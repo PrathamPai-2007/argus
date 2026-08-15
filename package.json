@@ -1,0 +1,23 @@
+{
+  "name": "argus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real-time on-chain intelligence pipeline: wallet clustering, funding-source links, liquidity anomalies",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts run",
+    "doctor": "bun run src/index.ts doctor",
+    "replay": "bun run src/index.ts replay",
+    "backfill": "bun run src/index.ts backfill",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.23.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
