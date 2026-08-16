@@ -423,6 +423,8 @@ function outcomeBadge(outcome, compact) {
   return '<span class="badge ' + cls + '">' + esc(text) + "</span>";
 }
 
+const levelsLabel = "+50% / -20%";
+
 function renderPerformance(sessions, container) {
   const rows = sessions || [];
   const active = rows.filter((s) => s.outcome === "active").length;
@@ -479,7 +481,7 @@ function timeAgo(sec) {
 }
 
 function tokenLink(chainId, address) {
-  return "<a href='#/token/" + chainId + "/" + address + "'>" + short(address) + "</a>";
+  return "<a href='#/token/" + esc(chainId) + "/" + esc(address) + "'>" + esc(short(address)) + "</a>";
 }
 
 function setConn(state, txt) {
@@ -765,11 +767,11 @@ function renderMembers(graph) {
       const pct = totalSupply > 0 ? (bal / totalSupply) * 100 : 0;
       rows += "<tr>" +
         '<td><span class="badge" style="color:' + color + ';border-color:' + color + '66;background:' + color + '14">#' + (ci + 1) + '</span></td>' +
-        '<td class="mono">' + short(m.address) + "</td>" +
+        '<td class="mono">' + esc(short(m.address)) + "</td>" +
         "<td>" + (m.label ? esc(m.label) : '<span class="faint">—</span>') + "</td>" +
         '<td class="num">' + fmtSupply(bal) + "</td>" +
         '<td class="num">' + pct.toFixed(2) + "%</td>" +
-        "<td>" + (m.funder ? '<span class="faint">' + short(m.funder) + "</span>" : '<span class="faint">—</span>') + "</td></tr>";
+        "<td>" + (m.funder ? '<span class="faint">' + esc(short(m.funder)) + "</span>" : '<span class="faint">—</span>') + "</td></tr>";
     }
   });
   el.innerHTML = '<div class="panel-b"><table class="tbl"><thead><tr><th>Cluster</th><th>Address</th><th>Label</th>' +
@@ -862,31 +864,76 @@ function route() {
 }
 
 function connect() {
-  const es = new EventSource("/events/stream");
-  es.onopen = () => setConn("live", "stream: live");
-  es.onerror = () => {
-    setConn("stale", "stream: reconnecting");
-    setTimeout(() => { es.close(); connect(); }, 3000);
-  };
-  es.onmessage = (msg) => {
-    let p;
-    try { p = JSON.parse(msg.data); } catch { return; }
-    if (p.type === "alert") {
-      const el = document.createElement("div");
-      el.className = "evt flash";
-      el.innerHTML = '<span class="t">' + timeAgo(Math.floor(Date.now() / 1000)) + "</span> " +
-        '<span class="' + sevClass(p.severity) + '">' + esc(p.severity) + "</span> " +
-        tokenLink(p.chainId || 1, p.tokenAddress) + ' <span class="hl">' + esc(p.headline) + "</span>";
-      const feed = $("alerts");
-      feed.prepend(el);
-      while (feed.children.length > 40) feed.lastChild.remove();
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = protocol + "//" + location.host + "/ws";
+  let ws;
+  let retryTimer;
+
+  function init() {
+    if (ws) { try { ws.close(); } catch {} }
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      setConn("live", "ws: live");
       refresh();
-    } else if (p.type === "performance_opened" || p.type === "performance_updated" || p.type === "performance_closed" || p.type === "performance_retracted") {
-      refresh();
-    } else if (p.type === "status") {
-      renderChains(p.status);
-    }
-  };
+    };
+    ws.onclose = () => {
+      setConn("stale", "ws: reconnecting");
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(init, 2000);
+    };
+    ws.onerror = () => {
+      setConn("stale", "ws: reconnecting");
+    };
+    ws.onmessage = (msg) => {
+      let p;
+      try { p = JSON.parse(msg.data); } catch { return; }
+      if (p.type === "alert") {
+        const el = document.createElement("div");
+        el.className = "evt flash";
+        el.innerHTML = '<span class="t">' + timeAgo(Math.floor(Date.now() / 1000)) + "</span> " +
+          '<span class="' + sevClass(p.severity) + '">' + esc(p.severity) + "</span> " +
+          tokenLink(p.chainId || 1, p.tokenAddress) + ' <span class="hl">' + esc(p.headline) + "</span>" +
+          '<span class="faint">(' + p.score + ")</span>";
+        const feed = $("alerts");
+        if (feed) {
+          feed.prepend(el);
+          while (feed.children.length > 40) feed.lastChild.remove();
+        }
+        refresh();
+      } else if (p.type === "signal" && p.data) {
+        const s = p.data;
+        const el = document.createElement("div");
+        el.className = "evt flash";
+        el.innerHTML = '<span class="t">' + timeAgo(s.timestamp || Math.floor(Date.now() / 1000)) + "</span> " +
+          '<span class="badge">' + esc(s.ruleId || s.rule_id) + "</span> " +
+          tokenLink(s.chainId || s.chain_id || 1, s.tokenAddress || s.token_address) +
+          '<span class="faint">w' + (s.weight || 0) + " &middot; b" + (s.blockNumber || s.block_number || 0) + "</span>";
+        const feed = $("signals");
+        if (feed) {
+          feed.prepend(el);
+          while (feed.children.length > 40) feed.lastChild.remove();
+        }
+      } else if (p.type === "event" && p.data) {
+        const e = p.data;
+        const el = document.createElement("div");
+        el.className = "evt flash";
+        el.innerHTML = '<span class="t">b' + (e.block_number || e.blockNumber || 0) + "</span> " +
+          '<span class="badge">' + esc(e.type || e.kind) + "</span> " +
+          '<span class="mono hl">' + short(e.tx_hash || e.txHash) + "</span>" +
+          (e.finalized === 1 ? "" : ' <span class="badge">unfinalized</span>');
+        const feed = $("events");
+        if (feed) {
+          feed.prepend(el);
+          while (feed.children.length > 40) feed.lastChild.remove();
+        }
+      } else if (p.type === "performance") {
+        refresh();
+      } else if (p.type === "status" && p.status) {
+        renderChains(p.status);
+      }
+    };
+  }
+  init();
 }
 
 function tickClock() {

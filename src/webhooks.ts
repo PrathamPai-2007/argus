@@ -1,5 +1,5 @@
 import type { WebhookConfig } from "./config.ts";
-import { log } from "./logger.ts";
+import { log, redactUrl } from "./logger.ts";
 import type { AlertPayload, Signal } from "./types.ts";
 
 // Outbound webhook delivery (PLAN.md §17): POST JSON to any HTTP endpoint with an
@@ -24,9 +24,21 @@ export interface WebhookBody {
 
 export class WebhookDispatcher {
   private targets: WebhookTarget[] = [];
+  private stopped = false;
+  private timers = new Set<ReturnType<typeof setTimeout>>();
+  private controllers = new Set<AbortController>();
 
   setTargets(targets: WebhookConfig[]): void {
+    this.stopped = false;
     this.targets = targets.map((t) => ({ ...t, events: new Set(t.events) }));
+  }
+
+  stop(): void {
+    this.stopped = true;
+    for (const timer of this.timers) clearTimeout(timer);
+    this.timers.clear();
+    for (const controller of this.controllers) controller.abort();
+    this.controllers.clear();
   }
 
   /** A new alert was emitted (or, when retracted, sent again via dispatchRetraction). */
@@ -85,6 +97,7 @@ export class WebhookDispatcher {
   }
 
   private async post(target: WebhookTarget, body: WebhookBody, attempt: number): Promise<void> {
+    if (this.stopped) return;
     const raw = JSON.stringify(body);
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -92,22 +105,42 @@ export class WebhookDispatcher {
       "x-argus-event": body.type,
     };
     if (target.secret) headers["x-argus-signature"] = `sha256=${await hmacSha256(target.secret, raw)}`;
+    let controller: AbortController | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
     try {
+      controller = new AbortController();
+      this.controllers.add(controller);
+      timeout = setTimeout(() => controller?.abort(), target.timeoutMs);
       const res = await fetch(target.url, {
         method: "POST",
         headers,
         body: raw,
-        signal: AbortSignal.timeout(target.timeoutMs),
+        signal: controller.signal,
+        redirect: "error",
       });
-      if (!res.ok) throw new Error(`webhook ${target.url} returned HTTP ${res.status}`);
-      log.debug("webhook delivered", { event: body.type, url: target.url });
+      if (!res.ok) {
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+          log.error("webhook rejected permanently", { event: body.type, url: redactUrl(target.url), status: res.status });
+          return;
+        }
+        throw new Error(`webhook ${redactUrl(target.url)} returned HTTP ${res.status}`);
+      }
+      await res.body?.cancel();
+      log.debug("webhook delivered", { event: body.type, url: redactUrl(target.url) });
     } catch (err) {
       if (attempt < target.retries) {
         const delay = 500 * 2 ** attempt;
-        setTimeout(() => void this.post(target, body, attempt + 1), delay);
+        const timer = setTimeout(() => {
+          this.timers.delete(timer);
+          void this.post(target, body, attempt + 1);
+        }, delay);
+        this.timers.add(timer);
       } else {
-        log.error("webhook delivery failed", { event: body.type, url: target.url, err: String(err) });
+        log.error("webhook delivery failed", { event: body.type, url: redactUrl(target.url), err: String(err) });
       }
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (controller) this.controllers.delete(controller);
     }
   }
 }

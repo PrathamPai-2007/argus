@@ -69,6 +69,19 @@ describe("validateConfig", () => {
     expect(() => validateConfig(c)).toThrow(/ARGUS_DEFINITELY_UNSET/);
   });
 
+  test("disabled chains may defer endpoint secrets", () => {
+    const c = baseConfig();
+    ((c["chains"] as unknown[])[0] as Record<string, unknown>).enabled = false;
+    ((c["chains"] as unknown[])[0] as Record<string, unknown>).rpcs = ["${ARGUS_DISABLED_RPC}"];
+    expect(validateConfig(c).chains[0]?.enabled).toBe(false);
+  });
+
+  test("rejects private webhook destinations", () => {
+    const c = baseConfig();
+    c["webhooks"] = [{ url: "http://127.0.0.1:9000/hook", events: ["alert"] }];
+    expect(() => validateConfig(c)).toThrow(/private hosts/);
+  });
+
   test("autoWatch.factories accepts a raw address", () => {
     const c = baseConfig();
     ((c["autoWatch"] as Record<string, unknown>)["factories"]) = ["0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f"];

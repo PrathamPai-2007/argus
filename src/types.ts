@@ -91,7 +91,7 @@ export interface TokenMeta {
   symbol: string | null;
   decimals: number | null;
   totalSupply: bigint | null;
-  source: "manual" | "factory";
+  source: "manual" | "factory" | "ranked";
 }
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";

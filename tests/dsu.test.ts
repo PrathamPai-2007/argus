@@ -2,6 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { RollbackDSU } from "../src/graph/dsu.ts";
 
 describe("RollbackDSU", () => {
+  test("rollback removes nodes created by a reverted union", () => {
+    const dsu = new RollbackDSU();
+    const mark = dsu.mark();
+    dsu.union("a", "b");
+    dsu.rollback(mark);
+    expect(dsu.componentCount).toBe(0);
+    expect(dsu.has("a")).toBe(false);
+    expect(dsu.has("b")).toBe(false);
+  });
   test("union + find", () => {
     const d = new RollbackDSU();
     expect(d.union("a", "b")).toBe(true);

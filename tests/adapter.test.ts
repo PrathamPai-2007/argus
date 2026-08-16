@@ -42,6 +42,46 @@ function callbacks(overrides: Partial<AdapterCallbacks> = {}): AdapterCallbacks 
 }
 
 describe("EvmAdapter backfill phase resume", () => {
+  test("startup drains a head received before live transition", async () => {
+    const adapter = new EvmAdapter(makeConfig(), callbacks());
+    const a = adapter as unknown as {
+      client: PublicClient;
+      connect: () => Promise<void>;
+      subscribe: () => Promise<void>;
+      startHeartbeat: () => void;
+      startWatchdog: () => void;
+      backfillRange: (from: bigint, to: bigint) => Promise<number>;
+    };
+    let range: [bigint, bigint] | null = null;
+    a.client = { getBlockNumber: async () => 100n } as unknown as PublicClient;
+    a.connect = async () => {};
+    a.startHeartbeat = () => {};
+    a.startWatchdog = () => {};
+    a.subscribe = async () => {
+      await (adapter as unknown as { onNewHead: (block: unknown) => Promise<void> }).onNewHead({ number: 101n, hash: "0x11", parentHash: "0x10", timestamp: 1n });
+    };
+    a.backfillRange = async (from, to) => { range = [from, to]; return Number(to); };
+    await adapter.start(null);
+    expect(range as [bigint, bigint] | null).toEqual([101n, 101n]);
+  });
+
+  test("contiguous parent mismatch invokes reorg handling", async () => {
+    const adapter = new EvmAdapter(makeConfig(), callbacks());
+    const a = adapter as unknown as {
+      running: boolean;
+      _status: string;
+      recentHeads: Array<{ number: number; hash: string; parentHash: string }>;
+      handleReorg: (block: unknown) => Promise<void>;
+    };
+    a.running = true;
+    a._status = "live";
+    a.recentHeads = [{ number: 100, hash: "0xcanonical", parentHash: "0xold" }];
+    let called = false;
+    a.handleReorg = async () => { called = true; };
+    await (adapter as unknown as { onNewHead: (block: unknown) => Promise<void> }).onNewHead({ number: 101n, hash: "0xnew", parentHash: "0xfork", timestamp: 1n });
+    expect(called).toBe(true);
+  });
+
   test("resuming from phase 'swap' ingests swap logs even though lp is done", async () => {
     const requested: string[] = [];
     const fakeClient = {
@@ -201,4 +241,3 @@ describe("EvmAdapter backfill phase resume", () => {
     await expect(adapter.backfillRange(1000n, 1001n)).rejects.toThrow("boom");
   });
 });
-

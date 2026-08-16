@@ -45,11 +45,13 @@ export async function runBackfill(args: BackfillArgs): Promise<number> {
   adapter.addRelevantAddresses([...labels.keys()]);
 
   // connect without subscribing, then pull the historical range
-  await adapter.connect();
-  await adapter.backfillRange(BigInt(args.from), BigInt(args.to));
-
-  console.log(`backfill complete: ${total} events ingested for chain ${args.chainId} blocks [${args.from}..${args.to}]`);
-  await adapter.stop();
-  db.closeDb();
-  return 0;
+  try {
+    await adapter.connect();
+    await adapter.backfillRange(BigInt(args.from), BigInt(args.to));
+    console.log(`backfill complete: ${total} events received for chain ${args.chainId} blocks [${args.from}..${args.to}]`);
+    return 0;
+  } finally {
+    await adapter.stop();
+    db.closeDb();
+  }
 }

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isIP } from "node:net";
 import { isFactoryRef, KNOWN_FACTORY_NAMES } from "./factories.ts";
 
 // ---- Types ----------------------------------------------------------------
@@ -79,6 +80,7 @@ export interface ArgusConfig {
   chains: ChainConfig[];
   watchlist: WatchlistEntry[];
   autoWatch: AutoWatchConfig;
+  volumeRanking: { pollMinutes: number; topN: number; backfillHours: number };
   rules: RulesConfig;
   scoring: ScoringConfig;
   alerts: AlertsConfig;
@@ -86,7 +88,6 @@ export interface ArgusConfig {
   retention: RetentionConfig;
   webhooks: WebhookConfig[];
   dbPath: string;
-  snapshotPath: string;
 }
 
 // ---- .env loading (no dependency) -----------------------------------------
@@ -122,7 +123,7 @@ function isObj(v: unknown): v is Record<string, unknown> {
 
 function reqNumber(obj: Record<string, unknown>, key: string, ctx: string, opts?: { min?: number; max?: number; int?: boolean }): number {
   const v = obj[key];
-  if (typeof v !== "number" || Number.isNaN(v)) fail(`${ctx}.${key} must be a number`);
+  if (typeof v !== "number" || !Number.isFinite(v)) fail(`${ctx}.${key} must be a finite number`);
   if (opts?.int && !Number.isInteger(v)) fail(`${ctx}.${key} must be an integer`);
   if (opts?.min !== undefined && v < opts.min) fail(`${ctx}.${key} must be >= ${opts.min}`);
   if (opts?.max !== undefined && v > opts.max) fail(`${ctx}.${key} must be <= ${opts.max}`);
@@ -164,8 +165,14 @@ function validateChain(raw: unknown, i: number): ChainConfig {
   if (!Array.isArray(rpcsRaw) || rpcsRaw.length === 0) fail(`${ctx}.rpcs must be a non-empty array`);
   const rpcs = rpcsRaw.map((r, j) => {
     if (typeof r !== "string") fail(`${ctx}.rpcs[${j}] must be a string`);
-    const url = interpolate(r);
-    if (!/^wss?:\/\//.test(url) && !/^https?:\/\//.test(url)) fail(`${ctx}.rpcs[${j}] must be a ws(s):// or http(s):// URL`);
+     const url = enabled ? interpolate(r) : r;
+     if (!enabled && /\$\{[A-Z0-9_]+\}/.test(url)) return url;
+     if (!/^wss?:\/\//.test(url) && !/^https?:\/\//.test(url)) fail(`${ctx}.rpcs[${j}] must be a ws(s):// or http(s):// URL`);
+    try {
+      if (!new URL(url).hostname) throw new Error();
+    } catch {
+      fail(`${ctx}.rpcs[${j}] must include a valid host`);
+    }
     return url;
   });
   const finalityDepth = reqNumber(raw, "finalityDepth", ctx, { int: true, min: 1 });
@@ -175,7 +182,7 @@ function validateChain(raw: unknown, i: number): ChainConfig {
   const bqRaw = isObj(bfRaw["bigquery"]) ? bfRaw["bigquery"] as Record<string, unknown> : {};
   const esEnabled = esRaw["enabled"] === true;
   const bqEnabled = bqRaw["enabled"] === true;
-  const esUrl = typeof esRaw["apiUrl"] === "string" ? interpolate(esRaw["apiUrl"] as string) : "https://api.etherscan.io/v2/api";
+   const esUrl = typeof esRaw["apiUrl"] === "string" ? (esEnabled ? interpolate(esRaw["apiUrl"] as string) : esRaw["apiUrl"] as string) : "https://api.etherscan.io/v2/api";
   const esKeyRaw = esRaw["apiKey"];
   const esKey = esEnabled && typeof esKeyRaw === "string" ? interpolate(esKeyRaw) : null;
   if (esEnabled && !esKey) fail(`${ctx}.backfill.etherscan.apiKey is required when enabled`);
@@ -234,6 +241,13 @@ export function validateConfig(raw: unknown): ArgusConfig {
     watchHours: reqNumber(awRaw, "watchHours", "autoWatch", { min: 1 }),
   };
 
+  const vrRaw = isObj(raw["volumeRanking"]) ? raw["volumeRanking"] as Record<string, unknown> : {};
+  const volumeRanking = {
+    pollMinutes: typeof vrRaw["pollMinutes"] === "number" ? reqNumber(vrRaw, "pollMinutes", "volumeRanking", { min: 1 }) : 5,
+    topN: typeof vrRaw["topN"] === "number" ? reqNumber(vrRaw, "topN", "volumeRanking", { int: true, min: 1, max: 100 }) : 10,
+    backfillHours: typeof vrRaw["backfillHours"] === "number" ? reqNumber(vrRaw, "backfillHours", "volumeRanking", { min: 0.25, max: 24 }) : 1,
+  };
+
   const rulesRaw = raw["rules"];
   if (!isObj(rulesRaw)) fail("rules must be an object");
   const rules: RulesConfig = {
@@ -282,8 +296,11 @@ export function validateConfig(raw: unknown): ArgusConfig {
   const webhooks: WebhookConfig[] = whRaw.map((w, i) => {
     const ctx = `webhooks[${i}]`;
     if (!isObj(w)) fail(`${ctx} must be an object`);
-    const url = interpolate(reqString(w, "url", ctx));
-    if (!/^https?:\/\//.test(url)) fail(`${ctx}.url must be an http(s):// URL`);
+     const url = interpolate(reqString(w, "url", ctx));
+     if (!/^https?:\/\//.test(url)) fail(`${ctx}.url must be an http(s):// URL`);
+     let parsed: URL;
+     try { parsed = new URL(url); } catch { fail(`${ctx}.url must be a valid URL`); }
+     if (parsed.username || parsed.password || isPrivateHost(parsed.hostname)) fail(`${ctx}.url must not target private hosts or contain credentials`);
     const eventsRaw = w["events"];
     if (!Array.isArray(eventsRaw) || eventsRaw.length === 0) fail(`${ctx}.events must be a non-empty array`);
     const events = eventsRaw.map((e, j) => {
@@ -305,6 +322,7 @@ export function validateConfig(raw: unknown): ArgusConfig {
     chains,
     watchlist,
     autoWatch,
+    volumeRanking,
     rules,
     scoring,
     alerts,
@@ -312,8 +330,18 @@ export function validateConfig(raw: unknown): ArgusConfig {
     retention,
     webhooks,
     dbPath: typeof raw["dbPath"] === "string" ? (raw["dbPath"] as string) : "data/argus.db",
-    snapshotPath: typeof raw["snapshotPath"] === "string" ? (raw["snapshotPath"] as string) : "data/graph.snapshot.json",
   };
+}
+
+function isPrivateHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/[\[\]]/g, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "metadata.google.internal") return true;
+  const version = isIP(host);
+  if (version === 4) {
+    const [a, b] = host.split(".").map(Number) as [number, number, number, number];
+    return a === 10 || a === 127 || a === 0 || a === 169 && b === 254 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31;
+  }
+  return version === 6 && (host === "::1" || host === "::" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe8") || host.startsWith("fe9") || host.startsWith("fea") || host.startsWith("feb"));
 }
 
 // ---- Loader ---------------------------------------------------------------

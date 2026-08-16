@@ -18,6 +18,13 @@ function hasFlag(flag: string): boolean {
   return process.argv.includes(flag);
 }
 
+function blockArg(flag: string): number | null {
+  const value = argValue(flag);
+  if (value === undefined || !/^\d+$/.test(value)) return null;
+  const block = Number(value);
+  return Number.isSafeInteger(block) && block >= 0 ? block : null;
+}
+
 function usage(): void {
   console.log(`argus — real-time on-chain intelligence pipeline
 
@@ -42,9 +49,9 @@ async function main(): Promise<number> {
 
     case "replay": {
       const chainId = Number(argValue("--chain") ?? "1");
-      const from = Number(argValue("--from"));
-      const to = Number(argValue("--to"));
-      if (!from || !to || to < from) {
+      const from = blockArg("--from");
+      const to = blockArg("--to");
+      if (!Number.isSafeInteger(chainId) || chainId < 1 || from === null || to === null || to < from) {
         console.error("replay requires --from <block> --to <block>");
         return 1;
       }
@@ -55,9 +62,9 @@ async function main(): Promise<number> {
 
     case "backfill": {
       const chainId = Number(argValue("--chain") ?? "1");
-      const from = Number(argValue("--from"));
-      const to = Number(argValue("--to"));
-      if (!from || !to || to < from) {
+      const from = blockArg("--from");
+      const to = blockArg("--to");
+      if (!Number.isSafeInteger(chainId) || chainId < 1 || from === null || to === null || to < from) {
         console.error("backfill requires --from <block> --to <block>");
         return 1;
       }

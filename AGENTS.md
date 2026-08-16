@@ -6,7 +6,7 @@ and liquidity anomalies in real time. See `README.md` for architecture, CLI, and
 ## Stack & constraints
 
 - **Bun + TypeScript**, one process. Runtime APIs used: `bun:sqlite`, `Bun.serve` (Phase 4), `bun test`.
-- **Only dependency: `viem`.** Do not add packages without a strong reason (no Redis/Docker/Postgres/ORMs/web frameworks/notification SDKs — build in-process instead).
+- **Only runtime dependency: `viem`.** TypeScript/Bun packages are dev dependencies; do not add runtime packages without a strong reason (no Redis/Docker/Postgres/ORMs/web frameworks/notification SDKs — build in-process instead).
 - Everything local: SQLite file in `data/`, logs in `logs/`, secrets in `.env` (never commit).
 
 ## Commands
@@ -31,16 +31,17 @@ src/
   config.ts            hand-rolled validation (no zod) + .env loader + hot reload
   db.ts                bun:sqlite repos (WAL). Tests use openDb(":memory:")
   types.ts             StandardEvent union, Signal, AlertPayload
-  queue.ts             ring buffer, drop-oldest + dropped counter (never block ingestion)
+  queue.ts             weighted ring buffer, drop-oldest + dropped counter (never block ingestion)
   ingest/evm.ts        ChainAdapter: WS subscribe, failover, heartbeat/stale, reorg walk-back,
                        gap backfill (per-gap provider selection: tiny gaps <=64 blocks on RPC,
                        larger on Etherscan/BigQuery; bounded per-address fan-out, throttle
                        retries + endpoint failover, archive-unsupported detection -> Etherscan),
-                       funding extraction (native transfers + Disperse calldata)
+                       funding extraction (native transfers + Disperse calldata), deferred head-gap and parent-hash recovery
   ingest/etherscan.ts  Etherscan getLogs provider: 256-block ranges, split-on-demand recursive
                        splitting, rate-limit backoff (5 retries), pagination
   ingest/bigquery.ts   optional BigQuery logs provider (service-account JWT, no SDK)
   ingest/normalizer.ts raw logs → StandardEvents (pure functions, fixture-tested)
+  ingest/dexscreener.ts DexScreener stablecoin-volume ranking for targeted enrichment
   ingest/probe.ts      endpoint probing shared by adapter + doctor
   graph/dsu.ts         RollbackDSU: union by size, NO path compression, op-stack rollback
   graph/engine.ts      GraphEngine: wallets, funding edges, balance ledgers, clusters;
@@ -51,9 +52,10 @@ src/
   alerts/manager.ts    cooldown / escalation(+20) / global rate limit / retractions
   performance.ts       pool-relative alert watches (12h, +50% target, -20% stop)
   alerts/telegram.ts   one fetch POST; no SDK
-  webhooks.ts          outbound HTTP delivery of alerts/signals/retractions (HMAC-signed, plain fetch)
-  engine.ts            orchestrator: queue drain → persist → graph → rules → score → alerts
-tests/                 bun:test; golden fixtures for normalizer; in-memory SQLite for scorer/alerts
+  webhooks.ts          outbound HTTP delivery of alerts/signals/retractions (HMAC-signed, SSRF-safe, plain fetch)
+  engine.ts            orchestrator: queue drain → persist → graph → rules → score → alerts;
+                       serialized control operations, bounded retries, overflow recovery, shutdown drain
+tests/                 bun:test; adapter/dashboard/config/security regressions; golden fixtures for normalizer; in-memory SQLite
 ```
 
 ## Invariants — do not break
@@ -68,21 +70,21 @@ tests/                 bun:test; golden fixtures for normalizer; in-memory SQLit
    state are tagged unconfirmed; reorgs issue explicit retractions.
 5. **Rules stay pure**: `(event, view, config) → Signal | null`, no graph mutation, no I/O.
 6. New tables/columns → new `migrations/NNNN_name.sql` file; never edit applied migrations.
-7. **Backfill is resumable**: phase + cursor persist in `backfill_jobs`; startup and recovery
-   resume from that cursor, never from a stale in-memory head. Watchdog uses per-request
-   provider heartbeats so slow Etherscan chunks aren't mistaken for a stalled backfill.
+7. **Live startup is independent of history**: startup begins at the current head and never waits
+   for historical backfill or restores a previous graph snapshot. Recovery state is in-process only.
    Provider choice is per-gap (`chooseBackfillProvider`): gaps <= `TINY_GAP_RPC_BLOCKS` (64)
    stay on RPC; larger gaps estimate request cost and pick Etherscan / BigQuery / RPC.
-8. **Non-critical backfill phases are best-effort.** Factory/LP/swap log queries may be skipped
-   on transient provider errors (log + advance cursor + continue); only the tokens phase is
-   fatal. `start()`/`recover()` go live even if a gap backfill fails — the durable cursor
-   resumes the gap. Transient `eth_getLogs` errors (`-32603`/"internal error", Infura) are
-   retried + failed over before any phase is skipped.
+8. **Recovery is best-effort.** Factory/LP/swap log queries may be skipped on transient provider
+   errors; optional enrichment/recovery failures never block live ingestion.
+9. **Outbound safety is enforced.** Webhook validation rejects loopback/private/link-local/metadata
+   targets; delivery rejects redirects, uses abortable timeouts, and stops retry timers on shutdown.
+10. **Dashboard exposure is deliberate.** The server binds to `127.0.0.1`; when
+    `ARGUS_DASHBOARD_TOKEN` is set, page/API/SSE requests require Bearer or Basic auth.
 
 ## Status
 
 - [x] Phase 0 scaffold (config, migrations, logger, doctor)
-- [x] Phase 1 EVM ingestion (WS, reconnect/failover, heartbeat, reorg walk-back, resumable backfill, checkpoints)
+- [x] Phase 1 EVM ingestion (WS, reconnect/failover, heartbeat, deferred head-gap recovery, parent-hash reorg detection, queue-overflow recovery, bounded backfill)
 - [x] Phase 2 graph engine (rollback DSU, funding extraction incl. Disperse, labels, ledgers, snapshots)
 - [x] Phase 3 heuristics R1–R8 + scorer + alert manager + Telegram
 - [x] Phase 4 dashboard (Bun.serve + SSE on 127.0.0.1:3737)
@@ -92,7 +94,7 @@ tests/                 bun:test; golden fixtures for normalizer; in-memory SQLit
 - [x] Phase 5 replay tuning presets (`default` | `cautious` | `strict`)
 - [x] Output layer: webhook push (`src/webhooks.ts`, HMAC-signed POST of alerts/signals/
   retractions) + graph API endpoints on the dashboard (clusters, funding edges)
-- Phase 6 multi-chain + auto-watch live fire: scaffolding in place (BNB Chain / Base configs commented)
+- Phase 6 multi-chain + auto-watch live fire: auto-watch is live; BNB Chain / Base configuration scaffolding remains commented
 - Phase 7 stretch: more chain support, per-token tuning
 - Historical backfill: provider choice is per-gap — tiny reorg gaps (<=64 blocks) stay on RPC;
   larger gaps pick Etherscan (default), BigQuery (optional, long ranges), or RPC from an
@@ -103,6 +105,8 @@ tests/                 bun:test; golden fixtures for normalizer; in-memory SQLit
   "archive requests require a personal token") switch the backfill back to Etherscan automatically.
 - Internal-tx funding via trace APIs: capability probed by doctor/adapter; extraction stubbed
   (free endpoints rarely expose `debug_traceTransaction` — graceful degradation is by design).
+- Security hardening: URL credentials are redacted from logs, dashboard auth is opt-in, and
+  webhook requests have SSRF, redirect, timeout, retry, and shutdown safeguards.
 
 ## Smoke testing without a paid RPC
 

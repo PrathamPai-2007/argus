@@ -79,13 +79,13 @@ describe("AlertManager", () => {
     const sink = new FakeSink();
     const m = new AlertManager(ALERTS_CFG, SCORING_CFG, [sink]);
     await m.maybeAlert(payload("0xt4", 90, "critical"), false);
-    const ids = await m.retractUnconfirmed(1, "reorg at block 123");
+    const ids = await m.retractUnconfirmed(1, 123, "reorg at block 123");
     expect(ids.length).toBe(1);
     expect(sink.texts[0]).toContain("retraction");
     const row = getDb().query("SELECT retracted FROM alerts WHERE id = ?").get(ids[0] as number) as { retracted: number };
     expect(row.retracted).toBe(1);
     // confirmed alerts are not retracted
-    const ids2 = await m.retractUnconfirmed(1, "another reorg");
+    const ids2 = await m.retractUnconfirmed(1, 123, "another reorg");
     expect(ids2.length).toBe(0);
   });
 

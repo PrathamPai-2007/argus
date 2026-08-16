@@ -21,4 +21,13 @@ describe("EventQueue", () => {
     expect(q.dropped).toBe(4);
     expect(q.drain()).toEqual([4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
   });
+
+  test("weighted capacity bounds event count, not batch count", () => {
+    const q = new EventQueue<{ id: number; events: number[] }>(16, (item) => item.events.length);
+    q.push({ id: 1, events: Array.from({ length: 15 }, (_, i) => i) });
+    q.push({ id: 2, events: [16, 17] });
+    expect(q.depth).toBe(2);
+    expect(q.dropped).toBe(15);
+    expect(q.drain()).toEqual([{ id: 2, events: [16, 17] }]);
+  });
 });

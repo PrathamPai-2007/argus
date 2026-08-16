@@ -62,6 +62,7 @@ export interface AdapterCallbacks {
   onStatus(chainId: number, status: AdapterStatus, detail?: Record<string, unknown>): void;
   onBackfillProgress?(chainId: number, progress: { phase: string; nextBlock: number; fromBlock: number; toBlock: number; provider: string }): void | Promise<void>;
   getBackfillProgress?(chainId: number): { phase: string; nextBlock: number; fromBlock: number; toBlock: number; provider: string } | null;
+  getAppliedBlock?(chainId: number): number;
 }
 
 export interface ChainAdapter {
@@ -76,6 +77,9 @@ export interface ChainAdapter {
   registerPool(pool: Address, token0: Address, token1: Address): void;
   fetchTokenMeta(address: Address): Promise<Partial<TokenMeta>>;
   getNonce(address: Address): Promise<number>;
+  recover(reason: string): Promise<void>;
+  flushEvents(): Promise<void>;
+  backfillToken(token: Address, fromBlock: bigint, toBlock: bigint): Promise<number>;
   status(): { status: AdapterStatus; endpoint: string; lastHead: number; lastHeadAt: number; tracesAvailable: boolean | null };
 }
 
@@ -115,6 +119,7 @@ export class EvmAdapter implements ChainAdapter {
   private lastHeadAt = 0;
   private lastProgressAt = 0;
   private backfillTail: Promise<void> = Promise.resolve(); // serializes overlapping backfillRange calls
+  private eventDispatch: Promise<void> | null = null;
   private backfillProgress: { from: number; to: number; progress: number } | null = null;
   private blockTimes = new Map<number, number>();
   private recentHeads: Array<{ number: number; hash: string; parentHash: string }> = [];
@@ -137,9 +142,26 @@ export class EvmAdapter implements ChainAdapter {
     this.chainId = cfg.chainId;
   }
 
+  private emitEvents(events: StandardEvent[]): Promise<void> {
+    const dispatch = () => this.cb.onEvents(this.chainId, events);
+    if (this.eventDispatch === null) {
+      try {
+        this.eventDispatch = Promise.resolve(dispatch());
+      } catch (err) {
+        this.eventDispatch = Promise.reject(err);
+      }
+    } else {
+      this.eventDispatch = this.eventDispatch.then(dispatch);
+    }
+    this.eventDispatch = this.eventDispatch.catch((err: unknown) => {
+      log.error("event dispatch failed", { chainId: this.chainId, err: String(err) });
+    });
+    return this.eventDispatch;
+  }
+
   // ---- lifecycle -----------------------------------------------------------
 
-  async start(resumeFrom: number | null): Promise<void> {
+  async start(_resumeFrom: number | null): Promise<void> {
     this.running = true;
     this.setStatus("connecting");
     await this.connect();
@@ -147,65 +169,25 @@ export class EvmAdapter implements ChainAdapter {
 
     const head = Number(await this.withRetry(() => this.mustClient().getBlockNumber()));
     if (head > this.observedHead) this.observedHead = head;
-    const saved = this.cb.getBackfillProgress?.(this.chainId) ?? null;
-    const resumesSaved = saved !== null && resumeFrom !== null && saved.fromBlock === resumeFrom + 1;
-    const from = resumesSaved ? saved.nextBlock : (resumeFrom !== null ? resumeFrom + 1 : head);
     this.startHeartbeat();
     this.startWatchdog();
-    await this.subscribe(false);
-    // Hold busy across the startup backfill so a stream error can't tear down
-    // subscriptions mid-backfill (recover() early-returns while busy).
-    this.busy = true;
-    let caughtUpThrough = from - 1;
-    if (from <= head) {
-      this.setStatus("backfilling", { from, to: head });
-      try {
-        caughtUpThrough = await this.backfillRange(BigInt(from), BigInt(head), resumesSaved ? saved.phase : undefined, resumesSaved ? saved.fromBlock : undefined);
-      } catch (err) {
-        // A failed startup backfill must not kill the engine (2026-08-15: a
-        // transient Infura eth_getLogs error after the main backfill completed
-        // aborted start() and left the chain in status "error" forever). Go live
-        // from the last block the durable cursor reached — the head-gap path
-        // resumes the rest from backfill_jobs.
-        const job = this.cb.getBackfillProgress?.(this.chainId) ?? null;
-        caughtUpThrough = Math.max(from - 1, (job?.nextBlock ?? from) - 1);
-        log.warn("startup backfill failed — going live; gap resumes from the durable cursor", {
-          chainId: this.chainId,
-          from,
-          head,
-          through: caughtUpThrough,
-          err: redactUrl(String(err)),
-        });
-      }
-    } else {
-      caughtUpThrough = head;
-    }
-    while (this.deferredHead && Number(this.deferredHead.number) > caughtUpThrough) {
-      const pending = this.deferredHead;
-      this.deferredHead = null;
-      const pendingNumber = pending.number as bigint;
-      try {
-        caughtUpThrough = await this.backfillRange(BigInt(caughtUpThrough + 1), pendingNumber);
-      } catch (err) {
-        log.warn("deferred-head backfill failed — going live; live stream will close the gap", {
-          chainId: this.chainId,
-          from: caughtUpThrough + 1,
-          to: Number(pendingNumber),
-          err: redactUrl(String(err)),
-        });
-        break;
-      }
-    }
-    const liveHead = caughtUpThrough;
+    await this.subscribe(true);
+    // Start from the current head. Historical state is intentionally not loaded
+    // into the live graph; reconnects and reorgs still use bounded in-process
+    // recovery backfills after startup.
+    const pendingHead = this.deferredHead;
     this.deferredHead = null;
-    this.lastHead = liveHead;
+    this.lastHead = head;
     this.lastProgressAt = Date.now();
-    this.lastFinalizedSent = liveHead - this.cfg.finalityDepth;
-    await this.resubscribeLogs();
+    this.lastFinalizedSent = head - this.cfg.finalityDepth;
+    if (pendingHead && Number(pendingHead.number) > head) {
+      this.setStatus("backfilling", { from: head + 1, to: Number(pendingHead.number), reason: "startup-gap" });
+      await this.backfillRange(BigInt(head + 1), pendingHead.number as bigint);
+      this.pushHead({ number: Number(pendingHead.number), hash: pendingHead.hash as string, parentHash: pendingHead.parentHash as string });
+      this.lastHead = Number(pendingHead.number);
+    }
     this.busy = false;
-    this.setStatus("live", { head: liveHead });
-    // Backfilled history up to (head - finalityDepth) is already canonical — finalize it immediately.
-    if (this.lastFinalizedSent > 0) this.cb.onFinalized(this.chainId, this.lastFinalizedSent);
+    this.setStatus("live", { head: this.lastHead });
   }
 
   async stop(): Promise<void> {
@@ -216,6 +198,14 @@ export class EvmAdapter implements ChainAdapter {
     this.watchdogTimer = null;
     this.teardownSubs();
     this.setStatus("stopped");
+  }
+
+  flushEvents(): Promise<void> {
+    return this.eventDispatch ?? Promise.resolve();
+  }
+
+  backfillToken(token: Address, fromBlock: bigint, toBlock: bigint): Promise<number> {
+    return this.backfillRange(fromBlock, toBlock, undefined, undefined, token.toLowerCase() as Address);
   }
 
   setWatchedTokens(addrs: Address[]): void {
@@ -264,7 +254,7 @@ export class EvmAdapter implements ChainAdapter {
         }
       }
     }
-    if (hits.length > 0) this.cb.onEvents(this.chainId, hits);
+    if (hits.length > 0) void this.emitEvents(hits);
   }
 
   /** Register a Uniswap V2-style pool (from factory logs or auto-watch); enables
@@ -624,7 +614,10 @@ export class EvmAdapter implements ChainAdapter {
     // newHeads
     this.unwatchers.push(
       c.watchBlocks({
-        onBlock: (block) => void this.onNewHead(block as Block<bigint, true>),
+        onBlock: (block) => void this.onNewHead(block as Block<bigint, true>).catch((err) => {
+          log.error("head processing failed", { chainId: this.chainId, err: String(err) });
+          void this.recover("head-processing-failed");
+        }),
         onError: (err) => this.onStreamError("newHeads", err),
         includeTransactions: true,
         emitMissed: false,
@@ -728,7 +721,7 @@ export class EvmAdapter implements ChainAdapter {
    *  Guards (Bug B): a busy mutex prevents overlapping recoveries; a cooldown
    *  dampens repeated failures; recentHeads/blockTimes are cleared so phantom
    *  parentHash mismatches from a previous backend can't fake a deep reorg. */
-  private async recover(reason: string): Promise<void> {
+  async recover(reason: string): Promise<void> {
     if (!this.running || this.busy) return;
     this.busy = true;
     const now = Date.now();
@@ -769,7 +762,8 @@ export class EvmAdapter implements ChainAdapter {
       await this.subscribe(false);
       let caughtUpThrough = this.lastHead;
       const job = this.cb.getBackfillProgress?.(this.chainId) ?? null;
-      const resumeStart = job !== null ? job.nextBlock : this.lastHead + 1;
+      const appliedStart = (this.cb.getAppliedBlock?.(this.chainId) ?? this.lastHead) + 1;
+      const resumeStart = reason === "queue-overflow" ? Math.min(this.lastHead + 1, appliedStart) : (job !== null ? job.nextBlock : this.lastHead + 1);
       if (head > resumeStart - 1) {
         this.setStatus("backfilling", { from: resumeStart, to: head });
         // Best-effort: a flaky gap backfill must not wedge the chain in "error"
@@ -875,15 +869,21 @@ export class EvmAdapter implements ChainAdapter {
               this.recentHeads = this.recentHeads.filter((h) => h.number <= prev.number);
               await this.cb.onReorg(this.chainId, prev.number + 1);
               this.setStatus("backfilling", { from: prev.number + 1, to: number - 1, reason: "head-gap-reorg" });
+              let backfilled = false;
               try {
                 await this.backfillRange(BigInt(prev.number + 1), BigInt(number - 1));
                 this.lastProgressAt = Date.now();
+                backfilled = true;
               } catch {
                 /* best-effort; log already emitted */
               } finally {
                 await this.resubscribeLogs();
-                this.setStatus("live", { head: this.lastHead });
               }
+              if (!backfilled) {
+                void this.recover("head-gap-reorg");
+                return;
+              }
+              this.setStatus("live", { head: this.lastHead });
               this.pushHead({ number, hash: blockHash, parentHash: block.parentHash });
               this.lastHead = number;
               this.cb.onHead(this.chainId, number, timestamp);
@@ -901,15 +901,21 @@ export class EvmAdapter implements ChainAdapter {
             log.info("head gap — backfilling", { chainId: this.chainId, from: prev.number + 1, to: number - 1, gap });
             this.stopLogSubscriptions();
             this.setStatus("backfilling", { from: prev.number + 1, to: number - 1, reason: "head-gap" });
+            let backfilled = false;
             try {
               await this.backfillRange(BigInt(prev.number + 1), BigInt(number - 1));
               this.lastProgressAt = Date.now();
+              backfilled = true;
             } catch {
               /* backfill is best-effort; log already emitted */
             } finally {
               await this.resubscribeLogs();
-              this.setStatus("live", { head: this.lastHead });
             }
+            if (!backfilled) {
+              void this.recover("head-gap");
+              return;
+            }
+            this.setStatus("live", { head: this.lastHead });
             this.pushHead({ number, hash: blockHash, parentHash: block.parentHash });
             this.lastHead = number;
             this.cb.onHead(this.chainId, number, timestamp);
@@ -920,6 +926,10 @@ export class EvmAdapter implements ChainAdapter {
           log.warn("deep head gap — recovering", { chainId: this.chainId, prev: prev.number, newHead: number, gap });
           this.recentHeads = [];
           void this.recover("deep-gap");
+          return;
+        }
+        if (number === prev.number + 1 && block.parentHash !== prev.hash) {
+          await this.handleReorg(block as Block<bigint, true> & { hash: `0x${string}` });
           return;
         }
         // contiguous: normal extension
@@ -969,7 +979,6 @@ export class EvmAdapter implements ChainAdapter {
     const number = Number(newHead.number);
     log.warn("reorg detected", { chainId: this.chainId, newHead: number, newHeadHash: newHead.hash });
     this.stopLogSubscriptions();
-    this.rewindFunding(number);
     let forkPoint = number - 1;
     let matched = false;
     for (let depth = 0; depth < MAX_REORG_WALK && forkPoint >= 0; depth++, forkPoint--) {
@@ -986,21 +995,25 @@ export class EvmAdapter implements ChainAdapter {
     if (!matched) {
       log.error("reorg deeper than buffer — forcing resync from checkpoint", { chainId: this.chainId });
       // treat the whole buffered range as suspect
-      const oldest = this.recentHeads[0];
-      forkPoint = oldest ? oldest.number - 1 : number - MAX_REORG_WALK;
+      forkPoint = this.lastFinalizedSent;
+      if (forkPoint >= number) forkPoint = number - MAX_REORG_WALK;
     }
 
     const fromBlock = forkPoint + 1;
     // drop forked heads
     this.recentHeads = this.recentHeads.filter((h) => h.number <= forkPoint);
-    await this.cb.onReorg(this.chainId, fromBlock);
-    // re-ingest canonical history for the forked range
-    await this.backfillRange(BigInt(fromBlock), BigInt(number));
+    this.rewindFunding(fromBlock);
+    try {
+      await this.cb.onReorg(this.chainId, fromBlock);
+      // re-ingest canonical history for the forked range
+      await this.backfillRange(BigInt(fromBlock), BigInt(number));
+    } finally {
+      await this.resubscribeLogs();
+    }
     this.pushHead({ number, hash: newHead.hash, parentHash: newHead.parentHash });
     this.lastHead = number;
     this.lastHeadAt = Date.now();
     this.lastProgressAt = Date.now();
-    await this.resubscribeLogs();
   }
 
   // ---- funding extraction from block transactions (PLAN.md §6) -----------------
@@ -1074,6 +1087,9 @@ export class EvmAdapter implements ChainAdapter {
 
   /** Park funding candidates in a rolling buffer; emit only the relevant subset now. */
   private bufferFunding(entries: FundingEvent[]): void {
+    const currentBlock = entries.reduce((max, e) => Math.max(max, e.blockNumber), 0);
+    const minClaimedBlock = currentBlock - FUNDING_BUFFER_BLOCKS;
+    this.claimedFunding = new Set([...this.claimedFunding].filter((key) => Number(key.split(":", 1)[0]) >= minClaimedBlock));
     const hits: FundingEvent[] = [];
     const retained: FundingEvent[] = [];
     for (const e of entries) {
@@ -1086,7 +1102,7 @@ export class EvmAdapter implements ChainAdapter {
         retained.push(e);
       }
     }
-    if (hits.length > 0) this.cb.onEvents(this.chainId, hits);
+    if (hits.length > 0) void this.emitEvents(hits);
     if (retained.length === 0) return;
     for (const e of retained) this.indexFunding(e);
     this.fundingBuffer.push({ block: entries[0]?.blockNumber ?? 0, entries: retained });
@@ -1177,7 +1193,7 @@ export class EvmAdapter implements ChainAdapter {
       const evt = normalizeTransfer(this.toRaw(l), this.chainId, ts);
       if (evt) events.push(evt);
     }
-    if (events.length > 0) this.cb.onEvents(this.chainId, events);
+    if (events.length > 0) void this.emitEvents(events);
   }
 
   private async onFactoryLogs(logs: ViemLog[]): Promise<void> {
@@ -1191,7 +1207,7 @@ export class EvmAdapter implements ChainAdapter {
         events.push(evt);
       }
     }
-    if (events.length > 0) this.cb.onEvents(this.chainId, events);
+    if (events.length > 0) void this.emitEvents(events);
   }
 
   /** LP-token transfers of known pools (R7 input). The pool is the LP token, so
@@ -1205,7 +1221,7 @@ export class EvmAdapter implements ChainAdapter {
       const evt = normalizeTransfer(this.toRaw(l), this.chainId, ts, pool as Address);
       if (evt) events.push(evt);
     }
-    if (events.length > 0) this.cb.onEvents(this.chainId, events);
+    if (events.length > 0) void this.emitEvents(events);
   }
 
   /** Swap logs of known pools (R2 input). */
@@ -1223,7 +1239,7 @@ export class EvmAdapter implements ChainAdapter {
         if (evt) events.push(evt);
       }
     }
-    if (events.length > 0) this.cb.onEvents(this.chainId, events);
+    if (events.length > 0) void this.emitEvents(events);
   }
 
   private async blockTime(n: number): Promise<number> {
@@ -1254,7 +1270,7 @@ export class EvmAdapter implements ChainAdapter {
 
   // ---- backfill (gap recovery + replay source, PLAN.md §10/§11.3) ----------------
 
-  async backfillRange(fromBlock: bigint, toBlock: bigint, resumePhase?: string, jobFromBlock?: number): Promise<number> {
+  async backfillRange(fromBlock: bigint, toBlock: bigint, resumePhase?: string, jobFromBlock?: number, onlyToken?: Address): Promise<number> {
     if (fromBlock > toBlock) return Number(toBlock);
     // Serialize overlapping backfill calls instead of skipping the late one
     // (Bug: a concurrent call used to be skipped, so callers believed the range
@@ -1262,21 +1278,21 @@ export class EvmAdapter implements ChainAdapter {
     // never closed). Callers await their own call, so a concurrent caller must
     // WAIT for the in-flight backfill to finish rather than return early.
     // Re-runs are safe: events are idempotent (INSERT OR IGNORE) and
-    // backfillRangeInner resumes from the durable cursor.
+    // Repeated ranges are safe because event inserts are idempotent.
     const prev = this.backfillTail;
     let release = () => {};
     this.backfillTail = new Promise<void>((r) => (release = r));
     await prev;
     this.backfilling = true;
     try {
-      return await this.backfillRangeInner(fromBlock, toBlock, resumePhase, jobFromBlock);
+      return await this.backfillRangeInner(fromBlock, toBlock, resumePhase, jobFromBlock, onlyToken);
     } finally {
       this.backfilling = false;
       release();
     }
   }
 
-  private async backfillRangeInner(fromBlock: bigint, toBlock: bigint, resumePhase?: string, jobFromBlock?: number): Promise<number> {
+  private async backfillRangeInner(fromBlock: bigint, toBlock: bigint, resumePhase?: string, jobFromBlock?: number, onlyToken?: Address): Promise<number> {
     if (fromBlock > toBlock) return Number(toBlock);
     // Clamp the range to the serving node's current head up-front. Load-balanced
     // free RPCs answer eth_blockNumber from a node ahead of the one serving
@@ -1301,7 +1317,7 @@ export class EvmAdapter implements ChainAdapter {
     const emit = async (events: StandardEvent[]) => {
       if (events.length === 0) return;
       events.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex || a.kind.localeCompare(b.kind));
-      await this.cb.onEvents(this.chainId, events);
+      await this.emitEvents(events);
     };
     const progress = async (phase: string, nextBlock: bigint) => {
       await this.cb.onBackfillProgress?.(this.chainId, {
@@ -1321,7 +1337,7 @@ export class EvmAdapter implements ChainAdapter {
     // mean ~24 sequential RPC calls per chunk; now it is a single call.
     const rangeChunks = Number((toBlock - fromBlock + 1n + GETLOGS_CHUNK - 1n) / GETLOGS_CHUNK);
     const poolChunks = this.pools.size > 0 ? rangeChunks : 0;
-    const totalSteps = rangeChunks /* tokens */ + this.factories.size + poolChunks /* LP */ + poolChunks /* swap */ + (gap <= 128 ? 1 : 0);
+    const totalSteps = rangeChunks /* tokens */ + (onlyToken ? 0 : this.factories.size) + poolChunks /* LP */ + poolChunks /* swap */ + (gap <= 128 ? 1 : 0);
     let doneSteps = 0;
     const setStep = (done: number) => {
       this.backfillProgress = { from: Number(fromBlock), to: Number(toBlock), progress: Math.round((done / Math.max(1, totalSteps)) * 100) };
@@ -1333,7 +1349,7 @@ export class EvmAdapter implements ChainAdapter {
     const savedProgress = this.cb.getBackfillProgress?.(this.chainId);
 
     // 1. Transfer logs for all watched tokens, batched per chunk
-    const tokens = [...this.watchedTokens];
+    const tokens = onlyToken ? [onlyToken] : [...this.watchedTokens];
     if (tokens.length > 0 && shouldRun("tokens")) {
       const first = startPhase === "tokens" && savedProgress ? BigInt(Math.max(Number(fromBlock), savedProgress.nextBlock)) : fromBlock;
       for (let from = first; from <= toBlock; from += GETLOGS_CHUNK) {
@@ -1366,7 +1382,7 @@ export class EvmAdapter implements ChainAdapter {
     //    transient provider error must not abort the backfill (2026-08-15: a
     //    flaky Infura eth_getLogs here after the main backfill completed aborted
     //    the whole engine start). Log, advance the cursor, keep going.
-    if (shouldRun("factory")) for (const f of this.factories) {
+    if (!onlyToken && shouldRun("factory")) for (const f of this.factories) {
       markProgress();
       setStep(doneSteps);
       try {
@@ -1395,7 +1411,11 @@ export class EvmAdapter implements ChainAdapter {
     //    error on one chunk must not abort the whole backfill — log, advance the
     //    cursor past the phase, and move on (2026-08-15: flaky Infura eth_getLogs
     //    on a pool here aborted the engine right after the main backfill completed).
-    const pools = [...this.pools];
+    const pools = [...this.pools].filter((pool) => {
+      if (!onlyToken) return true;
+      const sides = this.poolSides.get(pool);
+      return sides?.token0 === onlyToken || sides?.token1 === onlyToken;
+    });
     if (pools.length > 0 && shouldRun("lp")) {
       const first = startPhase === "lp" && savedProgress ? BigInt(Math.max(Number(fromBlock), savedProgress.nextBlock)) : fromBlock;
       for (let from = first; from <= toBlock; from += GETLOGS_CHUNK) {
@@ -1442,7 +1462,7 @@ export class EvmAdapter implements ChainAdapter {
             if (!sides) continue;
             const ts = timestamps.get(Number(l.blockNumber)) ?? Math.floor(Date.now() / 1000);
             for (const token of [sides.token0, sides.token1]) {
-              if (!this.watchedTokens.has(token)) continue;
+              if (onlyToken ? token !== onlyToken : !this.watchedTokens.has(token)) continue;
               const evt = normalizeSwap(this.toRaw(l), this.chainId, token, pool, token === sides.token0, ts);
               if (evt) batch.push(evt);
             }

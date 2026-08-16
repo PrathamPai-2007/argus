@@ -10,7 +10,7 @@ import { DEAD_ADDRESSES, ZERO_ADDRESS } from "../types.ts";
 export type RuleFn = (evt: StandardEvent, view: GraphEngine, cfg: RulesConfig) => Signal | null;
 
 function pct(amount: bigint, circ: bigint): number {
-  return (Number(amount) / Number(circ)) * 100;
+  return circ > 0n ? Number((amount * 10_000n) / circ) / 100 : 0;
 }
 
 function lpIsPool(view: GraphEngine, token: Address): boolean {
@@ -55,12 +55,12 @@ export const R2: RuleFn = (evt, view, cfg) => {
   const s = evt as SwapEvent;
   const windowSecs = c.windowMinutes * 60;
   const now = s.timestamp;
-  const cur = view.swapVolumeBetween(s.tokenAddress, now - windowSecs, now);
+  const cur = view.swapVolumeBetween(s.tokenAddress, now - windowSecs, now + 1);
   const prev = view.swapVolumeBetween(s.tokenAddress, now - 2 * windowSecs, now - windowSecs);
   const curTot = cur.buy + cur.sell;
   const prevTot = prev.buy + prev.sell;
   if (prevTot <= 0n) return null; // no baseline yet
-  const spikePct = (Number(curTot) / Number(prevTot) - 1) * 100;
+  const spikePct = Number((curTot * 10_000n) / prevTot) / 100 - 100;
   if (spikePct < c.volumeSpikePct) return null;
   return {
     chainId: s.chainId,
@@ -196,10 +196,9 @@ export const R6: RuleFn = (evt, view, cfg) => {
 };
 
 /**
- * R7 — LP-lock safety. Fires when a pool's LP token is burned to a dead address
- * such that the fraction of LP *ever minted* that has been removed exceeds
- * (100 - minLockedPct)%. A pool whose LP is being drained faster than it was
- * locked is a liquidity-exit (rug) risk once it has been live for
+ * R7 — LP-lock safety. Fires when less than minLockedPct of a pool's LP token
+ * supply has been burned to a dead address. A pool with little permanently
+ * locked liquidity is a liquidity-exit (rug) risk once it has been live for
  * minPoolAgeHours. PURE: reads graph lp-status after the burn was applied.
  */
 export const R7: RuleFn = (evt, view, cfg) => {
@@ -212,7 +211,7 @@ export const R7: RuleFn = (evt, view, cfg) => {
   if (!lp || lp.lpMinted <= 0n) return null;
   const ageHours = (t.timestamp - lp.createdTs) / 3600;
   if (ageHours < c.minPoolAgeHours) return null;
-  const lockedPct = (Number(lp.lpMinted - lp.lpBurned) / Number(lp.lpMinted)) * 100;
+   const lockedPct = Number((lp.lpBurned * 10_000n) / lp.lpMinted) / 100;
   if (lockedPct >= c.minLockedPct) return null;
   return {
     chainId: t.chainId,

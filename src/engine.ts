@@ -1,21 +1,20 @@
-import { existsSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { watch } from "node:fs";
 import { AlertManager } from "./alerts/manager.ts";
-import { buildAlertLinks, TelegramSink, type AlertSink } from "./alerts/telegram.ts";
+import { buildAlertLinks, formatPerformanceOutcomeMessage, TelegramSink, type AlertSink } from "./alerts/telegram.ts";
 import { loadConfig, reloadConfig, type ArgusConfig } from "./config.ts";
 import * as db from "./db.ts";
 import { resolveFactories } from "./factories.ts";
 import { GraphEngine, DEFAULT_GRAPH_TUNING } from "./graph/engine.ts";
 import { EvmAdapter, type AdapterStatus, type ChainAdapter } from "./ingest/evm.ts";
+import { rankStablecoinVolume, fetchTokenPrice, type RankedToken } from "./ingest/dexscreener.ts";
 import { log, redactUrl } from "./logger.ts";
-import { priceFromSwap, thresholds, updateSession, PERFORMANCE_WINDOW_SECS, type PerformanceEvent } from "./performance.ts";
+import { priceFromSwap, thresholds, updateSession, PERFORMANCE_WINDOW_SECS, type PerformanceEvent, type PerformanceSession } from "./performance.ts";
 import { EventQueue } from "./queue.ts";
 import { RULES } from "./rules/index.ts";
 import { scoreToken } from "./scorer.ts";
 import { seedLabels } from "./seeds.ts";
 import { WebhookDispatcher } from "./webhooks.ts";
-import type { Address, AlertPayload, Signal, StandardEvent } from "./types.ts";
+import type { Address, AlertPayload, Signal, StandardEvent, TokenMeta } from "./types.ts";
 
 // Orchestrator (PLAN.md §4): adapters → queue → graph → rules → scorer → alerts.
 
@@ -56,15 +55,17 @@ const KNOWN_QUOTES: Record<number, Set<string>> = {
 };
 
 export class ArgusEngine {
-  private graph: GraphEngine;
-  private queue = new EventQueue<QueuedEvents>(100_000);
+  private graphs = new Map<number, GraphEngine>();
+  private queue = new EventQueue<QueuedEvents>(100_000, (item) => item.events.length);
+  private queueRecoveryDropped = 0;
+  private queueRecoveryRunning = new Set<number>();
   private chains = new Map<number, ChainRuntime>();
   private alertManager: AlertManager;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   private draining = false;
-  private snapshotTimer: ReturnType<typeof setInterval> | null = null;
   private pruneTimer: ReturnType<typeof setInterval> | null = null;
   private performanceTimer: ReturnType<typeof setInterval> | null = null;
+  private volumeTimer: ReturnType<typeof setInterval> | null = null;
   private configWatcher: ReturnType<typeof watch> | null = null;
   private significance = new Map<string, { lastAt: number; lastValue: number | null }>();
   private metaInFlight = new Set<string>();
@@ -72,13 +73,23 @@ export class ArgusEngine {
   private nonceInFlight = new Set<string>();
   private pendingFinalized = new Map<number, number>();
   private finalizing = new Set<number>();
-  private snapshotBlocks = new Map<number, number>();
+  private controlTail: Promise<void> = Promise.resolve();
   private running = false;
   private alertHook: ((payload: AlertPayload, id: number) => void) | null = null;
   private performanceHook: ((event: PerformanceEvent) => void) | null = null;
   private webhooks = new WebhookDispatcher();
+  private enrichmentQueue: RankedToken[] = [];
+  private enrichmentQueued = new Set<string>();
+  private enrichmentRunning = false;
+  private failedEventRetries = new Map<string, number>();
+  private failedEventTimers = new Set<ReturnType<typeof setTimeout>>();
 
-  /** Optional live hook for emitted alerts (Phase 4 dashboard SSE). */
+  private signalHook?: (signal: Signal) => void;
+  private eventHook?: (event: StandardEvent) => void;
+  private tokenHook?: (token: TokenMeta) => void;
+  private statusHook?: () => void;
+
+  /** Optional live hook for emitted alerts (Phase 4 dashboard SSE/WS). */
   setAlertHook(hook: (payload: AlertPayload, id: number) => void): void {
     this.alertHook = hook;
   }
@@ -87,18 +98,44 @@ export class ArgusEngine {
     this.performanceHook = hook;
   }
 
+  setSignalHook(hook: (signal: Signal) => void): void {
+    this.signalHook = hook;
+  }
+
+  setEventHook(hook: (event: StandardEvent) => void): void {
+    this.eventHook = hook;
+  }
+
+  setTokenHook(hook: (token: TokenMeta) => void): void {
+    this.tokenHook = hook;
+  }
+
+  setStatusHook(hook: () => void): void {
+    this.statusHook = hook;
+  }
+
   /** Active chain ids (Phase 4 dashboard). */
   chainsForStatus(): number[] {
     return [...this.chains.keys()];
   }
 
   /** Live graph view for the dashboard/API (read-only; never mutate from outside). */
-  graphView(): GraphEngine {
-    return this.graph;
+  graphView(chainId?: number): GraphEngine {
+    if (chainId !== undefined) return this.graphFor(chainId);
+    const firstChain = this.chains.keys().next().value ?? 1;
+    return this.graphFor(firstChain);
+  }
+
+  private graphFor(chainId: number): GraphEngine {
+    let graph = this.graphs.get(chainId);
+    if (!graph) {
+      graph = new GraphEngine(DEFAULT_GRAPH_TUNING);
+      this.graphs.set(chainId, graph);
+    }
+    return graph;
   }
 
   constructor(private cfg: ArgusConfig) {
-    this.graph = new GraphEngine(DEFAULT_GRAPH_TUNING);
     const sinks: AlertSink[] = [];
     if (cfg.alerts.telegram) {
       const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -117,26 +154,12 @@ export class ArgusEngine {
 
   async start(): Promise<void> {
     this.running = true;
+    db.resetSessionData();
     const enabled = this.cfg.chains.filter((c) => c.enabled);
     seedLabels(enabled.map((c) => c.chainId));
 
-    // An active backfill owns unfinalized facts that must survive a restart; replay
-    // them instead of restoring a snapshot that may predate the durable cursor.
-    const activeBackfill = enabled.some((c) => {
-      const job = db.getBackfillJob(c.chainId);
-      return job?.status === "running" || job?.status === "failed";
-    });
-    const restored = activeBackfill ? false : this.restoreSnapshot(enabled.map((c) => c.chainId));
     for (const c of enabled) {
-      const job = db.getBackfillJob(c.chainId);
-      if (job?.status === "failed") db.upsertBackfillJob({ ...job, status: "running", lastError: null });
       this.loadChainStateIntoGraph(c.chainId);
-      if (!restored) {
-        const t0 = Date.now();
-        const events = db.loadEvents(c.chainId, 0, Number.MAX_SAFE_INTEGER, activeBackfill ? undefined : { finalizedOnly: true });
-        for (const e of events) this.graph.applyEvent(e);
-        log.info("rebuilt graph from finalized events", { chainId: c.chainId, events: events.length, ms: Date.now() - t0 });
-      }
     }
 
     // Config watchlist → tokens table
@@ -156,35 +179,30 @@ export class ArgusEngine {
               safe.tokenAmount = BigInt(safe.tokenAmount);
               safe.quoteAmount = BigInt(safe.quoteAmount);
             }
+            this.eventHook?.(safe);
             return safe;
           });
           const inserted = db.insertEvents(safeEvents, false);
           if (inserted.length > 0) {
-            this.queue.push({ chainId, events: inserted });
+            if (this.queue.depth >= this.queue.capacity && this.queue.dropped > this.queueRecoveryDropped) {
+              this.queueRecoveryDropped = this.queue.dropped;
+              void this.recoverQueueOverflow(chainId);
+            }
+            for (let i = 0; i < inserted.length; i += 256) {
+              this.queue.push({ chainId, events: inserted.slice(i, i + 256) });
+            }
+            if (this.queue.dropped > this.queueRecoveryDropped) {
+              this.queueRecoveryDropped = this.queue.dropped;
+              void this.recoverQueueOverflow(chainId);
+            }
             await this.drain();
           }
         },
         onFinalized: (chainId, upTo) => this.onFinalized(chainId, upTo),
-        onReorg: (chainId, from) => void this.onReorg(chainId, from),
-        onHead: () => {},
-        onStatus: (chainId, status, detail) => this.onAdapterStatus(chainId, status, detail),
-        onBackfillProgress: (chainId, progress) => {
-          db.upsertBackfillJob({
-            chainId,
-            fromBlock: progress.fromBlock,
-            toBlock: progress.toBlock,
-            phase: progress.phase,
-            nextBlock: progress.nextBlock,
-            provider: progress.provider,
-            status: progress.phase === "complete" ? "complete" : "running",
-            lastError: null,
-          });
-        },
-        getBackfillProgress: (chainId) => {
-          const job = db.getBackfillJob(chainId);
-          if (!job || (job.status !== "running" && job.status !== "failed")) return null;
-          return { phase: job.phase, nextBlock: job.nextBlock, fromBlock: job.fromBlock, toBlock: job.toBlock, provider: job.provider };
-        },
+        onReorg: (chainId, from) => this.onReorg(chainId, from),
+          onHead: () => {},
+          onStatus: (chainId, status, detail) => this.onAdapterStatus(chainId, status, detail),
+          getAppliedBlock: (chainId) => this.chains.get(chainId)?.lastAppliedBlock ?? 0,
       });
       const labels = db.loadLabels(c.chainId);
       adapter.setDisperseContracts([...labels.entries()].filter(([, l]) => l.kind === "disperse").map(([a]) => a));
@@ -196,29 +214,29 @@ export class ArgusEngine {
       adapter.addRelevantAddresses([...labels.keys()]);
       // Register pools known from the DB so LP/Swap subscriptions are live immediately.
       for (const p of db.listPools(c.chainId)) {
-        this.graph.registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
-        if (p.token0 && p.token1) adapter.registerPool(p.poolAddress, p.token0, p.token1);
+        this.graphFor(c.chainId).registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
+        const t0 = p.token0 ?? p.tokenAddress;
+        const t1 = p.token1 ?? p.quoteToken ?? p.tokenAddress;
+        adapter.registerPool(p.poolAddress, t0, t1);
       }
-      this.chains.set(c.chainId, { adapter, status: "connecting", lastAppliedBlock: this.snapshotBlocks.get(c.chainId) ?? 0, eventsApplied: 0 });
+      this.chains.set(c.chainId, { adapter, status: "connecting", lastAppliedBlock: 0, eventsApplied: 0 });
     }
 
     this.drainTimer = setInterval(() => this.drain(), 250);
-    this.snapshotTimer = setInterval(() => this.saveSnapshot(), 5 * 60_000);
     this.pruneTimer = setInterval(() => this.retentionSweep(), 60 * 60_000);
-    this.performanceTimer = setInterval(() => this.expirePerformance(), 60_000);
+    this.performanceTimer = setInterval(() => void this.expirePerformance(), 15_000);
 
     for (const [chainId, rt] of this.chains) {
-      const resumeFrom = this.snapshotBlocks.get(chainId) ?? db.getCheckpoint(chainId);
-      rt.adapter.start(resumeFrom).catch((err) => {
+      rt.adapter.start(null).catch((err) => {
         const safeErr = redactUrl(String(err));
         log.error("adapter start failed", { chainId, err: safeErr });
-        const job = db.getBackfillJob(chainId);
-        if (job?.status === "running") db.upsertBackfillJob({ ...job, status: "failed", lastError: safeErr });
         this.onAdapterStatus(chainId, "error", { err: safeErr });
       });
     }
 
     this.watchConfigFile();
+    this.volumeTimer = setInterval(() => void this.refreshVolumeRankings(), this.cfg.volumeRanking.pollMinutes * 60_000);
+    setTimeout(() => void this.refreshVolumeRankings(), 10_000);
     log.info("argus engine started", {
       chains: enabled.map((c) => c.chainId),
       configuredWatchlist: this.cfg.watchlist.length,
@@ -229,24 +247,29 @@ export class ArgusEngine {
   async stop(): Promise<void> {
     this.running = false;
     if (this.drainTimer) clearInterval(this.drainTimer);
-    if (this.snapshotTimer) clearInterval(this.snapshotTimer);
     if (this.pruneTimer) clearInterval(this.pruneTimer);
     if (this.performanceTimer) clearInterval(this.performanceTimer);
+    if (this.volumeTimer) clearInterval(this.volumeTimer);
     this.configWatcher?.close();
     for (const rt of this.chains.values()) await rt.adapter.stop();
-    this.drain(); // flush
-    this.saveSnapshot();
+    for (const timer of this.failedEventTimers) clearTimeout(timer);
+    this.failedEventTimers.clear();
+    for (const rt of this.chains.values()) await rt.adapter.flushEvents();
+    await this.drainUntilEmpty();
+    await this.controlTail;
+    this.webhooks.stop();
     log.info("argus engine stopped");
   }
 
   private loadChainStateIntoGraph(chainId: number): void {
-    this.graph.setLabels(db.loadLabels(chainId));
+    const graph = this.graphFor(chainId);
+    graph.setLabels(db.loadLabels(chainId));
     const now = Math.floor(Date.now() / 1000);
     for (const t of db.listWatchedTokens(chainId, now)) {
-      if (t.totalSupply !== null) this.graph.setTotalSupply(t.address, t.totalSupply);
+      if (t.totalSupply !== null) graph.setTotalSupply(t.address, t.totalSupply);
     }
     for (const p of db.listPools(chainId)) {
-      this.graph.registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
+      graph.registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
     }
   }
 
@@ -263,43 +286,54 @@ export class ArgusEngine {
     this.pendingFinalized.set(chainId, Math.max(previous, upToBlock));
     if (this.finalizing.has(chainId)) return;
     this.finalizing.add(chainId);
-    void (async () => {
+    void this.enqueueControl(async () => {
       try {
         await this.drainUntilEmpty();
         const boundary = this.pendingFinalized.get(chainId);
         if (boundary === undefined) return;
         db.markEventsFinalized(chainId, boundary);
-        db.setCheckpoint(chainId, boundary);
         db.confirmAlertsUpTo(chainId, boundary);
-        this.graph.finalize(boundary);
+        this.graphFor(chainId).finalize(boundary);
         if (this.pendingFinalized.get(chainId) === boundary) this.pendingFinalized.delete(chainId);
       } finally {
         this.finalizing.delete(chainId);
         if (this.pendingFinalized.has(chainId)) this.onFinalized(chainId, this.pendingFinalized.get(chainId) as number);
       }
-    })();
+    }).catch((err) => log.error("finalization failed", { chainId, err: String(err) }));
   }
 
   private async onReorg(chainId: number, fromBlock: number): Promise<void> {
-    await this.drainUntilEmpty();
-    const pending = this.pendingFinalized.get(chainId);
-    if (pending !== undefined && pending >= fromBlock) this.pendingFinalized.delete(chainId);
-    const rewound = this.graph.rewindTo(fromBlock);
-    db.deleteUnfinalizedFrom(chainId, fromBlock);
     const rt = this.chains.get(chainId);
-    if (rt && rt.lastAppliedBlock >= fromBlock) rt.lastAppliedBlock = fromBlock - 1;
-    const reason = `reorg at block ${fromBlock}`;
-    const retracted = await this.alertManager.retractUnconfirmed(chainId, reason);
-    const retractedPerformance = db.retractPerformanceForAlerts(retracted);
-    for (const id of retractedPerformance) {
-      const session = db.getPerformanceSession(id);
-      if (session) this.performanceHook?.({ type: "performance_retracted", session });
-    }
-    for (const id of retracted) {
-      const row = db.getAlert(id);
-      if (row) this.webhooks.dispatchRetraction(id, chainId, row.token_address, reason);
-    }
-    log.warn("reorg handled", { chainId, fromBlock, rewoundTransitions: rewound, retracted: retracted.length });
+    return this.enqueueControl(async () => {
+      if (rt) await rt.adapter.flushEvents();
+      await this.drainUntilEmpty();
+      const pending = this.pendingFinalized.get(chainId);
+      if (pending !== undefined && pending >= fromBlock) this.pendingFinalized.delete(chainId);
+      const rewound = this.graphFor(chainId).rewindTo(fromBlock);
+      db.deleteDerivedFrom(chainId, fromBlock);
+      db.deleteUnfinalizedFrom(chainId, fromBlock);
+      if (rt && rt.lastAppliedBlock >= fromBlock) rt.lastAppliedBlock = fromBlock - 1;
+      const reason = `reorg at block ${fromBlock}`;
+      const retracted = await this.alertManager.retractUnconfirmed(chainId, fromBlock, reason);
+      const retractedPerformance = db.retractPerformanceForAlerts(retracted);
+      const forkedPerformance = db.retractPerformanceFrom(chainId, fromBlock);
+      for (const id of [...new Set([...retractedPerformance, ...forkedPerformance])]) {
+        const session = db.getPerformanceSession(id);
+        if (session) this.performanceHook?.({ type: "performance_retracted", session });
+      }
+      for (const id of retracted) {
+        const row = db.getAlert(id);
+        if (row) this.webhooks.dispatchRetraction(id, chainId, row.token_address, reason);
+      }
+      this.significance = new Map([...this.significance].filter(([key]) => !key.startsWith(`${chainId}:`)));
+      log.warn("reorg handled", { chainId, fromBlock, rewoundTransitions: rewound, retracted: retracted.length });
+    });
+  }
+
+  private enqueueControl(fn: () => Promise<void>): Promise<void> {
+    const next = this.controlTail.then(fn, fn);
+    this.controlTail = next.catch(() => undefined);
+    return next;
   }
 
   private async drainUntilEmpty(): Promise<void> {
@@ -307,6 +341,43 @@ export class ArgusEngine {
       await this.drain();
       if (this.draining || this.queue.depth > 0) await new Promise((resolve) => setTimeout(resolve, 0));
     } while (this.draining || this.queue.depth > 0);
+  }
+
+  private async recoverQueueOverflow(chainId: number): Promise<void> {
+    if (this.queueRecoveryRunning.has(chainId)) return;
+    this.queueRecoveryRunning.add(chainId);
+    return this.enqueueControl(async () => {
+      try {
+        await this.drainUntilEmpty();
+        const runtime = this.chains.get(chainId);
+        if (!runtime) return;
+        const from = runtime.lastAppliedBlock + 1;
+        db.deleteUnfinalizedFrom(chainId, from);
+        await runtime.adapter.recover("queue-overflow");
+      } finally {
+        this.queueRecoveryRunning.delete(chainId);
+      }
+    });
+  }
+
+  private scheduleEventRetry(chainId: number, evt: StandardEvent, graphApplied: boolean): void {
+    const key = `${evt.chainId}:${evt.blockNumber}:${evt.logIndex}:${evt.kind}`;
+    const attempts = this.failedEventRetries.get(key) ?? 0;
+    if (attempts >= 3 || !this.running) return;
+    this.failedEventRetries.set(key, attempts + 1);
+    const timer = setTimeout(() => {
+      this.failedEventTimers.delete(timer);
+      try {
+        if (graphApplied) this.postProcess(chainId, evt);
+        else this.queue.push({ chainId, events: [evt] });
+        this.failedEventRetries.delete(key);
+      } catch (err) {
+        log.error("event retry failed", { chainId, block: evt.blockNumber, kind: evt.kind, err: String(err) });
+        this.scheduleEventRetry(chainId, evt, graphApplied);
+      }
+      void this.drain();
+    }, 1_000 * (attempts + 1));
+    this.failedEventTimers.add(timer);
   }
 
   // ---- main drain loop --------------------------------------------------------------
@@ -326,15 +397,19 @@ export class ArgusEngine {
         const rt = this.chains.get(chainId);
         for (let i = 0; i < events.length; i++) {
           const evt = events[i] as StandardEvent;
+          const graph = this.graphFor(chainId);
+          let graphApplied = false;
           try {
-            this.graph.applyEvent(evt);
+            graph.applyEvent(evt);
+            graphApplied = true;
             if (rt) {
               rt.eventsApplied++;
               if (evt.blockNumber > rt.lastAppliedBlock) rt.lastAppliedBlock = evt.blockNumber;
             }
             this.postProcess(chainId, evt);
+            this.failedEventRetries.delete(`${evt.chainId}:${evt.blockNumber}:${evt.logIndex}:${evt.kind}`);
           } catch (err) {
-            // A single bad event must never kill the process (silent-death 2026-08-14).
+            this.scheduleEventRetry(chainId, evt, graphApplied);
             log.error("event processing failed — skipping", {
               chainId,
               block: evt.blockNumber,
@@ -379,7 +454,8 @@ export class ArgusEngine {
 
     if (evt.kind !== "transfer") return;
     const token = evt.tokenAddress;
-    const isPoolLp = this.graph.isPool(token);
+    const graph = this.graphFor(chainId);
+    const isPoolLp = graph.isPool(token);
 
     if (!isPoolLp) {
       const meta = db.getToken(chainId, token);
@@ -408,12 +484,12 @@ export class ArgusEngine {
       this.chains.get(chainId)?.adapter.addRelevantAddresses([evt.sender, evt.receiver]);
 
       // lazy nonce check for fresh receivers (PLAN.md §6 "nonce 0–1 = genuinely fresh")
-      if (this.graph.isFresh(evt.receiver, evt.timestamp, 30) && this.graph.nonceOf(evt.receiver) === null) {
+      if (graph.isFresh(evt.receiver, evt.timestamp, 30) && graph.nonceOf(evt.receiver) === null) {
         this.fetchNonce(chainId, evt.receiver);
       }
     }
 
-    this.runRules(chainId, evt);
+      this.runRules(chainId, evt);
   }
 
   private runRules(chainId: number, evt: StandardEvent): void {
@@ -422,7 +498,7 @@ export class ArgusEngine {
       if (!ruleCfg?.enabled) continue;
       let signal: Signal | null = null;
       try {
-        signal = rule(evt, this.graph, this.cfg.rules);
+        signal = rule(evt, this.graphFor(chainId), this.cfg.rules);
       } catch (err) {
         log.error("rule evaluation failed", { rule: id, err: String(err) });
         continue;
@@ -447,14 +523,21 @@ export class ArgusEngine {
     }
     this.significance.set(key, { lastAt: now, lastValue: value });
     db.insertSignal(signal);
+    this.signalHook?.(signal);
     this.webhooks.dispatchSignal(signal);
 
     const res = scoreToken(signal.chainId, signal.tokenAddress, this.cfg.scoring, now);
     if (res.severity === null) return;
     const payload = this.buildAlertPayload(signal.chainId, signal.tokenAddress, res.score, res.severity, res.signals);
-    void this.alertManager.maybeAlert(payload, finalized).then((id) => {
+    void this.alertManager.maybeAlert(payload, finalized).then(async (id) => {
       if (id !== null) {
-        this.openPerformanceSession(id, signal.chainId, signal.tokenAddress, sourceEvent);
+        const alert = db.getAlert(id);
+        if (!alert || alert.retracted) return;
+        // Permanently watch alerted token across sessions
+        db.upsertToken({ chainId: payload.chainId, address: payload.tokenAddress, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt: null });
+        this.refreshWatchSubscription(payload.chainId);
+        await this.ensureTokenPoolsRegistered(payload.chainId, payload.tokenAddress);
+        await this.openPerformanceSession(id, signal.chainId, signal.tokenAddress, sourceEvent);
         this.alertHook?.(payload, id);
         this.webhooks.dispatchAlert(payload, id, finalized);
       }
@@ -463,21 +546,67 @@ export class ArgusEngine {
     });
   }
 
-  private openPerformanceSession(alertId: number, chainId: number, tokenAddress: Address, sourceEvent?: StandardEvent): void {
-    const swap = sourceEvent?.kind === "swap" ? sourceEvent : db.latestSwapForToken(chainId, tokenAddress);
-    if (!swap) return;
-    const entryPrice = priceFromSwap(swap);
-    if (entryPrice === null) return;
-    const pool = db.listPoolsForToken(swap.chainId, swap.tokenAddress).find((p) => p.pool_address === swap.poolAddress);
+  private async ensureTokenPoolsRegistered(chainId: number, token: Address): Promise<void> {
+    const existing = db.listPoolsForToken(chainId, token);
+    if (existing.length > 0) {
+      for (const p of existing) {
+        const quote = p.quote_token ?? token;
+        this.chains.get(chainId)?.adapter.registerPool(p.pool_address, token, quote);
+        this.graphFor(chainId).registerPool(p.pool_address);
+      }
+      return;
+    }
+    const fallback = await fetchTokenPrice(chainId, token);
+    if (fallback) {
+      db.insertPool({
+        chainId,
+        poolAddress: fallback.poolAddress,
+        tokenAddress: token,
+        quoteToken: fallback.quoteToken,
+        factory: "dexscreener",
+        createdBlock: 0,
+      });
+      this.chains.get(chainId)?.adapter.registerPool(fallback.poolAddress, token, fallback.quoteToken);
+      this.graphFor(chainId).registerPool(fallback.poolAddress);
+    }
+  }
+
+  private async openPerformanceSession(alertId: number, chainId: number, tokenAddress: Address, sourceEvent?: StandardEvent): Promise<void> {
+    let swap = sourceEvent?.kind === "swap" ? sourceEvent : db.latestSwapForToken(chainId, tokenAddress);
+    let entryPrice = swap ? priceFromSwap(swap) : null;
+    let poolAddress = swap?.poolAddress;
+    let quoteToken: Address | null = null;
+    const openedAt = sourceEvent?.timestamp ?? (swap?.timestamp ?? Math.floor(Date.now() / 1000));
+    const entryBlock = sourceEvent?.blockNumber ?? (swap?.blockNumber ?? 0);
+
+    if (entryPrice === null) {
+      const fallback = await fetchTokenPrice(chainId, tokenAddress);
+      if (fallback) {
+        entryPrice = fallback.price;
+        poolAddress = fallback.poolAddress;
+        quoteToken = fallback.quoteToken;
+        db.insertPool({
+          chainId,
+          poolAddress: fallback.poolAddress,
+          tokenAddress,
+          quoteToken: fallback.quoteToken,
+          factory: "dexscreener",
+          createdBlock: entryBlock,
+        });
+        this.chains.get(chainId)?.adapter.registerPool(fallback.poolAddress, tokenAddress, fallback.quoteToken);
+        this.graphFor(chainId).registerPool(fallback.poolAddress);
+      }
+    }
+
+    if (entryPrice === null || !poolAddress) return;
+    const pool = db.listPoolsForToken(chainId, tokenAddress).find((p) => p.pool_address === poolAddress);
     const { targetPrice, stopPrice } = thresholds(entryPrice);
-    const openedAt = sourceEvent?.timestamp ?? swap.timestamp;
-    const entryBlock = sourceEvent?.blockNumber ?? swap.blockNumber;
     const id = db.createPerformanceSession({
       alertId,
-      chainId: swap.chainId,
-      tokenAddress: swap.tokenAddress,
-      poolAddress: swap.poolAddress,
-      quoteToken: pool?.quote_token ?? null,
+      chainId,
+      tokenAddress,
+      poolAddress,
+      quoteToken: quoteToken ?? pool?.quote_token ?? null,
       entryPrice,
       targetPrice,
       stopPrice,
@@ -509,19 +638,61 @@ export class ArgusEngine {
       const updated = db.getPerformanceSession(session.id);
       if (!updated) continue;
       this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
+      if (updated.outcome !== "active") {
+        this.dispatchOutcomeNotification(updated);
+      }
     }
   }
 
-  private expirePerformance(): void {
+  private async expirePerformance(): Promise<void> {
     const ids = db.expirePerformanceSessions(Math.floor(Date.now() / 1000));
     for (const id of ids) {
       const session = db.getPerformanceSession(id);
-      if (session) this.performanceHook?.({ type: "performance_closed", session });
+      if (session) {
+        this.performanceHook?.({ type: "performance_closed", session });
+        this.dispatchOutcomeNotification(session);
+      }
+    }
+
+    // Polling check for active sessions with low swap frequency
+    const activeSessions = db.listPerformanceSessions({ activeOnly: true });
+    const now = Math.floor(Date.now() / 1000);
+    for (const session of activeSessions) {
+      if (now - session.updated_at >= 15) {
+        const priceData = await fetchTokenPrice(session.chain_id, session.token_address);
+        if (priceData && priceData.price > 0n) {
+          const result = updateSession(session, priceData.price, now);
+          db.updatePerformanceSession({
+            id: session.id,
+            outcome: result.outcome,
+            currentPrice: result.currentPrice,
+            minPrice: result.minPrice,
+            maxPrice: result.maxPrice,
+            lastBlock: session.last_block,
+            updatedAt: now,
+            closedAt: result.closedAt,
+          });
+          const updated = db.getPerformanceSession(session.id);
+          if (updated) {
+            this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
+            if (updated.outcome !== "active") {
+              this.dispatchOutcomeNotification(updated);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private dispatchOutcomeNotification(session: PerformanceSession): void {
+    const msg = formatPerformanceOutcomeMessage(session);
+    for (const sink of this.alertManager["sinks"]) {
+      void sink.sendText(msg).catch((err) => log.error("outcome sink failed", { sink: sink.name, err: String(err) }));
     }
   }
 
   private buildAlertPayload(chainId: number, token: Address, score: number, severity: AlertPayload["severity"], signals: Signal[]): AlertPayload {
-    const topCluster = this.graph.clusterBreakdown(token).find((c) => c.memberCount > 1);
+    const topCluster = this.graphFor(chainId).clusterBreakdown(token).find((c) => c.memberCount > 1);
     const headline = topCluster
       ? `${topCluster.memberCount} wallets hold ${topCluster.pctOfSupply.toFixed(2)}% of supply in one cluster`
       : (signals[0] ? ruleHeadline(signals[0]) : "suspicious activity detected");
@@ -563,7 +734,7 @@ export class ArgusEngine {
           totalSupply,
           source: existing?.source ?? "manual",
         });
-        if (totalSupply) this.graph.setTotalSupply(token, totalSupply);
+        if (totalSupply) this.graphFor(chainId).setTotalSupply(token, totalSupply);
         // Non-standard / reverting totalSupply(): remember it so the per-transfer
         // lazy check stops firing RPC calls for every event on this token.
         if (totalSupply === null) this.metaFailed.add(key);
@@ -584,7 +755,7 @@ export class ArgusEngine {
     if (!rt) return;
     rt.adapter
       .getNonce(addr)
-      .then((nonce) => this.graph.setNonce(addr, nonce))
+      .then((nonce) => this.graphFor(chainId).setNonce(addr, nonce))
       .catch(() => void 0)
       .finally(() => this.nonceInFlight.delete(key));
   }
@@ -612,7 +783,7 @@ export class ArgusEngine {
         token0: evt.token0,
         token1: evt.token1,
       });
-      this.graph.registerPool(evt.poolAddress, evt.blockNumber, evt.timestamp);
+      this.graphFor(evt.chainId).registerPool(evt.poolAddress, evt.blockNumber, evt.timestamp);
       this.chains.get(evt.chainId)?.adapter.registerPool(evt.poolAddress, evt.token0, evt.token1);
       if (!this.cfg.autoWatch.enabled) continue;
       const existing = db.getToken(evt.chainId, token);
@@ -632,59 +803,128 @@ export class ArgusEngine {
     rt.adapter.setWatchedTokens(db.listWatchedTokens(chainId, now).map((t) => t.address));
   }
 
-  // ---- snapshots / retention / hot reload -------------------------------------------------
-
-  private saveSnapshot(): void {
-    try {
-      const blocks: Record<string, number> = {};
-      for (const [chainId, rt] of this.chains) {
-        // Never regress below the restored block (a fresh instance has lastAppliedBlock 0
-        // until the first backfill delivers events — writing 0 clobbers the checkpoint).
-        blocks[String(chainId)] = Math.max(rt.lastAppliedBlock, this.snapshotBlocks.get(chainId) ?? 0);
-      }
-      const json = JSON.stringify({ version: 1, savedAt: Date.now(), blocks, graph: JSON.parse(this.graph.toJSON()) });
-      mkdirSync(dirname(this.cfg.snapshotPath), { recursive: true });
-      writeFileSync(this.cfg.snapshotPath, json);
-      log.debug("snapshot saved", { path: this.cfg.snapshotPath });
-    } catch (err) {
-      log.error("snapshot save failed", { err: String(err) });
-    }
-  }
-
-  private restoreSnapshot(requiredChains: number[]): boolean {
-    try {
-      if (!existsSync(this.cfg.snapshotPath)) return false;
-      const j = JSON.parse(readFileSync(this.cfg.snapshotPath, "utf8")) as { version: number; blocks: Record<string, number>; graph: unknown };
-      if (j.version !== 1) return false;
-      const blocks = Object.entries(j.blocks).filter(([, block]) => block > 0);
-      const blockMap = new Map(blocks.map(([chainId, block]) => [Number(chainId), block]));
-      // The snapshot is saved at lastAppliedBlock ≈ head, but the checkpoint is
-      // head − finalityDepth, so they are (almost) never equal — requiring equality
-      // made restore always fail and replay everything on every restart. Restore as
-      // long as the snapshot is at least as far along as the finalized checkpoint
-      // (it contains that state); the adapter resumes from snapshotBlock + 1.
-      if (blocks.length === 0 || requiredChains.some((chainId) => (blockMap.get(chainId) ?? 0) < (db.getCheckpoint(chainId) ?? 0))) {
-        log.info("snapshot is not aligned with finalized checkpoints — rebuilding graph");
-        return false;
-      }
-      this.graph = GraphEngine.fromJSON(JSON.stringify(j.graph));
-      for (const [k, v] of blocks) this.snapshotBlocks.set(Number(k), v);
-      log.info("restored graph snapshot", { blocks: j.blocks });
-      return true;
-    } catch (err) {
-      log.warn("snapshot restore failed — falling back to replay", { err: String(err) });
-      return false;
-    }
-  }
+  // ---- retention / hot reload -------------------------------------------------
 
   private retentionSweep(): void {
     const pruned = db.pruneEvents(this.cfg.retention.eventDays * 86_400);
     this.refreshWatchSubscriptionForExpiry();
+    this.pruneSignificance();
+    this.syncAllClusters();
     if (pruned > 0) log.info("retention sweep", { prunedEvents: pruned });
+  }
+
+  private pruneSignificance(): void {
+    const now = Math.floor(Date.now() / 1000);
+    const cooldownSecs = this.cfg.alerts.cooldownMinutes * 60;
+    for (const [key, entry] of this.significance.entries()) {
+      if (now - entry.lastAt > cooldownSecs) {
+        this.significance.delete(key);
+      }
+    }
+  }
+
+  private syncAllClusters(): void {
+    for (const chainId of this.chains.keys()) {
+      const graph = this.graphFor(chainId);
+      const activeTokens = db.listWatchedTokens(chainId, Math.floor(Date.now() / 1000));
+      const allClusters: db.ClusterMaterialized[] = [];
+      for (const t of activeTokens) {
+        const breakdown = graph.clusterBreakdown(t.address);
+        for (const c of breakdown) {
+          allClusters.push({
+            clusterId: c.clusterId,
+            memberCount: c.memberCount,
+            members: c.members,
+          });
+        }
+      }
+      db.syncClusters(allClusters);
+    }
   }
 
   private refreshWatchSubscriptionForExpiry(): void {
     for (const chainId of this.chains.keys()) this.refreshWatchSubscription(chainId);
+  }
+
+  private async refreshVolumeRankings(): Promise<void> {
+    if (!this.running) return;
+    for (const chain of this.cfg.chains.filter((c) => c.enabled)) {
+      try {
+        const ranked = await rankStablecoinVolume(chain.chainId, this.cfg.volumeRanking.topN);
+        const now = Math.floor(Date.now() / 1000);
+        const addresses = ranked.map((token) => token.address);
+        db.expireRankedTokens(chain.chainId, now, addresses);
+        const runtime = this.chains.get(chain.chainId);
+        if (!runtime) continue;
+        const head = runtime.adapter.status().lastHead;
+        for (const token of ranked) {
+          const existing = db.getToken(token.chainId, token.address);
+          db.upsertToken({
+            chainId: token.chainId,
+            address: token.address,
+            symbol: null,
+            decimals: null,
+            totalSupply: null,
+            source: "ranked",
+            ...(existing?.source === "manual" ? {} : { expiresAt: now + this.cfg.volumeRanking.pollMinutes * 120 }),
+          });
+          for (const pool of token.pools) {
+            db.insertPool({
+              chainId: token.chainId,
+              poolAddress: pool.poolAddress,
+              tokenAddress: pool.tokenAddress,
+              quoteToken: pool.quoteToken,
+              factory: "dexscreener",
+              createdBlock: head,
+              ...(pool.createdAt !== null ? { createdTs: pool.createdAt } : {}),
+              token0: pool.tokenAddress,
+              token1: pool.quoteToken,
+            });
+            this.graphFor(token.chainId).registerPool(pool.poolAddress, head, pool.createdAt ?? undefined);
+            runtime.adapter.registerPool(pool.poolAddress, pool.tokenAddress, pool.quoteToken);
+          }
+          this.fetchMeta(token.chainId, token.address);
+          this.enqueueEnrichment(token);
+        }
+        this.refreshWatchSubscription(chain.chainId);
+        log.info("volume ranking refreshed", { chainId: chain.chainId, tokens: ranked.map((token) => ({ token: token.address, volume: token.volume })) });
+      } catch (err) {
+        log.warn("volume ranking refresh failed", { chainId: chain.chainId, err: String(err) });
+      }
+    }
+    void this.drainEnrichmentQueue();
+  }
+
+  private enqueueEnrichment(token: RankedToken): void {
+    const key = `${token.chainId}:${token.address}`;
+    if (this.enrichmentQueued.has(key)) return;
+    this.enrichmentQueued.add(key);
+    this.enrichmentQueue.push(token);
+  }
+
+  private async drainEnrichmentQueue(): Promise<void> {
+    if (this.enrichmentRunning || !this.running) return;
+    this.enrichmentRunning = true;
+    try {
+      while (this.running && this.enrichmentQueue.length > 0) {
+        const token = this.enrichmentQueue.shift() as RankedToken;
+        const key = `${token.chainId}:${token.address}`;
+        this.enrichmentQueued.delete(key);
+        const runtime = this.chains.get(token.chainId);
+        if (!runtime) continue;
+        const head = runtime.adapter.status().lastHead;
+        const blocks = Math.max(1, Math.ceil(this.cfg.volumeRanking.backfillHours * 300));
+        const from = BigInt(Math.max(0, head - blocks));
+        try {
+          await runtime.adapter.backfillToken(token.address, from, BigInt(head));
+          log.info("ranked token enrichment complete", { chainId: token.chainId, token: token.address, from: Number(from), to: head });
+        } catch (err) {
+          log.warn("ranked token enrichment failed", { chainId: token.chainId, token: token.address, err: String(err) });
+        }
+      }
+    } finally {
+      this.enrichmentRunning = false;
+    }
   }
 
   private watchConfigFile(): void {
@@ -710,9 +950,10 @@ export class ArgusEngine {
     this.cfg.scoring = next.scoring;
     this.cfg.alerts = next.alerts;
     this.cfg.autoWatch = next.autoWatch;
+    this.cfg.volumeRanking = next.volumeRanking;
     this.cfg.webhooks = next.webhooks;
     this.webhooks.setTargets(next.webhooks);
-    log.info("config hot-reloaded (rules/scoring/alerts/autoWatch/webhooks)");
+    log.info("config hot-reloaded (rules/scoring/alerts/autoWatch/volumeRanking/webhooks)");
   }
 
   // ---- status ------------------------------------------------------------------------------
@@ -724,10 +965,9 @@ export class ArgusEngine {
         ...rt.adapter.status(),
         lastAppliedBlock: rt.lastAppliedBlock,
         eventsApplied: rt.eventsApplied,
-        checkpoint: db.getCheckpoint(chainId),
       };
     }
-    return { chains, queueDepth: this.queue.depth, queueDropped: this.queue.dropped, wallets: this.graph.wallets.size };
+    return { chains, queueDepth: this.queue.depth, queueDropped: this.queue.dropped, wallets: [...this.graphs.values()].reduce((n, graph) => n + graph.wallets.size, 0) };
   }
 }
 

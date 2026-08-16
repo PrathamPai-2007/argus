@@ -8,7 +8,18 @@ const threshold = LEVELS[(process.env.ARGUS_LOG_LEVEL as LogLevel) ?? (process.a
 
 const LOG_DIR = join(process.cwd(), "logs");
 mkdirSync(LOG_DIR, { recursive: true });
-const file = join(LOG_DIR, `argus-${new Date().toISOString().slice(0, 10)}.log`);
+
+function pad(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/** Format log timestamps in UTC, independent of the host timezone. */
+export function formatLogTimestamp(date = new Date()): string {
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}-${pad(date.getUTCHours())}-${pad(date.getUTCMinutes())}-${pad(date.getUTCSeconds())}`;
+}
+
+const isTest = process.env.NODE_ENV === "test" || process.env.BUN_ENV === "test" || process.argv.some((a) => a.includes("test"));
+const file = join(LOG_DIR, isTest ? "argus-test.log" : `argus-${formatLogTimestamp()}.log`);
 
 // Mask API keys / auth tokens embedded in URLs before anything hits the log file.
 // viem error strings include the full request URL (e.g. `wss://.../ws/v3/<key>`),
@@ -32,10 +43,11 @@ function redactValue(v: unknown): unknown {
 
 function emit(level: LogLevel, msg: string, ctx?: Record<string, unknown>): void {
   if (LEVELS[level] < threshold) return;
-  const line = JSON.stringify({ ts: new Date().toISOString(), level, msg: redactUrl(msg), ...(ctx ? (redactValue(ctx) as Record<string, unknown>) : {}) });
+  const timestamp = formatLogTimestamp();
+  const line = JSON.stringify({ ts: timestamp, level, msg: redactUrl(msg), ...(ctx ? (redactValue(ctx) as Record<string, unknown>) : {}) });
   appendFileSync(file, line + "\n");
   const c = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
-  c(`[${level}] ${msg}${ctx ? " " + JSON.stringify(redactValue(ctx)) : ""}`);
+  c(`[${timestamp}] [${level}] ${redactUrl(msg)}${ctx ? " " + JSON.stringify(redactValue(ctx)) : ""}`);
 }
 
 export const log = {
@@ -49,10 +61,14 @@ export const log = {
 // stderr). Always surface them into the log file — no more silent deaths.
 process.on("uncaughtException", (err) => {
   emit("error", "uncaught exception", { err: String(err?.message ?? err), stack: err?.stack });
+  process.exitCode = 1;
+  process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
   emit("error", "unhandled rejection", {
     err: String(reason instanceof Error ? reason.message : reason),
     stack: reason instanceof Error ? reason.stack : undefined,
   });
+  process.exitCode = 1;
+  process.exit(1);
 });

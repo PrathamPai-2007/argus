@@ -1,4 +1,4 @@
-// Argus configuration — see PLAN.md §12. Secrets live in .env and are
+// Argus configuration — see README.md for usage. Secrets live in .env and are
 // referenced here as ${VAR_NAME} placeholders.
 export default {
   chains: [
@@ -12,7 +12,7 @@ export default {
       finalityDepth: 12,
       staleAfterMs: 15_000,
       backfill: {
-        etherscan: { enabled: true, apiUrl: "https://api.etherscan.io/v2/api", apiKey: "${ETHERSCAN_API_KEY}", requestsPerSecond: 3 },
+        etherscan: { enabled: false, apiUrl: "https://api.etherscan.io/v2/api", apiKey: null, requestsPerSecond: 3 },
         bigquery: { enabled: false, projectId: null, credentialsPath: null, dataset: "bigquery-public-data.crypto_ethereum", maxBytesBilled: null },
         bigqueryThresholdHours: 6,
       },
@@ -28,6 +28,9 @@ export default {
   ],
 
   autoWatch: { enabled: true, factories: ["uniswap-v2"], watchHours: 24 },
+
+  // DexScreener stablecoin-quoted volume drives slow background enrichment.
+  volumeRanking: { pollMinutes: 5, topN: 10, backfillHours: 1 },
 
   rules: {
     R1: { enabled: true, supplyPct: 15, windowHours: 2, walletAgeDays: 7, weight: 35 },
@@ -46,7 +49,8 @@ export default {
 
   dashboard: { port: 3737 },
 
-  // Outbound webhooks: POST JSON to any HTTP endpoint (Discord/Slack/n8n/your server).
+  // Outbound webhooks: POST JSON to an HTTP(S) endpoint (Discord/Slack/n8n/your server).
+  // Private, loopback, link-local, and metadata destinations are rejected by validation.
   // events: which payloads to send — "alert" (new alerts + reorg retractions) and/or "signal".
   // secret: optional; signs the body as x-argus-signature: sha256=<HMAC-SHA256 hex>. Keep in .env.
   webhooks: [
@@ -56,5 +60,4 @@ export default {
   retention: { eventDays: 7 },
 
   dbPath: "data/argus.db",
-  snapshotPath: "data/graph.snapshot.json",
 };

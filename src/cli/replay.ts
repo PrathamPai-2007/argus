@@ -31,8 +31,9 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
   db.openDb(cfg.dbPath);
   seedLabels([args.chainId]);
 
-  const preset = (args.preset ?? "default") as PresetName;
-  applyPreset(cfg, preset);
+  try {
+    const preset = (args.preset ?? "default") as PresetName;
+    applyPreset(cfg, preset);
   console.log(`preset: ${preset} (R1 ${cfg.rules.R1.supplyPct}%, R2 ${cfg.rules.R2.volumeSpikePct}%, R4 warn ${cfg.rules.R4.warnPct}%, R5 ${cfg.rules.R5.minBuyers}, R8 ${cfg.rules.R8.minWallets})`);
 
   const events = db.loadEvents(args.chainId, args.from, args.to, { finalizedOnly: true });
@@ -56,6 +57,7 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
   for (const evt of events) {
     graph.applyEvent(evt);
     applied++;
+    if (args.token && (evt.kind === "swap" || evt.kind === "transfer") && evt.tokenAddress !== args.token.toLowerCase()) continue;
     if (evt.kind === "swap") {
       const watch = watches.get(evt.tokenAddress);
       const price = priceFromSwap(evt);
@@ -73,7 +75,6 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
       }
     }
     if (evt.kind !== "transfer" && evt.kind !== "swap") continue;
-    if (args.token && evt.tokenAddress !== args.token.toLowerCase()) continue;
     for (const [id, rule] of Object.entries(RULES)) {
       const ruleCfg = cfg.rules[id as keyof typeof cfg.rules];
       if (!ruleCfg?.enabled) continue;
@@ -135,8 +136,10 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
     }
     console.log("\nsuggestion: raise thresholds to ~p75 to cut noise, or drop to p25 to catch earlier (see presets).");
   }
-  db.closeDb();
-  return 0;
+    return 0;
+  } finally {
+    db.closeDb();
+  }
 }
 
 function openReplayWatch(watches: Map<string, PerformanceSession>, token: string, evt: SwapEvent, _score: number): void {

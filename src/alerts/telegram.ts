@@ -46,10 +46,47 @@ export function formatAlertMessage(p: AlertPayload, alertId: number, confirmed: 
     "<b>Evidence:</b>",
     ...p.lines.map((l) => ` • ${esc(l)}`),
     "",
-    `<a href="${p.links.dexscreener}">DEXScreener</a> · <a href="${p.links.bubblemaps}">Bubblemaps</a> · <a href="${p.links.dashboard}">Dashboard</a>`,
+    `<a href="${esc(p.links.dexscreener)}">DEXScreener</a> · <a href="${esc(p.links.bubblemaps)}">Bubblemaps</a> · <a href="${esc(p.links.dashboard)}">Dashboard</a>`,
     `<i>alert #${alertId}</i>`,
   ];
   return lines.join("\n");
+}
+
+export function formatPerformanceOutcomeMessage(s: {
+  outcome: string;
+  token_address: string;
+  chain_id: number;
+  entry_price: bigint;
+  current_price: bigint;
+  alert_id: number;
+}): string {
+  const chain = chainSlug(s.chain_id);
+  const entry = Number(s.entry_price) / 1e18;
+  const current = Number(s.current_price) / 1e18;
+  const pct = entry > 0 ? (((current - entry) / entry) * 100).toFixed(2) : "0.00";
+  const sign = Number(pct) >= 0 ? "+" : "";
+
+  let emoji = "⏱️";
+  let title = "PERFORMANCE WATCH EXPIRED (12h)";
+  if (s.outcome === "target_hit") {
+    emoji = "🎯";
+    title = "TAKE PROFIT TARGET HIT (+50%)";
+  } else if (s.outcome === "stop_hit") {
+    emoji = "🛑";
+    title = "STOP LOSS HIT (-20%)";
+  }
+
+  return [
+    `${emoji} <b>ARGUS — ${title}</b>`,
+    "",
+    `<b>Token:</b> <code>${esc(s.token_address)}</code>`,
+    `<b>Chain:</b> ${esc(chain.name)}`,
+    `<b>Return:</b> ${sign}${pct}%`,
+    `<b>Entry price:</b> $${entry > 0 ? entry.toFixed(6) : "—"}`,
+    `<b>Final price:</b> $${current > 0 ? current.toFixed(6) : "—"}`,
+    "",
+    `<i>linked to alert #${s.alert_id}</i>`,
+  ].join("\n");
 }
 
 export class TelegramSink implements AlertSink {
@@ -72,6 +109,7 @@ export class TelegramSink implements AlertSink {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: this.chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+      signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -83,7 +121,7 @@ export class TelegramSink implements AlertSink {
 /** Verify a bot token (doctor). */
 export async function probeTelegram(botToken: string): Promise<{ ok: boolean; username?: string; error?: string }> {
   try {
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/getMe`, { signal: AbortSignal.timeout(15_000) });
     const j = (await res.json()) as { ok: boolean; result?: { username?: string }; description?: string };
     if (j.ok) return j.result?.username ? { ok: true, username: j.result.username } : { ok: true };
     return { ok: false, error: j.description ?? `http ${res.status}` };

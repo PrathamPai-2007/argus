@@ -286,6 +286,8 @@ describe("GraphEngine pools (Phase 6)", () => {
 
   test("finalize prunes stale rolling window events older than 24h for finalized blocks", () => {
     const g = new GraphEngine();
+    const pool = addr("pool");
+    g.registerPool(pool, 1, 0);
     g.setTotalSupply(TOKEN, 1_000_000n);
     const now = 200_000;
     const oldTs = now - 100_000; // > 86,400s old
@@ -294,8 +296,8 @@ describe("GraphEngine pools (Phase 6)", () => {
 
     // Apply old buy (block 10) and recent buy (block 100)
     g.applyEvent(transfer(ZERO_ADDRESS, addr("acc1"), 500n, { block: bOld, ts: oldTs }));
-    g.applyEvent(transfer(addr("acc1"), addr("acc2"), 100n, { block: bOld, ts: oldTs }));
-    g.applyEvent(transfer(addr("acc2"), addr("acc3"), 200n, { block: bRecent, ts: now }));
+    g.applyEvent(transfer(pool, addr("acc2"), 100n, { block: bOld, ts: oldTs }));
+    g.applyEvent(transfer(pool, addr("acc3"), 200n, { block: bRecent, ts: now }));
 
     // Before finalize: fresh accumulation scans old buy
     expect(g.freshAccumulation(TOKEN, 0, now, 30).amount).toBe(300n);
@@ -307,4 +309,3 @@ describe("GraphEngine pools (Phase 6)", () => {
     expect(g.freshAccumulation(TOKEN, 0, now, 30).amount).toBe(200n);
   });
 });
-

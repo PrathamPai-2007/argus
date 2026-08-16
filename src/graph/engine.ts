@@ -117,8 +117,8 @@ export class GraphEngine {
   private sends = new Map<Address, SendEntry[]>();
   private exchangeFundings = new Map<Address, ExchangeFundingEntry[]>();
   private fundingAmountIndex = new Map<string, Array<{ funded: Address; funder: Address; ts: number; block: number }>>();
-  private fanoutSenders = new Set<Address>(); // already-unioned fanouts (don't re-union per event)
-  private identicalAmountUnioned = new Set<string>(); // amount keys already unioned
+  private fanoutSenders = new Map<string, number>(); // key → last union timestamp
+  private identicalAmountUnioned = new Map<string, number>(); // amount key → last union timestamp
 
   private history: Array<{ block: number; undo: UndoFn }> = [];
 
@@ -271,7 +271,7 @@ export class GraphEngine {
     }
 
     // accumulation log: plain wallet receiving tokens (mints from 0x0 are distribution, not accumulation)
-    const receiverIsPlain = !this.isInfra(to) && !this.pools.has(to) && from !== ZERO_ADDRESS;
+    const receiverIsPlain = !this.isInfra(to) && !this.pools.has(to) && this.pools.has(from);
     if (receiverIsPlain && evt.amount > 0n) {
       this.buys.push({ token, addr: to, amount: evt.amount, ts: evt.timestamp, block: evt.blockNumber });
       undos.push(() => void this.buys.pop());
@@ -289,9 +289,10 @@ export class GraphEngine {
       const cutoff = evt.timestamp - this.tuning.fanoutWindowSecs;
       const recent = list.filter((s) => s.ts >= cutoff && s.token === token && s.amount === evt.amount);
       const distinct = [...new Set(recent.map((s) => s.to))].filter((a) => !this.isInfra(a));
-      if (distinct.length >= this.tuning.fanoutMinRecipients && !this.fanoutSenders.has(`${from}:${token}:${evt.amount}`)) {
+      const fanoutKey = `${from}:${token}:${evt.amount}`;
+      if (distinct.length >= this.tuning.fanoutMinRecipients && !this.fanoutSenders.has(fanoutKey)) {
         const key = `${from}:${token}:${evt.amount}`;
-        this.fanoutSenders.add(key);
+        this.fanoutSenders.set(key, evt.timestamp);
         undos.push(() => this.fanoutSenders.delete(key));
         const mark = this.dsu.mark();
         for (let i = 1; i < distinct.length; i++) this.dsu.union(distinct[0] as Address, distinct[i] as Address);
@@ -349,9 +350,9 @@ export class GraphEngine {
       const cutoff = evt.timestamp - this.tuning.identicalAmountWindowSecs;
       const recent = list.filter((x) => x.ts >= cutoff && this.labels.get(x.funder)?.kind !== "cex");
       const distinctFunded = [...new Set(recent.map((x) => x.funded))].filter((a) => !this.isInfra(a));
-      if (distinctFunded.length >= this.tuning.identicalAmountMin && !this.identicalAmountUnioned.has(key)) {
-        this.identicalAmountUnioned.add(key);
-        undos.push(() => this.identicalAmountUnioned.delete(key));
+       if (distinctFunded.length >= this.tuning.identicalAmountMin && !this.identicalAmountUnioned.has(key)) {
+         this.identicalAmountUnioned.set(key, evt.timestamp);
+         undos.push(() => this.identicalAmountUnioned.delete(key));
         const mark = this.dsu.mark();
         for (let i = 1; i < distinctFunded.length; i++) this.dsu.union(distinctFunded[0] as Address, distinctFunded[i] as Address);
         undos.push(() => this.dsu.rollback(mark));
@@ -436,6 +437,9 @@ export class GraphEngine {
     if (!maxTs) {
       for (const b of this.buys) if (b.ts > maxTs) maxTs = b.ts;
       for (const s of this.swapVolume) if (s.ts > maxTs) maxTs = s.ts;
+      for (const list of this.sends.values()) for (const s of list) if (s.ts > maxTs) maxTs = s.ts;
+      for (const list of this.exchangeFundings.values()) for (const x of list) if (x.ts > maxTs) maxTs = x.ts;
+      for (const list of this.fundingAmountIndex.values()) for (const x of list) if (x.ts > maxTs) maxTs = x.ts;
     }
     const cutoffTs = maxTs - 86_400;
     if (cutoffTs > 0) {
@@ -455,6 +459,13 @@ export class GraphEngine {
         const filtered = list.filter((x) => x.block > boundary || x.ts >= cutoffTs);
         if (filtered.length === 0) this.fundingAmountIndex.delete(key);
         else this.fundingAmountIndex.set(key, filtered);
+        if (filtered.length === 0) this.identicalAmountUnioned.delete(key);
+      }
+      for (const [key, ts] of this.fanoutSenders) {
+        if (ts < cutoffTs) this.fanoutSenders.delete(key);
+      }
+      for (const [key, ts] of this.identicalAmountUnioned) {
+        if (ts < cutoffTs) this.identicalAmountUnioned.delete(key);
       }
     }
 
@@ -493,7 +504,7 @@ export class GraphEngine {
   freshAccumulation(token: Address, windowStartTs: number, refTs: number, ageDays: number): { amount: bigint; wallets: Address[]; perWallet: Map<Address, bigint> } {
     const perWallet = new Map<Address, bigint>();
     for (const b of this.buys) {
-      if (b.token !== token || b.ts < windowStartTs) continue;
+      if (b.token !== token || b.ts < windowStartTs || b.ts > refTs) continue;
       if (!this.isFresh(b.addr, refTs, ageDays)) continue;
       perWallet.set(b.addr, (perWallet.get(b.addr) ?? 0n) + b.amount);
     }
@@ -515,13 +526,13 @@ export class GraphEngine {
   /** Recent identical-amount sends from a sender (R3). */
   recentFanout(sender: Address, token: Address, amount: bigint, windowSecs: number, refTs: number): SendEntry[] {
     const list = this.sends.get(sender) ?? [];
-    return list.filter((s) => s.token === token && s.amount === amount && s.ts >= refTs - windowSecs);
+    return list.filter((s) => s.token === token && s.amount === amount && s.ts >= refTs - windowSecs && s.ts <= refTs);
   }
 
   /** Same-size exchange fundings within a window (R8). */
   exchangeFanout(funder: Address, amount: bigint, windowSecs: number, refTs: number): ExchangeFundingEntry[] {
     const list = this.exchangeFundings.get(funder) ?? [];
-    return list.filter((x) => x.amount === amount && x.ts >= refTs - windowSecs);
+    return list.filter((x) => x.amount === amount && x.ts >= refTs - windowSecs && x.ts <= refTs);
   }
 
   /** How was this wallet exchange-funded? (R8 evidence) */
@@ -605,8 +616,8 @@ export class GraphEngine {
         sends: [...this.sends.entries()],
         exchangeFundings: [...this.exchangeFundings.entries()],
         fundingAmountIndex: [...this.fundingAmountIndex.entries()],
-        fanoutSenders: [...this.fanoutSenders],
-        identicalAmountUnioned: [...this.identicalAmountUnioned],
+         fanoutSenders: [...this.fanoutSenders.entries()],
+         identicalAmountUnioned: [...this.identicalAmountUnioned.entries()],
       },
       replacer,
     );
@@ -630,8 +641,8 @@ export class GraphEngine {
     g.sends = new Map((j["sends"] as [Address, SendEntry[]][]) ?? []);
     g.exchangeFundings = new Map((j["exchangeFundings"] as [Address, ExchangeFundingEntry[]][]) ?? []);
     g.fundingAmountIndex = new Map((j["fundingAmountIndex"] as [string, { funded: Address; funder: Address; ts: number; block: number }[]][]) ?? []);
-    g.fanoutSenders = new Set((j["fanoutSenders"] as Address[]) ?? []);
-    g.identicalAmountUnioned = new Set((j["identicalAmountUnioned"] as string[]) ?? []);
+    g.fanoutSenders = new Map((j["fanoutSenders"] as [string, number][] | string[] ?? []).map((v) => Array.isArray(v) ? v : [v, 0]));
+    g.identicalAmountUnioned = new Map((j["identicalAmountUnioned"] as [string, number][] | string[] ?? []).map((v) => Array.isArray(v) ? v : [v, 0]));
     return g;
   }
 }

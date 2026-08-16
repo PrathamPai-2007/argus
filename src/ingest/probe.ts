@@ -31,8 +31,10 @@ export async function probeTraceCapability(client: PublicClient): Promise<boolea
       if (msg.includes("method") && (msg.includes("not found") || msg.includes("does not exist") || msg.includes("not supported") || msg.includes("unsupported") || msg.includes("not available") || msg.includes("missing"))) {
         continue; // method doesn't exist
       }
-      // "transaction not found" / "invalid params" style errors mean the method exists
-      return true;
+      // Only method-level validation errors prove the method exists. Auth,
+      // timeout, and rate-limit failures are not capability evidence.
+      if (msg.includes("transaction not found") || msg.includes("invalid params") || msg.includes("invalid argument")) return true;
+      return false;
     }
   }
   return false;

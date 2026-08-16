@@ -83,6 +83,24 @@ export function deleteUnfinalizedFrom(chainId: number, fromBlock: number): numbe
   return Number(res.changes);
 }
 
+/** Remove durable projections created by a forked block range. */
+export function deleteDerivedFrom(chainId: number, fromBlock: number): void {
+  const d = getDb();
+  d.transaction(() => {
+    const pools = d.query("SELECT pool_address, token_address FROM pools WHERE chain_id = ? AND created_block >= ?").all(chainId, fromBlock) as {
+      pool_address: string;
+      token_address: string;
+    }[];
+    d.run("DELETE FROM funding_edges WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
+    d.run("DELETE FROM wallets WHERE chain_id = ? AND first_seen_block >= ?", [chainId, fromBlock]);
+    d.run("DELETE FROM signals WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
+    d.run("DELETE FROM pools WHERE chain_id = ? AND created_block >= ?", [chainId, fromBlock]);
+    for (const pool of pools) {
+      d.run("DELETE FROM tokens WHERE chain_id = ? AND source = 'factory' AND address = ? AND NOT EXISTS (SELECT 1 FROM pools WHERE chain_id = ? AND token_address = ?)", [chainId, pool.token_address, chainId, pool.token_address]);
+    }
+  })();
+}
+
 export function loadEvents(chainId: number, fromBlock: number, toBlock: number, opts?: { finalizedOnly?: boolean; kinds?: EventKind[] }): StandardEvent[] {
   let sql = "SELECT payload_json FROM events WHERE chain_id = ? AND block_number >= ? AND block_number <= ?";
   const params: (string | number)[] = [chainId, fromBlock, toBlock];
@@ -129,60 +147,6 @@ export function pruneEvents(olderThanSecs: number): number {
     [cutoff],
   );
   return Number(res.changes);
-}
-
-// ---- Checkpoints -----------------------------------------------------------
-
-export function getCheckpoint(chainId: number): number | null {
-  const row = getDb().query("SELECT last_block FROM checkpoints WHERE chain_id = ?").get(chainId) as { last_block: number } | null;
-  return row ? row.last_block : null;
-}
-
-export function setCheckpoint(chainId: number, lastBlock: number): void {
-  getDb().run("INSERT INTO checkpoints (chain_id, last_block) VALUES (?, ?) ON CONFLICT(chain_id) DO UPDATE SET last_block = excluded.last_block", [chainId, lastBlock]);
-}
-
-export interface BackfillJob {
-  chainId: number;
-  fromBlock: number;
-  toBlock: number;
-  phase: string;
-  nextBlock: number;
-  provider: string;
-  status: "running" | "paused" | "complete" | "failed";
-  lastError: string | null;
-  updatedAt: number;
-}
-
-export function getBackfillJob(chainId: number): BackfillJob | null {
-  const row = getDb().query("SELECT chain_id, from_block, to_block, phase, next_block, provider, status, last_error, updated_at FROM backfill_jobs WHERE chain_id = ?").get(chainId) as {
-    chain_id: number; from_block: number; to_block: number; phase: string; next_block: number; provider: string;
-    status: BackfillJob["status"]; last_error: string | null; updated_at: number;
-  } | null;
-  if (!row) return null;
-  return {
-    chainId: row.chain_id,
-    fromBlock: row.from_block,
-    toBlock: row.to_block,
-    phase: row.phase,
-    nextBlock: row.next_block,
-    provider: row.provider,
-    status: row.status,
-    lastError: row.last_error,
-    updatedAt: row.updated_at,
-  };
-}
-
-export function upsertBackfillJob(job: Omit<BackfillJob, "updatedAt">): void {
-  getDb().run(
-    `INSERT INTO backfill_jobs (chain_id, from_block, to_block, phase, next_block, provider, status, last_error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(chain_id) DO UPDATE SET
-       from_block = excluded.from_block, to_block = excluded.to_block, phase = excluded.phase,
-       next_block = excluded.next_block, provider = excluded.provider, status = excluded.status,
-       last_error = excluded.last_error, updated_at = unixepoch()`,
-    [job.chainId, job.fromBlock, job.toBlock, job.phase, job.nextBlock, job.provider, job.status, job.lastError],
-  );
 }
 
 // ---- Wallets / funding -----------------------------------------------------
@@ -245,6 +209,43 @@ export function listFundingEdgesForWallets(chainId: number, addresses: Address[]
   return rows.map((r) => ({ ...r, amount: BigInt(r.amount) }));
 }
 
+/** Clean up transient unfinalized events and un-alerted expired ranked tokens on startup while preserving alerts, alerted tokens, pools, and active performance tracking across sessions. */
+export function resetSessionData(): void {
+  const d = getDb();
+  d.transaction(() => {
+    d.run("DELETE FROM events WHERE finalized = 0");
+    d.run(
+      "DELETE FROM tokens WHERE source = 'ranked' AND expires_at IS NOT NULL AND address NOT IN (SELECT token_address FROM alerts)",
+    );
+    d.run(
+      "DELETE FROM pools WHERE token_address NOT IN (SELECT address FROM tokens)",
+    );
+  })();
+}
+
+export interface ClusterMaterialized {
+  clusterId: string;
+  memberCount: number;
+  members: Address[];
+}
+
+/** Materialize in-memory DSU cluster state into SQL clusters and cluster_members tables. */
+export function syncClusters(clusters: ClusterMaterialized[]): void {
+  const d = getDb();
+  d.transaction(() => {
+    d.run("DELETE FROM cluster_members");
+    d.run("DELETE FROM clusters");
+    const insCluster = d.prepare("INSERT OR REPLACE INTO clusters (id, member_count) VALUES (?, ?)");
+    const insMember = d.prepare("INSERT OR REPLACE INTO cluster_members (cluster_id, address) VALUES (?, ?)");
+    for (const c of clusters) {
+      insCluster.run(c.clusterId, c.memberCount);
+      for (const m of c.members) {
+        insMember.run(c.clusterId, m);
+      }
+    }
+  })();
+}
+
 // ---- Tokens / pools ----------------------------------------------------------
 
 export function upsertToken(t: TokenMeta & { expiresAt?: number | null }): void {
@@ -262,7 +263,7 @@ export function upsertToken(t: TokenMeta & { expiresAt?: number | null }): void 
 
 export function getToken(chainId: number, address: Address): (TokenMeta & { expires_at: number | null }) | null {
   const row = getDb().query("SELECT * FROM tokens WHERE chain_id = ? AND address = ?").get(chainId, address) as
-    | { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: "manual" | "factory"; expires_at: number | null }
+    | { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: "manual" | "factory" | "ranked"; expires_at: number | null }
     | null;
   if (!row) return null;
   return {
@@ -279,7 +280,7 @@ export function getToken(chainId: number, address: Address): (TokenMeta & { expi
 export function listWatchedTokens(chainId: number, nowSecs: number): TokenMeta[] {
   const rows = getDb()
     .query("SELECT * FROM tokens WHERE chain_id = ? AND (expires_at IS NULL OR expires_at > ?)")
-    .all(chainId, nowSecs) as { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: "manual" | "factory" }[];
+    .all(chainId, nowSecs) as { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: "manual" | "factory" | "ranked" }[];
   return rows.map((r) => ({
     chainId: r.chain_id,
     address: r.address,
@@ -288,6 +289,19 @@ export function listWatchedTokens(chainId: number, nowSecs: number): TokenMeta[]
     totalSupply: r.total_supply !== null ? BigInt(r.total_supply) : null,
     source: r.source,
   }));
+}
+
+/** Expire ranked tokens that were not returned by the latest volume poll. */
+export function expireRankedTokens(chainId: number, nowSecs: number, keep: Address[]): void {
+  if (keep.length === 0) {
+    getDb().run("UPDATE tokens SET expires_at = ? WHERE chain_id = ? AND source = 'ranked'", [nowSecs, chainId]);
+    return;
+  }
+  const placeholders = keep.map(() => "?").join(",");
+  getDb().run(
+    `UPDATE tokens SET expires_at = ? WHERE chain_id = ? AND source = 'ranked' AND address NOT IN (${placeholders})`,
+    [nowSecs, chainId, ...keep],
+  );
 }
 
 export function insertPool(p: {
@@ -429,7 +443,7 @@ export function getAlert(id: number): AlertRow | null {
 }
 
 export function alertsInLastMinute(): number {
-  const row = getDb().query("SELECT COUNT(*) AS n FROM alerts WHERE created_at >= ?").get(Math.floor(Date.now() / 1000) - 60) as { n: number };
+  const row = getDb().query("SELECT COUNT(*) AS n FROM alerts WHERE created_at >= ? AND retracted = 0").get(Math.floor(Date.now() / 1000) - 60) as { n: number };
   return row.n;
 }
 
@@ -525,7 +539,10 @@ export function createPerformanceSession(input: {
       input.entryPrice.toString(),
     ],
   );
-  return Number(result.lastInsertRowid);
+  if (Number(result.changes) > 0) return Number(result.lastInsertRowid);
+  const existing = getPerformanceForAlert(input.alertId);
+  if (!existing) throw new Error(`performance session missing for alert ${input.alertId}`);
+  return existing.id;
 }
 
 export function getPerformanceSession(id: number): PerformanceSession | null {
@@ -580,6 +597,20 @@ export function retractPerformanceForAlerts(alertIds: number[]): number[] {
   const placeholders = alertIds.map(() => "?").join(",");
   const rows = getDb().query(`SELECT id FROM performance_sessions WHERE alert_id IN (${placeholders}) AND outcome <> 'retracted'`).all(...alertIds) as { id: number }[];
   if (rows.length > 0) getDb().run(`UPDATE performance_sessions SET outcome = 'retracted', closed_at = COALESCE(closed_at, unixepoch()), updated_at = unixepoch() WHERE alert_id IN (${placeholders}) AND outcome <> 'retracted'`, alertIds);
+  return rows.map((r) => r.id);
+}
+
+export function retractPerformanceFrom(chainId: number, fromBlock: number): number[] {
+  const d = getDb();
+  const rows = d.query(
+    "SELECT id FROM performance_sessions WHERE chain_id = ? AND outcome <> 'retracted' AND (entry_block >= ? OR last_block >= ?)",
+  ).all(chainId, fromBlock, fromBlock) as { id: number }[];
+  if (rows.length > 0) {
+    d.run(
+      "UPDATE performance_sessions SET outcome = 'retracted', closed_at = COALESCE(closed_at, unixepoch()), updated_at = unixepoch() WHERE chain_id = ? AND outcome <> 'retracted' AND (entry_block >= ? OR last_block >= ?)",
+      [chainId, fromBlock, fromBlock],
+    );
+  }
   return rows.map((r) => r.id);
 }
 

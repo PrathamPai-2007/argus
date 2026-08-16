@@ -13,7 +13,7 @@ export class RollbackDSU {
   private size = new Map<string, number>();
   private keys = new Set<string>();
   /** Each entry: [childRoot, parentRoot] — before the union, childRoot was its own root. */
-  private ops: Array<[string, string]> = [];
+  private ops: Array<[string, string, string[]]> = [];
   private _components = 0;
 
   private ensure(x: string): void {
@@ -38,9 +38,20 @@ export class RollbackDSU {
 
   /** Union two elements. Returns true if they were in different sets. */
   union(a: string, b: string): boolean {
+    const created: string[] = [];
+    if (!this.parent.has(a)) created.push(a);
+    if (!this.parent.has(b)) created.push(b);
     let ra = this.find(a);
     let rb = this.find(b);
-    if (ra === rb) return false;
+    if (ra === rb) {
+      for (const key of new Set(created)) {
+        this.parent.delete(key);
+        this.size.delete(key);
+        this.keys.delete(key);
+        this._components--;
+      }
+      return false;
+    }
     let sa = this.size.get(ra) as number;
     let sb = this.size.get(rb) as number;
     if (sa < sb) {
@@ -49,7 +60,7 @@ export class RollbackDSU {
     }
     this.parent.set(rb, ra);
     this.size.set(ra, sa + sb);
-    this.ops.push([rb, ra]);
+    this.ops.push([rb, ra, created]);
     this._components--;
     return true;
   }
@@ -64,12 +75,18 @@ export class RollbackDSU {
     while (this.ops.length > m) {
       const op = this.ops.pop();
       if (!op) break;
-      const [childRoot, parentRoot] = op;
+      const [childRoot, parentRoot, created] = op;
       const ps = this.size.get(parentRoot) as number;
       const cs = this.size.get(childRoot) as number;
       this.parent.set(childRoot, childRoot);
       this.size.set(parentRoot, ps - cs);
       this._components++;
+      for (const key of created) {
+        this.parent.delete(key);
+        this.size.delete(key);
+        this.keys.delete(key);
+        this._components--;
+      }
     }
   }
 
@@ -117,16 +134,16 @@ export class RollbackDSU {
   }
 
   /** Export raw state for snapshots. */
-  toJSON(): { parent: Record<string, string>; size: Record<string, number>; ops: [string, string][] } {
+  toJSON(): { parent: Record<string, string>; size: Record<string, number>; ops: [string, string, string[]][] } {
     return { parent: Object.fromEntries(this.parent), size: Object.fromEntries(this.size), ops: [...this.ops] };
   }
 
-  static fromJSON(j: { parent: Record<string, string>; size: Record<string, number>; ops: [string, string][] }): RollbackDSU {
+  static fromJSON(j: { parent: Record<string, string>; size: Record<string, number>; ops: [string, string, string[]][] }): RollbackDSU {
     const d = new RollbackDSU();
     d.parent = new Map(Object.entries(j.parent));
     d.size = new Map(Object.entries(j.size));
     d.keys = new Set(d.parent.keys());
-    d.ops = j.ops.map(([a, b]) => [a, b] as [string, string]);
+    d.ops = j.ops.map(([a, b, created]) => [a, b, created ?? []] as [string, string, string[]]);
     let comps = 0;
     for (const [k, v] of d.parent) if (k === v) comps++;
     d._components = comps;

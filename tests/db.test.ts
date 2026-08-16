@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { closeDb, getBackfillJob, getToken, insertEvents, loadEvents, openDb, upsertBackfillJob, upsertToken } from "../src/db.ts";
+import { closeDb, getToken, insertEvents, loadEvents, openDb, upsertToken } from "../src/db.ts";
 import type { FundingEvent, StandardTransferEvent, SwapEvent } from "../src/types.ts";
 
 // Regression: payload_json round-trips bigints to strings; loadEvents must revive them
@@ -48,12 +48,6 @@ describe("db.loadEvents", () => {
     };
     expect(insertEvents([event], false)).toHaveLength(1);
     expect(insertEvents([event], false)).toHaveLength(0);
-  });
-
-  test("persists resumable backfill progress", () => {
-    upsertBackfillJob({ chainId: 1, fromBlock: 100, toBlock: 200, phase: "tokens", nextBlock: 164, provider: "rpc", status: "running", lastError: null });
-    expect(getBackfillJob(1)?.nextBlock).toBe(164);
-    expect(getBackfillJob(1)?.phase).toBe("tokens");
   });
 
   test("upsertToken updates expires_at on conflict and preserves it when omitted", () => {

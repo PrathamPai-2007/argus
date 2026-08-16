@@ -14,6 +14,7 @@ export interface DashboardOptions {
 
 interface SseClient {
   write: (payload: unknown) => void;
+  close: () => void;
 }
 
 function safeJson(data: unknown): string {
@@ -22,11 +23,18 @@ function safeJson(data: unknown): string {
   );
 }
 
+function queryLimit(value: string | null, fallback: number): number {
+  if (value === null || value === "") return fallback;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, 500) : fallback;
+}
+
 export class DashboardServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private sseClients = new Map<number, SseClient>();
   private nextSseId = 1;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly authToken = process.env.ARGUS_DASHBOARD_TOKEN ?? null;
 
   constructor(
     private engine: ArgusEngine,
@@ -43,14 +51,34 @@ export class DashboardServer {
         headline: payload.headline,
       }),
     );
-    engine.setPerformanceHook((event) => this.broadcastPerformance(event));
+    engine.setPerformanceHook((event) => this.broadcast({ type: "performance", data: event }));
+    engine.setSignalHook((signal) => this.broadcast({ type: "signal", data: signal }));
+    engine.setEventHook((event) => this.broadcast({ type: "event", data: event }));
   }
 
   start(): void {
     this.server = Bun.serve({
       hostname: "127.0.0.1",
       port: this.opts.port,
-      fetch: (req) => this.handle(req),
+      fetch: (req, server) => {
+        const url = new URL(req.url);
+        if (url.pathname === "/ws") {
+          if (this.authToken && !authorized(req, this.authToken)) {
+            return new Response("unauthorized", { status: 401 });
+          }
+          const upgraded = server.upgrade(req, { data: undefined });
+          if (upgraded) return undefined;
+          return new Response("upgrade failed", { status: 400 });
+        }
+        return this.handle(req);
+      },
+      websocket: {
+        open: (ws) => {
+          ws.subscribe("argus-live");
+        },
+        message: () => {},
+        close: () => {},
+      },
     });
     this.tickTimer = setInterval(() => this.broadcastStatus(), 5_000);
     log.info("dashboard listening", { url: `http://127.0.0.1:${this.opts.port}` });
@@ -59,6 +87,7 @@ export class DashboardServer {
   stop(): void {
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.tickTimer = null;
+    for (const client of this.sseClients.values()) client.close();
     this.sseClients.clear();
     if (this.server) {
       this.server.stop(true);
@@ -73,6 +102,9 @@ export class DashboardServer {
 
     const url = new URL(req.url);
     const accept = req.headers.get("accept") ?? "";
+    if (this.authToken && !authorized(req, this.authToken)) {
+      return new Response("authentication required", { status: 401, headers: { "www-authenticate": 'Basic realm="argus"' } });
+    }
 
     if (url.pathname === "/" || url.pathname.startsWith("/token/")) {
       return new Response(renderPage(), { headers: { "content-type": "text/html; charset=utf-8" } });
@@ -87,10 +119,15 @@ export class DashboardServer {
             write: (payload) => {
               try {
                 controller.enqueue(encoder.encode(`data: ${safeJson(payload)}\n\n`));
+                if ((controller.desiredSize ?? 0) < 0) {
+                  this.sseClients.delete(id);
+                  controller.close();
+                }
               } catch {
                 this.sseClients.delete(id);
               }
             },
+            close: () => { try { controller.close(); } catch { /* already closed */ } },
           };
           this.sseClients.set(id, client);
           client.write({ type: "hello", t: Date.now() });
@@ -127,19 +164,19 @@ export class DashboardServer {
       return this.json(tokens);
     }
     if (url.pathname === "/api/alerts") {
-      const limit = Number(url.searchParams.get("limit") ?? 100);
+      const limit = queryLimit(url.searchParams.get("limit"), 100);
       return this.json(db.listAlerts(limit));
     }
     if (url.pathname === "/api/signals") {
       const chain = Number(url.searchParams.get("chain") ?? 0);
-      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const limit = queryLimit(url.searchParams.get("limit"), 50);
       return this.json(db.listSignals(chain || undefined, limit));
     }
     if (url.pathname === "/api/performance") {
       const chain = Number(url.searchParams.get("chain") ?? 0);
       const token = url.searchParams.get("token")?.toLowerCase() as Address | undefined;
       const activeOnly = url.searchParams.get("active") === "1";
-      const limit = Number(url.searchParams.get("limit") ?? 100);
+      const limit = queryLimit(url.searchParams.get("limit"), 100);
       return this.json(db.listPerformanceSessions({ ...(chain ? { chainId: chain } : {}), ...(token ? { tokenAddress: token } : {}), activeOnly, limit }));
     }
     const tokenMatch = url.pathname.match(/^\/api\/token\/(\d+)\/(0x[0-9a-fA-F]{40})$/);
@@ -170,7 +207,7 @@ export class DashboardServer {
       return this.json(this.graphForWallet(chainId, addr));
     }
     if (url.pathname === "/api/events/recent") {
-      const limit = Number(url.searchParams.get("limit") ?? 100);
+      const limit = queryLimit(url.searchParams.get("limit"), 100);
       return this.json(db.listRecentEvents(limit));
     }
 
@@ -178,16 +215,16 @@ export class DashboardServer {
   }
 
   private broadcast(data: unknown): void {
+    const payload = safeJson(data);
     for (const client of this.sseClients.values()) client.write(data);
-  }
-
-  private broadcastPerformance(event: PerformanceEvent): void {
-    this.broadcast(event);
+    if (this.server) {
+      this.server.publish("argus-live", payload);
+    }
   }
 
   /** Wallet clusters + funding edges for a token (graph API for external visualization). */
   private graphForToken(chainId: number, token: Address): unknown {
-    const graph = this.engine.graphView();
+    const graph = this.engine.graphView(chainId);
     const tokenRow = db.getToken(chainId, token);
     const allMembers = new Set<Address>();
     const clusters = graph.clusterBreakdown(token).map((c) => ({
@@ -230,7 +267,7 @@ export class DashboardServer {
 
   /** A single wallet's cluster, funder chain and funding edges (graph API). */
   private graphForWallet(chainId: number, addr: Address): unknown {
-    const graph = this.engine.graphView();
+    const graph = this.engine.graphView(chainId);
     const w = graph.wallets.get(addr);
     const label = graph.labelOf(addr);
     const cluster = graph.clusterOf(addr);
@@ -270,6 +307,18 @@ export class DashboardServer {
         "cache-control": "no-cache",
       },
     });
+  }
+}
+
+function authorized(req: Request, token: string): boolean {
+  const header = req.headers.get("authorization") ?? "";
+  if (header.startsWith("Bearer ")) return header.slice(7) === token;
+  if (!header.startsWith("Basic ")) return false;
+  try {
+    const decoded = atob(header.slice(6));
+    return decoded.slice(decoded.indexOf(":") + 1) === token;
+  } catch {
+    return false;
   }
 }
 

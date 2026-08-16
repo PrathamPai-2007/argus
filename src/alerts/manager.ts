@@ -25,11 +25,17 @@ export class AlertManager {
     const last = lastAlertForToken(payload.chainId, payload.tokenAddress);
     if (last) {
       const cooldownSecs = this.alertsCfg.cooldownMinutes * 60;
-      const inCooldown = now - last.created_at < cooldownSecs;
+      const timeSinceLast = now - last.created_at;
+      const inCooldown = timeSinceLast < cooldownSecs;
       if (inCooldown) {
+        let lastPayloadSev: string | null = null;
+        try { lastPayloadSev = JSON.parse(last.payload_json).severity; } catch {}
+        const newCritical = payload.severity === "critical" && lastPayloadSev !== "critical";
+        const minEscalationInterval = 180; // 3 minutes between escalation re-alerts
         const escalated = payload.score >= last.score + this.alertsCfg.escalationDelta;
-        if (!escalated) {
-          log.debug("alert suppressed by cooldown", { token: payload.tokenAddress, score: payload.score, lastScore: last.score });
+        
+        if (!escalated || (timeSinceLast < minEscalationInterval && !newCritical)) {
+          log.debug("alert suppressed by cooldown", { token: payload.tokenAddress, score: payload.score, lastScore: last.score, timeSinceLast });
           return null;
         }
         log.info("alert escalation inside cooldown", { token: payload.tokenAddress, from: last.score, to: payload.score });
@@ -53,11 +59,11 @@ export class AlertManager {
     return id;
   }
 
-  /** Retract all unconfirmed alerts for a chain (reorg invalidation, PLAN.md §11.1). Returns retracted ids. */
-  async retractUnconfirmed(chainId: number, reason: string): Promise<number[]> {
+  /** Retract unconfirmed alerts at or after the reorg boundary. */
+  async retractUnconfirmed(chainId: number, fromBlock: number, reason: string): Promise<number[]> {
     const rows = getDb()
-      .query("SELECT id, token_address FROM alerts WHERE chain_id = ? AND confirmed = 0 AND retracted = 0")
-      .all(chainId) as { id: number; token_address: string }[];
+      .query("SELECT id, token_address FROM alerts WHERE chain_id = ? AND confirmed = 0 AND retracted = 0 AND (block_number IS NULL OR block_number >= ?)")
+      .all(chainId, fromBlock) as { id: number; token_address: string }[];
     for (const r of rows) {
       retractAlert(r.id);
       const text = `↩️ ARGUS retraction: alert #${r.id} (${r.token_address}) invalidated — ${reason}`;

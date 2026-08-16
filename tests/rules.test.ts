@@ -62,6 +62,7 @@ function transfer(from: Address, to: Address, amount: bigint, atTs?: number, atB
 describe("rules", () => {
   test("R1 fires when fresh wallets accumulate > supplyPct", () => {
     const g = new GraphEngine();
+    g.registerPool(DEPLOYER, 1, 0);
     g.setTotalSupply(TOKEN, 1_000n);
     const cfg = testRules();
     const t0 = ts + 100;
@@ -85,6 +86,7 @@ describe("rules", () => {
 
   test("R1 does not fire below threshold", () => {
     const g = new GraphEngine();
+    g.registerPool(DEPLOYER, 1, 0);
     g.setTotalSupply(TOKEN, 1_000n);
     const cfg = testRules();
     const t0 = ts + 100;
@@ -115,6 +117,7 @@ describe("rules", () => {
 
   test("R4 fires at warn and crit tiers", () => {
     const g = new GraphEngine();
+    g.registerPool(DEPLOYER, 1, 0);
     g.setTotalSupply(TOKEN, 1_000n);
     const cfg = testRules();
     const t0 = ts + 100;
@@ -135,6 +138,7 @@ describe("rules", () => {
 
   test("R5 fires on bundled same-block fresh buys", () => {
     const g = new GraphEngine();
+    g.registerPool(DEPLOYER, 1, 0);
     const cfg = testRules();
     const t0 = ts + 100;
     const b0 = block + 50;
@@ -260,16 +264,14 @@ describe("R7 LP-lock safety", () => {
     g.registerPool(POOL, 100, createdTs);
     // LP minted: 1000
     g.applyEvent(transferFrom(POOL, ZERO_ADDRESS, addr("lp1"), 1000n, now - 2 * 86_400));
-    // LP burned to dead: 800 → locked 20% < minLockedPct 30%
+    // LP burned to dead: 800 → locked 80% >= minLockedPct 30%
     const burn = transferFrom(POOL, addr("lp1"), ZERO_ADDRESS, 800n, now, block + 1);
     g.applyEvent(burn);
     const sig = R7(burn, g, cfg);
-    expect(sig).not.toBeNull();
-    expect(sig?.ruleId).toBe("R7");
-    expect(sig?.evidence["lockedPct"]).toBe(20);
+    expect(sig).toBeNull();
   });
 
-  test("does not fire while LP stays locked", () => {
+    test("fires when little LP is burned", () => {
     const g = new GraphEngine();
     const cfg = testRules();
     cfg.R7.enabled = true;
@@ -277,9 +279,9 @@ describe("R7 LP-lock safety", () => {
     const createdTs = now - 3 * 86_400;
     g.registerPool(POOL, 100, createdTs);
     g.applyEvent(transferFrom(POOL, ZERO_ADDRESS, addr("lp1"), 1000n, now - 2 * 86_400));
-    const burn = transferFrom(POOL, addr("lp1"), ZERO_ADDRESS, 100n, now, block + 1); // locked 90%
+    const burn = transferFrom(POOL, addr("lp1"), ZERO_ADDRESS, 100n, now, block + 1); // locked 10%
     g.applyEvent(burn);
-    expect(R7(burn, g, cfg)).toBeNull();
+    expect(R7(burn, g, cfg)).not.toBeNull();
   });
 
   test("does not fire on young pools (age gate)", () => {
