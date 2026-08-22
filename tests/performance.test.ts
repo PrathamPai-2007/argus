@@ -29,10 +29,15 @@ describe("alert performance", () => {
     expect(thresholds(p as bigint)).toEqual({ targetPrice: 750_000_000_000_000_000n, stopPrice: 400_000_000_000_000_000n });
   });
 
+  test("normalizes ERC-20 decimals in both orientations", () => {
+    expect(priceFromSwap(swap(1_000_000n, 1_000_000_000_000_000_000n), 6, 18)).toBe(1_000_000_000_000_000_000n);
+    expect(priceFromSwap(swap(1_000_000_000_000_000_000n, 1_000_000n), 18, 6)).toBe(1_000_000_000_000_000_000n);
+  });
+
   test("closes at stop, target, and twelve-hour expiry", () => {
     const entry = priceFromSwap(swap(100n, 100n)) as bigint;
     const t = thresholds(entry);
-    const base = { target_price: t.targetPrice, stop_price: t.stopPrice, min_price: entry, max_price: entry, expires_at: 1_000 + PERFORMANCE_WINDOW_SECS, outcome: "active" as const };
+    const base = { entry_price: entry, target_price: t.targetPrice, stop_price: t.stopPrice, min_price: entry, max_price: entry, expires_at: 1_000 + PERFORMANCE_WINDOW_SECS, outcome: "active" as const };
     expect(updateSession(base, t.stopPrice, 1_001).outcome).toBe("stop_hit");
     expect(updateSession(base, t.targetPrice, 1_001).outcome).toBe("target_hit");
     expect(updateSession(base, entry, 1_000 + PERFORMANCE_WINDOW_SECS).outcome).toBe("expired");
@@ -57,5 +62,13 @@ describe("alert performance", () => {
   test("invalid swaps do not produce a price", () => {
     expect(priceFromSwap(swap(0n, 1n))).toBeNull();
     expect(priceFromSwap(swap(1n, 0n))).toBeNull();
+  });
+
+  test("extreme single-step price jump returns invalid_price outcome", () => {
+    const entry = 1_000_000_000n; // 1e9
+    const t = thresholds(entry);
+    const base = { entry_price: entry, target_price: t.targetPrice, stop_price: t.stopPrice, min_price: entry, max_price: entry, expires_at: 1_000 + PERFORMANCE_WINDOW_SECS, outcome: "active" as const };
+    // Price jump of 2,000x (USD vs Native scale mismatch) returns invalid_price
+    expect(updateSession(base, entry * 2000n, 1_001).outcome).toBe("invalid_price");
   });
 });

@@ -20,6 +20,8 @@ function makeConfig(): ChainConfig {
     name: "test",
     enabled: true,
     rpcs: ["https://example.test"],
+    httpRpcs: [],
+    infuraRetryMinutes: 5,
     finalityDepth: 64,
     staleAfterMs: 30_000,
     backfill: {
@@ -35,7 +37,6 @@ function callbacks(overrides: Partial<AdapterCallbacks> = {}): AdapterCallbacks 
     onEvents: async () => {},
     onFinalized: () => {},
     onReorg: async () => {},
-    onHead: () => {},
     onStatus: () => {},
     ...overrides,
   };
@@ -239,5 +240,92 @@ describe("EvmAdapter backfill phase resume", () => {
     adapter.setWatchedTokens([TOKEN]);
 
     await expect(adapter.backfillRange(1000n, 1001n)).rejects.toThrow("boom");
+  });
+
+  test("Infura URL detection", () => {
+    const cfg = makeConfig();
+    cfg.rpcs = ["https://mainnet.infura.io/v3/secret_key", "https://ethereum-rpc.publicnode.com"];
+    const adapter = new EvmAdapter(cfg, callbacks());
+    const a = adapter as unknown as {
+      isInfuraUrl: (url?: string) => boolean;
+      getInfuraIndex: () => number;
+    };
+    expect(a.isInfuraUrl("https://mainnet.infura.io/v3/xxx")).toBe(true);
+    expect(a.isInfuraUrl("wss://ethereum-rpc.publicnode.com")).toBe(false);
+    expect(a.getInfuraIndex()).toBe(0);
+  });
+
+  test("successful Infura probe restores the live endpoint", async () => {
+    const cfg = makeConfig();
+    cfg.rpcs = ["https://mainnet.infura.io/v3/secret_key", "https://ethereum-rpc.publicnode.com"];
+    const adapter = new EvmAdapter(cfg, callbacks());
+    const a = adapter as unknown as {
+      running: boolean;
+      busy: boolean;
+      endpointIdx: number;
+      buildClient: (url: string, silent?: boolean) => PublicClient;
+      recover: (reason: string) => Promise<void>;
+      tryInfuraRecovery: () => Promise<void>;
+    };
+    a.running = true;
+    a.busy = false;
+    a.endpointIdx = 1;
+    let recovered = "";
+    a.buildClient = () => ({ getBlockNumber: async () => 1000n } as unknown as PublicClient);
+    a.recover = async (reason) => { recovered = reason; };
+
+    await a.tryInfuraRecovery();
+
+    expect(a.endpointIdx).toBe(0);
+    expect(recovered).toBe("infura-retry");
+  });
+
+  test("Routine RPC backfilling uses Ankr instead of Infura", async () => {
+    const cfg = makeConfig();
+    cfg.rpcs = ["https://mainnet.infura.io/v3/secret_key", "https://ethereum-rpc.publicnode.com"];
+    cfg.httpRpcs = ["https://rpc.ankr.com/eth/test_key", "https://ethereum-rpc.publicnode.com"];
+    const queriedUrls: string[] = [];
+
+    const adapter = new EvmAdapter(cfg, callbacks());
+    (adapter as unknown as { buildClient: (url: string) => PublicClient }).buildClient = (url: string) => {
+      queriedUrls.push(url);
+      return {
+        getLogs: async () => [],
+        getBlockNumber: async () => 1000n,
+      } as unknown as PublicClient;
+    };
+
+    const event = parseAbiItem("event Transfer(address indexed from, address indexed to, uint256 value)");
+    await (adapter as unknown as {
+      getLogsAdaptive: (addrs: string[], e: unknown, from: bigint, to: bigint) => Promise<unknown[]>;
+    }).getLogsAdaptive([TOKEN], event, 1000n, 1005n);
+
+    expect(queriedUrls).toContain("https://rpc.ankr.com/eth/test_key");
+    expect(queriedUrls).not.toContain("https://mainnet.infura.io/v3/secret_key");
+  });
+
+  test("Dual-RPC parallel catch-up backfills chunks across both Infura and Public ETH RPC", async () => {
+    const cfg = makeConfig();
+    cfg.rpcs = ["https://mainnet.infura.io/v3/secret_key", "https://ethereum-rpc.publicnode.com"];
+    const queriedUrls: string[] = [];
+
+    const adapter = new EvmAdapter(cfg, callbacks());
+    (adapter as unknown as { buildClient: (url: string) => PublicClient }).buildClient = (url: string) => {
+      return {
+        getLogs: async () => {
+          queriedUrls.push(url);
+          return [];
+        },
+        getBlockNumber: async () => 2000n,
+        getBlock: async () => ({ hash: "0x" + "11".repeat(32), parentHash: "0x" + "22".repeat(32), number: 1000n, timestamp: 1_700_000_000n, transactions: [] }),
+      } as unknown as PublicClient;
+    };
+    adapter.setWatchedTokens([TOKEN]);
+
+    // Range spanning 3 chunks (> 128 blocks each chunk: 1000..1127, 1128..1255, 1256..1383)
+    await adapter.backfillRange(1000n, 1383n);
+
+    expect(queriedUrls).toContain("https://mainnet.infura.io/v3/secret_key");
+    expect(queriedUrls).toContain("https://ethereum-rpc.publicnode.com");
   });
 });

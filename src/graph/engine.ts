@@ -114,6 +114,12 @@ export class GraphEngine {
   private swapVolume: SwapVolumeEntry[] = [];
 
   private buys: BuyEntry[] = [];
+  private buysByToken = new Map<Address, BuyEntry[]>();
+  private tokensBoughtByWallet = new Map<Address, Map<Address, number>>();
+
+  getTokensBoughtBy(wallet: Address): Set<Address> {
+    return new Set(this.tokensBoughtByWallet.get(wallet)?.keys() ?? []);
+  }
   private sends = new Map<Address, SendEntry[]>();
   private exchangeFundings = new Map<Address, ExchangeFundingEntry[]>();
   private fundingAmountIndex = new Map<string, Array<{ funded: Address; funder: Address; ts: number; block: number }>>();
@@ -273,8 +279,25 @@ export class GraphEngine {
     // accumulation log: plain wallet receiving tokens (mints from 0x0 are distribution, not accumulation)
     const receiverIsPlain = !this.isInfra(to) && !this.pools.has(to) && this.pools.has(from);
     if (receiverIsPlain && evt.amount > 0n) {
-      this.buys.push({ token, addr: to, amount: evt.amount, ts: evt.timestamp, block: evt.blockNumber });
-      undos.push(() => void this.buys.pop());
+      const entry = { token, addr: to, amount: evt.amount, ts: evt.timestamp, block: evt.blockNumber };
+      this.buys.push(entry);
+      
+      let tBuys = this.buysByToken.get(token);
+      if (!tBuys) { tBuys = []; this.buysByToken.set(token, tBuys); }
+      tBuys.push(entry);
+
+      let wTokens = this.tokensBoughtByWallet.get(to);
+      if (!wTokens) { wTokens = new Map(); this.tokensBoughtByWallet.set(to, wTokens); }
+      wTokens.set(token, (wTokens.get(token) ?? 0) + 1);
+
+      undos.push(() => {
+        this.buys.pop();
+        this.buysByToken.get(token)!.pop();
+        const wt = this.tokensBoughtByWallet.get(to)!;
+        const count = wt.get(token)!;
+        if (count === 1) wt.delete(token);
+        else wt.set(token, count - 1);
+      });
     }
 
     // token fan-out detection (linkage signal #3, feeds R3)
@@ -313,9 +336,14 @@ export class GraphEngine {
     const funderLabel = this.labels.get(evt.funder);
     const funderIsCex = funderLabel?.kind === "cex";
 
-    const fresh = !this.wallets.has(evt.funded);
+    const fresh = this.isFresh(evt.funded, evt.timestamp, 1);
     this.ensureWallet(evt.funded, evt.blockNumber, evt.timestamp, evt.funder, undos);
     this.ensureWallet(evt.funder, evt.blockNumber, evt.timestamp, null, undos);
+    const wFunded = this.wallets.get(evt.funded);
+    if (wFunded && !wFunded.funder && evt.funder) {
+      wFunded.funder = evt.funder;
+      undos.push(() => { wFunded.funder = null; });
+    }
 
     if (funderIsCex) {
       // Exchange-funded: NEVER hard-merge (PLAN.md §6). Track weak edge for R8.
@@ -444,6 +472,17 @@ export class GraphEngine {
     const cutoffTs = maxTs - 86_400;
     if (cutoffTs > 0) {
       this.buys = this.buys.filter((b) => b.block > boundary || b.ts >= cutoffTs);
+      this.buysByToken.clear();
+      this.tokensBoughtByWallet.clear();
+      for (const b of this.buys) {
+        let tBuys = this.buysByToken.get(b.token);
+        if (!tBuys) { tBuys = []; this.buysByToken.set(b.token, tBuys); }
+        tBuys.push(b);
+        let wTokens = this.tokensBoughtByWallet.get(b.addr);
+        if (!wTokens) { wTokens = new Map(); this.tokensBoughtByWallet.set(b.addr, wTokens); }
+        wTokens.set(b.token, (wTokens.get(b.token) ?? 0) + 1);
+      }
+
       this.swapVolume = this.swapVolume.filter((s) => s.block > boundary || s.ts >= cutoffTs);
       for (const [addr, list] of this.sends) {
         const filtered = list.filter((s) => s.block > boundary || s.ts >= cutoffTs);
@@ -503,8 +542,8 @@ export class GraphEngine {
   /** Fresh-wallet accumulation within a window (R1). */
   freshAccumulation(token: Address, windowStartTs: number, refTs: number, ageDays: number): { amount: bigint; wallets: Address[]; perWallet: Map<Address, bigint> } {
     const perWallet = new Map<Address, bigint>();
-    for (const b of this.buys) {
-      if (b.token !== token || b.ts < windowStartTs || b.ts > refTs) continue;
+    for (const b of this.buysByToken.get(token) ?? []) {
+      if (b.ts < windowStartTs || b.ts > refTs) continue;
       if (!this.isFresh(b.addr, refTs, ageDays)) continue;
       perWallet.set(b.addr, (perWallet.get(b.addr) ?? 0n) + b.amount);
     }
@@ -516,8 +555,8 @@ export class GraphEngine {
   /** Fresh receivers of a token within a specific block (R5). */
   freshReceiversInBlock(token: Address, block: number, refTs: number, ageDays: number): Address[] {
     const set = new Set<Address>();
-    for (const b of this.buys) {
-      if (b.token !== token || b.block !== block) continue;
+    for (const b of this.buysByToken.get(token) ?? []) {
+      if (b.block !== block) continue;
       if (this.isFresh(b.addr, refTs, ageDays)) set.add(b.addr);
     }
     return [...set];
@@ -638,6 +677,14 @@ export class GraphEngine {
     g.lpMinted = new Map((j["lpMinted"] as [Address, bigint][]) ?? []);
     g.swapVolume = (j["swapVolume"] as SwapVolumeEntry[]) ?? [];
     g.buys = (j["buys"] as BuyEntry[]) ?? [];
+    for (const b of g.buys) {
+      let tBuys = g.buysByToken.get(b.token);
+      if (!tBuys) { tBuys = []; g.buysByToken.set(b.token, tBuys); }
+      tBuys.push(b);
+      let wTokens = g.tokensBoughtByWallet.get(b.addr);
+      if (!wTokens) { wTokens = new Map(); g.tokensBoughtByWallet.set(b.addr, wTokens); }
+      wTokens.set(b.token, (wTokens.get(b.token) ?? 0) + 1);
+    }
     g.sends = new Map((j["sends"] as [Address, SendEntry[]][]) ?? []);
     g.exchangeFundings = new Map((j["exchangeFundings"] as [Address, ExchangeFundingEntry[]][]) ?? []);
     g.fundingAmountIndex = new Map((j["fundingAmountIndex"] as [string, { funded: Address; funder: Address; ts: number; block: number }[]][]) ?? []);

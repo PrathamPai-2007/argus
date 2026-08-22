@@ -4,7 +4,7 @@ import { GraphEngine, DEFAULT_GRAPH_TUNING } from "../graph/engine.ts";
 import { applyPreset, type PresetName } from "../presets.ts";
 import { RULES } from "../rules/index.ts";
 import { seedLabels } from "../seeds.ts";
-import { PERFORMANCE_STOP_BPS, PERFORMANCE_TARGET_BPS, PERFORMANCE_WINDOW_SECS, priceFromSwap, thresholds, updateSession, type PerformanceSession } from "../performance.ts";
+import { PERFORMANCE_STOP_BPS, PERFORMANCE_TARGET_BPS, PERFORMANCE_WINDOW_SECS, decimalsForAddress, priceFromSwap, thresholds, updateSession, type PerformanceSession } from "../performance.ts";
 import type { RuleId, Signal, SwapEvent } from "../types.ts";
 
 // `replay` — offline backtest / threshold tuning (PLAN.md §10, Phase 5).
@@ -60,7 +60,13 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
     if (args.token && (evt.kind === "swap" || evt.kind === "transfer") && evt.tokenAddress !== args.token.toLowerCase()) continue;
     if (evt.kind === "swap") {
       const watch = watches.get(evt.tokenAddress);
-      const price = priceFromSwap(evt);
+      const pool = db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
+        .get(evt.chainId, evt.poolAddress, evt.tokenAddress) as { quote_token: string | null } | undefined;
+      const tokenDecimals = db.getToken(evt.chainId, evt.tokenAddress)?.decimals ?? 18;
+      const quoteDecimals = pool?.quote_token
+        ? db.getToken(evt.chainId, pool.quote_token)?.decimals ?? decimalsForAddress(pool.quote_token)
+        : 18;
+      const price = priceFromSwap(evt, tokenDecimals, quoteDecimals);
       if (watch && price !== null && watch.pool_address === evt.poolAddress) {
         const result = updateSession(watch, price, evt.timestamp);
         watch.current_price = result.currentPrice;
@@ -91,7 +97,7 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
         bestWeights.set(s.tokenAddress, weights);
         if (evt.kind === "swap" && !watches.has(s.tokenAddress)) {
           const score = Math.min(100, [...weights.values()].reduce((a, b) => a + b, 0));
-          if (score >= cfg.scoring.info) openReplayWatch(watches, s.tokenAddress, evt, score);
+          if (score >= cfg.scoring.info) openReplayWatch(watches, s.tokenAddress, evt);
         }
         console.log(`  [block ${evt.blockNumber}] ${s.ruleId} w=${s.weight} ${JSON.stringify(s.evidence).slice(0, 220)}`);
       }
@@ -142,7 +148,7 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
   }
 }
 
-function openReplayWatch(watches: Map<string, PerformanceSession>, token: string, evt: SwapEvent, _score: number): void {
+function openReplayWatch(watches: Map<string, PerformanceSession>, token: string, evt: SwapEvent): void {
   const entryPrice = priceFromSwap(evt);
   if (entryPrice === null) return;
   const { targetPrice, stopPrice } = thresholds(entryPrice);
@@ -166,6 +172,9 @@ function openReplayWatch(watches: Map<string, PerformanceSession>, token: string
     min_price: entryPrice,
     max_price: entryPrice,
     updated_at: evt.timestamp,
+    last_poll_at: null,
+    missing_observations: 0,
+    close_reason: null,
   });
 }
 

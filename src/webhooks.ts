@@ -136,7 +136,7 @@ export class WebhookDispatcher {
         }, delay);
         this.timers.add(timer);
       } else {
-        log.error("webhook delivery failed", { event: body.type, url: redactUrl(target.url), err: String(err) });
+        log.error("webhook delivery failed", { event: body.type, url: redactUrl(target.url), err });
       }
     } finally {
       if (timeout) clearTimeout(timeout);

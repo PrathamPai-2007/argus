@@ -61,8 +61,17 @@ export async function runDoctor(configPath?: string): Promise<number> {
         name: `rpc[${chain.name}]`,
         ok: p.reachable,
         detail: p.reachable
-          ? `${redacted} block=${p.blockNumber} latency=${p.latencyMs}ms traces=${p.tracesAvailable ? "yes" : "no (log-only funding extraction)"}`
+          ? `${redacted} block=${p.blockNumber} latency=${p.latencyMs}ms traces=${p.tracesAvailable ? "yes" : "no"} archiveDepth=${p.maxArchiveDepth >= 100000 ? "full" : `${p.maxArchiveDepth}b`}`
           : `${redacted} unreachable: ${p.error}`,
+      });
+    }
+    for (const url of chain.httpRpcs) {
+      const p = await probeEndpoint(url, false);
+      const redacted = url.replace(/\/([A-Za-z0-9_-]{16,})$/, "/***");
+      checks.push({
+        name: `http-rpc[${chain.name}]`,
+        ok: p.reachable,
+        detail: p.reachable ? `${redacted} block=${p.blockNumber} latency=${p.latencyMs}ms` : `${redacted} unreachable: ${p.error}`,
       });
     }
     if (!anyOk) checks.push({ name: `rpc[${chain.name}] pool`, ok: false, detail: "no working endpoint for an ENABLED chain" });

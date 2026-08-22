@@ -32,7 +32,6 @@ export async function runBackfill(args: BackfillArgs): Promise<number> {
     },
     onFinalized: () => {},
     onReorg: () => {},
-    onHead: () => {},
     onStatus: (_c, status, detail) => log.info("backfill adapter status", { status, ...detail }),
   });
   const labels = db.loadLabels(args.chainId);

@@ -133,7 +133,7 @@ function reviveEvent(e: Record<string, unknown>): StandardEvent {
   if (typeof e["timestamp"] === "string") e["timestamp"] = Number(e["timestamp"]);
   for (const f of BIGINT_FIELDS[e["kind"] as EventKind] ?? []) {
     const v = e[f];
-    if (typeof v === "string") e[f] = BigInt(v);
+    if (typeof v === "string" || typeof v === "number") e[f] = BigInt(v);
   }
   return e as unknown as StandardEvent;
 }
@@ -233,11 +233,11 @@ export interface ClusterMaterialized {
 export function syncClusters(clusters: ClusterMaterialized[]): void {
   const d = getDb();
   d.transaction(() => {
-    d.run("DELETE FROM cluster_members");
-    d.run("DELETE FROM clusters");
     const insCluster = d.prepare("INSERT OR REPLACE INTO clusters (id, member_count) VALUES (?, ?)");
     const insMember = d.prepare("INSERT OR REPLACE INTO cluster_members (cluster_id, address) VALUES (?, ?)");
+    const delMember = d.prepare("DELETE FROM cluster_members WHERE cluster_id = ?");
     for (const c of clusters) {
+      delMember.run(c.clusterId);
       insCluster.run(c.clusterId, c.memberCount);
       for (const m of c.members) {
         insMember.run(c.clusterId, m);
@@ -380,6 +380,28 @@ export function loadLabels(chainId: number): Map<Address, { label: string; kind:
 
 // ---- Signals / alerts ---------------------------------------------------------
 
+type SignalRow = {
+  chain_id: number;
+  token_address: Address;
+  rule_id: string;
+  weight: number;
+  evidence_json: string;
+  block_number: number;
+  created_at: number;
+};
+
+function mapSignalRow(r: SignalRow): Signal {
+  return {
+    chainId: r.chain_id,
+    tokenAddress: r.token_address,
+    ruleId: r.rule_id as Signal["ruleId"],
+    weight: r.weight,
+    evidence: JSON.parse(r.evidence_json) as Record<string, unknown>,
+    blockNumber: r.block_number,
+    timestamp: r.created_at,
+  };
+}
+
 export function insertSignal(s: Signal): number {
   const res = getDb().run(
     "INSERT INTO signals (chain_id, token_address, rule_id, weight, evidence_json, block_number, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -391,24 +413,8 @@ export function insertSignal(s: Signal): number {
 export function recentSignals(chainId: number, tokenAddress: Address, sinceSecs: number): Signal[] {
   const rows = getDb()
     .query("SELECT * FROM signals WHERE chain_id = ? AND token_address = ? AND created_at >= ? ORDER BY created_at")
-    .all(chainId, tokenAddress, sinceSecs) as {
-    chain_id: number;
-    token_address: Address;
-    rule_id: string;
-    weight: number;
-    evidence_json: string;
-    block_number: number;
-    created_at: number;
-  }[];
-  return rows.map((r) => ({
-    chainId: r.chain_id,
-    tokenAddress: r.token_address,
-    ruleId: r.rule_id as Signal["ruleId"],
-    weight: r.weight,
-    evidence: JSON.parse(r.evidence_json) as Record<string, unknown>,
-    blockNumber: r.block_number,
-    timestamp: r.created_at,
-  }));
+    .all(chainId, tokenAddress, sinceSecs) as SignalRow[];
+  return rows.map(mapSignalRow);
 }
 
 export function insertAlert(p: AlertPayload, confirmed: boolean, blockNumber: number | null): number {
@@ -460,24 +466,12 @@ export interface AlertRow {
   block_number: number | null;
 }
 
-function mapAlert(r: AlertRow): AlertRow {
-  return r;
-}
-
 export function listAlerts(limit = 100): AlertRow[] {
-  return (
-    getDb()
-      .query("SELECT * FROM alerts ORDER BY id DESC LIMIT ?")
-      .all(limit) as AlertRow[]
-  ).map(mapAlert);
+  return getDb().query("SELECT * FROM alerts ORDER BY id DESC LIMIT ?").all(limit) as AlertRow[];
 }
 
 export function listAlertsForToken(chainId: number, tokenAddress: Address, limit = 50): AlertRow[] {
-  return (
-    getDb()
-      .query("SELECT * FROM alerts WHERE chain_id = ? AND token_address = ? ORDER BY id DESC LIMIT ?")
-      .all(chainId, tokenAddress, limit) as AlertRow[]
-  ).map(mapAlert);
+  return getDb().query("SELECT * FROM alerts WHERE chain_id = ? AND token_address = ? ORDER BY id DESC LIMIT ?").all(chainId, tokenAddress, limit) as AlertRow[];
 }
 
 // ---- Alert performance ------------------------------------------------------
@@ -489,6 +483,9 @@ type PerformanceRow = Omit<PerformanceSession, "entry_price" | "current_price" |
   stop_price: string;
   min_price: string;
   max_price: string;
+  last_poll_at: number | null;
+  missing_observations: number;
+  close_reason: string | null;
 };
 
 function mapPerformance(row: PerformanceRow): PerformanceSession {
@@ -575,13 +572,20 @@ export function updatePerformanceSession(input: {
   lastBlock: number;
   updatedAt: number;
   closedAt: number | null;
+  lastPollAt?: number;
+  missingObservations?: number;
+  closeReason?: string | null;
 }): void {
   getDb().run(
     `UPDATE performance_sessions
      SET outcome = ?, current_price = ?, min_price = ?, max_price = ?, last_block = ?,
-         closed_at = ?, updated_at = ?
-     WHERE id = ?`,
-    [input.outcome, input.currentPrice.toString(), input.minPrice.toString(), input.maxPrice.toString(), input.lastBlock, input.closedAt, input.updatedAt, input.id],
+          closed_at = ?, updated_at = ?,
+          last_poll_at = COALESCE(?, last_poll_at),
+          missing_observations = COALESCE(?, missing_observations),
+          close_reason = COALESCE(?, close_reason)
+      WHERE id = ?`,
+    [input.outcome, input.currentPrice.toString(), input.minPrice.toString(), input.maxPrice.toString(), input.lastBlock, input.closedAt, input.updatedAt,
+      input.lastPollAt ?? null, input.missingObservations ?? null, input.closeReason ?? null, input.id],
   );
 }
 
@@ -617,48 +621,12 @@ export function retractPerformanceFrom(chainId: number, fromBlock: number): numb
 export function listSignals(chainId?: number, limit = 50): Signal[] {
   const rows = (chainId
     ? getDb().query("SELECT * FROM signals WHERE chain_id = ? ORDER BY id DESC LIMIT ?").all(chainId, limit)
-    : getDb().query("SELECT * FROM signals ORDER BY id DESC LIMIT ?").all(limit)) as {
-    chain_id: number;
-    token_address: Address;
-    rule_id: string;
-    weight: number;
-    evidence_json: string;
-    block_number: number;
-    created_at: number;
-  }[];
-  return rows.map((r) => ({
-    chainId: r.chain_id,
-    tokenAddress: r.token_address,
-    ruleId: r.rule_id as Signal["ruleId"],
-    weight: r.weight,
-    evidence: JSON.parse(r.evidence_json) as Record<string, unknown>,
-    blockNumber: r.block_number,
-    timestamp: r.created_at,
-  }));
+    : getDb().query("SELECT * FROM signals ORDER BY id DESC LIMIT ?").all(limit)) as SignalRow[];
+  return rows.map(mapSignalRow);
 }
 
 export function listSignalsForToken(chainId: number, tokenAddress: Address, limit = 100): Signal[] {
-  return (
-    getDb()
-      .query("SELECT * FROM signals WHERE chain_id = ? AND token_address = ? ORDER BY id DESC LIMIT ?")
-      .all(chainId, tokenAddress, limit) as {
-      chain_id: number;
-      token_address: Address;
-      rule_id: string;
-      weight: number;
-      evidence_json: string;
-      block_number: number;
-      created_at: number;
-    }[]
-  ).map((r) => ({
-    chainId: r.chain_id,
-    tokenAddress: r.token_address,
-    ruleId: r.rule_id as Signal["ruleId"],
-    weight: r.weight,
-    evidence: JSON.parse(r.evidence_json) as Record<string, unknown>,
-    blockNumber: r.block_number,
-    timestamp: r.created_at,
-  }));
+  return (getDb().query("SELECT * FROM signals WHERE chain_id = ? AND token_address = ? ORDER BY id DESC LIMIT ?").all(chainId, tokenAddress, limit) as SignalRow[]).map(mapSignalRow);
 }
 
 export function listRecentEvents(limit = 100): { block_number: number; type: string; tx_hash: string; finalized: number }[] {

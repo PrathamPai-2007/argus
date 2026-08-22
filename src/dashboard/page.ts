@@ -3,10 +3,6 @@
 // the hundred-eyed watchman. Reticle rings, a slow radar sweep on the brand mark, and a
 // radial funding-constellation in the token detail view. Zero fonts/assets loaded remotely.
 
-import { PERFORMANCE_STOP_BPS, PERFORMANCE_TARGET_BPS } from "../performance.ts";
-
-const levelsLabel = "+" + ((PERFORMANCE_TARGET_BPS - 10_000) / 100) + "% / -" + ((10_000 - PERFORMANCE_STOP_BPS) / 100) + "%";
-
 export function renderPage(): string {
   return `<!doctype html>
 <html lang="en">
@@ -110,6 +106,18 @@ export function renderPage(): string {
     display:inline-flex; align-items:center; gap:6px; }
   .panel-h .live-tag i { width:6px; height:6px; border-radius:50%; background:var(--acc); animation:pulse 2s ease-in-out infinite; }
   .panel-b { padding:6px 0; }
+
+  /* ---------- bento & scroll ---------- */
+  .bento { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+  .scroll-y { max-height:410px; overflow-y:auto; padding:6px 0; }
+  .scroll-y::-webkit-scrollbar { width:10px; }
+  .scroll-y::-webkit-scrollbar-thumb { background:var(--line); border-radius:5px; border:2px solid var(--panel); }
+  .scroll-y::-webkit-scrollbar-track { background:transparent; }
+  .rail-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:14px 0 16px; }
+  .rail-row .recents-btn { margin-left:auto; }
+  .recents-btn { color:var(--acc); border-color:rgba(61,248,168,.35); background:rgba(61,248,168,.06);
+    flex-shrink:0; font-size:11px; letter-spacing:.12em; text-transform:uppercase; }
+  .recents-btn:hover { background:rgba(61,248,168,.1); }
 
   /* ---------- table ---------- */
   .tbl { width:100%; border-collapse:collapse; }
@@ -231,8 +239,12 @@ export function renderPage(): string {
     .grid > .panel, .grid > .panel.third { grid-column:span 12; }
     .detail-grid > .panel, .detail-grid > .panel.third { grid-column:span 12; }
   }
+  @media (max-width:768px) {
+    .bento { grid-template-columns:1fr; }
+  }
   @media (max-width:640px) {
     .wrap { padding:10px 12px 28px; }
+    .bento { grid-template-columns:1fr; }
     .cards { grid-template-columns:1fr; }
     .metric { min-width:0; flex:1 1 0; align-items:flex-start; }
     .metrics { width:100%; }
@@ -285,31 +297,44 @@ export function renderPage(): string {
     </div>
   </header>
 
-  <nav class="rail" id="chainbar" aria-label="Chain status"></nav>
+  <div class="rail-row">
+    <nav class="rail" id="chainbar" aria-label="Chain status"></nav>
+    <button class="btn recents-btn" id="recentsBtn" type="button">Recents</button>
+  </div>
 
   <main id="main">
     <section id="mainView">
-      <div class="grid reveal">
-        <div class="panel third">
+      <div class="bento reveal">
+        <div class="panel">
           <div class="panel-h"><span class="ret" aria-hidden="true"></span><h2>Watched tokens</h2></div>
-          <table class="tbl" id="toktab">
-            <thead><tr><th>Token</th><th class="num tight">Supply</th><th class="tight">Last alert</th></tr></thead>
-            <tbody></tbody>
-          </table>
+          <div class="scroll-y">
+            <table class="tbl" id="toktab">
+              <thead><tr><th>Token</th><th class="num tight">Supply</th><th class="tight">Last alert</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
 
-        <div class="panel third">
+        <div class="panel">
           <div class="panel-h"><span class="ret" aria-hidden="true"></span><h2>Live alerts</h2>
             <span class="live-tag"><i aria-hidden="true"></i>stream</span></div>
           <div class="feed" id="alerts" aria-live="polite" aria-label="Live alerts"></div>
         </div>
 
-        <div class="panel third">
+        <div class="panel">
           <div class="panel-h"><span class="ret" aria-hidden="true"></span><h2>Alert performance</h2>
             <span class="live-tag"><i aria-hidden="true"></i>12h watch</span></div>
-          <div id="performance" aria-live="polite"></div>
+          <div class="scroll-y" id="performance" aria-live="polite"></div>
         </div>
+      </div>
+    </section>
 
+    <section id="recentsView" hidden>
+      <div class="toolbar">
+        <button class="btn" id="backRecents" type="button"><span aria-hidden="true">&#8592;</span> Overview</button>
+        <span class="faint" style="font-size:11px;letter-spacing:.16em;text-transform:uppercase;">Recents</span>
+      </div>
+      <div class="grid reveal">
         <div class="panel">
           <div class="panel-h"><span class="ret" aria-hidden="true"></span><h2>Recent signals</h2></div>
           <div class="feed" id="signals" aria-label="Recent signals"></div>
@@ -379,7 +404,6 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":
 const short = (a) => (a ? a.slice(0, 6) + "…" + a.slice(-4) : "");
 const sevClass = (s) => (s === "critical" ? "sev critical" : s === "alert" ? "sev alert" : "sev info");
 const badgeClass = (s) => (s === "critical" ? "badge critical" : s === "alert" ? "badge alert" : "badge info");
-const statusClass = (s) => (s === "live" ? "live" : s === "error" ? "error" : "stale backfilling reconnecting".includes(s) ? "stale" : "");
 const PALETTE = ["#3df8a8", "#7ab3ff", "#ffc24b", "#ff7aa8", "#b28aff", "#5ad8d8"];
 
 function fmtSupply(v) {
@@ -403,7 +427,8 @@ function fmtPrice(v) {
   if (!isFinite(n) || n <= 0) return "—";
   if (n >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
   if (n >= 1) return n.toFixed(4);
-  return n.toPrecision(5);
+  if (n >= 0.0001) return n.toFixed(6);
+  return n.toPrecision(6).replace(/\.?0+$/, "");
 }
 
 function returnPct(s) {
@@ -839,7 +864,15 @@ async function openToken(chainId, address) {
 
 function showMain() {
   $("tokenView").hidden = true;
+  $("recentsView").hidden = true;
   $("mainView").hidden = false;
+  refresh();
+}
+
+function showRecents() {
+  $("tokenView").hidden = true;
+  $("mainView").hidden = true;
+  $("recentsView").hidden = false;
   refresh();
 }
 
@@ -856,8 +889,11 @@ function route() {
   const match = routeParts(hash) || routeParts(path);
   if (match) {
     openToken(match[0], match[1]);
+  } else if (/^[#/]*recents/.test(hash)) {
+    showRecents();
   } else {
     $("tokenView").hidden = true;
+    $("recentsView").hidden = true;
     $("mainView").hidden = false;
     refresh();
   }
@@ -946,6 +982,8 @@ tickClock();
 window.addEventListener("hashchange", route);
 window.addEventListener("popstate", route);
 $("backBtn").addEventListener("click", () => { window.location.hash = "#/"; showMain(); });
+$("backRecents").addEventListener("click", () => { window.location.hash = "#/"; showMain(); });
+$("recentsBtn").addEventListener("click", () => { window.location.hash = "#/recents"; });
 
 route();
 connect();

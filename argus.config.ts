@@ -8,11 +8,13 @@ export default {
       enabled: true,
       // Pool is used with automatic failover. Public endpoints work for dev;
       // put keyed endpoints in .env for production use.
-      rpcs: ["${RPC_ETH_MAINNET}", "wss://ethereum-rpc.publicnode.com"],
+      rpcs: ["${RPC_ETH_MAINNET}", "${RPC_ETH_BACKUP:-wss://ethereum-rpc.publicnode.com}"],
+      httpRpcs: [process.env.RPC_ETH_HTTP ?? `https://rpc.ankr.com/eth/${process.env.ANKR_API_KEY ?? ""}`, process.env.RPC_ETH_BACKUP_HTTP ?? "https://ethereum-rpc.publicnode.com"],
+      infuraRetryMinutes: 5,
       finalityDepth: 12,
-      staleAfterMs: 15_000,
+      staleAfterMs: 30_000,
       backfill: {
-        etherscan: { enabled: false, apiUrl: "https://api.etherscan.io/v2/api", apiKey: null, requestsPerSecond: 3 },
+        etherscan: { enabled: true, apiUrl: "https://api.etherscan.io/v2/api", apiKey: "${ETHERSCAN_API_KEY}", requestsPerSecond: 3 },
         bigquery: { enabled: false, projectId: null, credentialsPath: null, dataset: "bigquery-public-data.crypto_ethereum", maxBytesBilled: null },
         bigqueryThresholdHours: 6,
       },

@@ -33,6 +33,7 @@ src/
   types.ts             StandardEvent union, Signal, AlertPayload
   queue.ts             weighted ring buffer, drop-oldest + dropped counter (never block ingestion)
   ingest/evm.ts        ChainAdapter: WS subscribe, failover, heartbeat/stale, reorg walk-back,
+                       HTTP-routed getLogs queries (dedicated HTTP client pool avoiding WS getLogs errors),
                        gap backfill (per-gap provider selection: tiny gaps <=64 blocks on RPC,
                        larger on Etherscan/BigQuery; bounded per-address fan-out, throttle
                        retries + endpoint failover, archive-unsupported detection -> Etherscan),
@@ -73,7 +74,7 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
 7. **Live startup is independent of history**: startup begins at the current head and never waits
    for historical backfill or restores a previous graph snapshot. Recovery state is in-process only.
    Provider choice is per-gap (`chooseBackfillProvider`): gaps <= `TINY_GAP_RPC_BLOCKS` (64)
-   stay on RPC; larger gaps estimate request cost and pick Etherscan / BigQuery / RPC.
+   stay on free HTTP RPC (PublicNode / httpRpcs pool) to preserve primary WS quotas; larger gaps estimate request cost and pick Etherscan / BigQuery / RPC.
 8. **Recovery is best-effort.** Factory/LP/swap log queries may be skipped on transient provider
    errors; optional enrichment/recovery failures never block live ingestion.
 9. **Outbound safety is enforced.** Webhook validation rejects loopback/private/link-local/metadata

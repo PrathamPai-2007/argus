@@ -11,6 +11,8 @@ export interface ChainConfig {
   name: string;
   enabled: boolean;
   rpcs: string[];
+  httpRpcs: string[];
+  infuraRetryMinutes: number;
   finalityDepth: number;
   staleAfterMs: number;
   backfill: BackfillConfig;
@@ -146,12 +148,12 @@ function isAddress(s: string): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(s);
 }
 
-/** Replace ${VAR} placeholders with environment variables (secrets stay in .env). */
+/** Replace ${VAR} placeholders with environment variables (secrets stay in .env). Supports ${VAR:-default}. */
 function interpolate(value: string): string {
-  return value.replace(/\$\{([A-Z0-9_]+)\}/g, (_, name: string) => {
+  return value.replace(/\$\{([A-Z0-9_]+)(?::-([^}]+))?\}/g, (_, name: string, def?: string) => {
     const v = process.env[name];
-    if (!v) fail(`environment variable ${name} is referenced but not set`);
-    return v;
+    if (!v && def === undefined) fail(`environment variable ${name} is referenced but not set`);
+    return v || def || "";
   });
 }
 
@@ -175,8 +177,21 @@ function validateChain(raw: unknown, i: number): ChainConfig {
     }
     return url;
   });
+  const httpRpcsRaw = raw["httpRpcs"];
+  const httpRpcs: string[] = Array.isArray(httpRpcsRaw)
+    ? httpRpcsRaw.map((r, j) => {
+        if (typeof r !== "string") fail(`${ctx}.httpRpcs[${j}] must be a string`);
+        const url = enabled ? interpolate(r) : r;
+        if (!enabled && /\$\{[A-Z0-9_]+\}/.test(url)) return url;
+        if (!/^https?:\/\//.test(url)) fail(`${ctx}.httpRpcs[${j}] must be an http(s):// URL`);
+        return url;
+      })
+    : [];
   const finalityDepth = reqNumber(raw, "finalityDepth", ctx, { int: true, min: 1 });
   const staleAfterMs = reqNumber(raw, "staleAfterMs", ctx, { int: true, min: 1000 });
+  const infuraRetryMinutes = typeof raw["infuraRetryMinutes"] === "number"
+    ? reqNumber(raw, "infuraRetryMinutes", ctx, { min: 1, max: 60 })
+    : 5;
   const bfRaw = isObj(raw["backfill"]) ? raw["backfill"] as Record<string, unknown> : {};
   const esRaw = isObj(bfRaw["etherscan"]) ? bfRaw["etherscan"] as Record<string, unknown> : {};
   const bqRaw = isObj(bfRaw["bigquery"]) ? bfRaw["bigquery"] as Record<string, unknown> : {};
@@ -190,7 +205,7 @@ function validateChain(raw: unknown, i: number): ChainConfig {
   const credentialsPath = bqEnabled && typeof bqRaw["credentialsPath"] === "string" ? interpolate(bqRaw["credentialsPath"] as string) : null;
   if (bqEnabled && (!projectId || !credentialsPath)) fail(`${ctx}.backfill.bigquery.projectId and credentialsPath are required when enabled`);
   return {
-    chainId, name, enabled, rpcs, finalityDepth, staleAfterMs,
+    chainId, name, enabled, rpcs, httpRpcs, infuraRetryMinutes, finalityDepth, staleAfterMs,
     backfill: {
       etherscan: { enabled: esEnabled, apiUrl: esUrl, apiKey: esKey, requestsPerSecond: typeof esRaw["requestsPerSecond"] === "number" ? reqNumber(esRaw, "requestsPerSecond", `${ctx}.backfill.etherscan`, { min: 0.1, max: 3 }) : 3 },
       bigquery: { enabled: bqEnabled, projectId, credentialsPath, dataset: typeof bqRaw["dataset"] === "string" ? bqRaw["dataset"] : "bigquery-public-data.crypto_ethereum", maxBytesBilled: typeof bqRaw["maxBytesBilled"] === "number" ? reqNumber(bqRaw, "maxBytesBilled", `${ctx}.backfill.bigquery`, { int: true, min: 1 }) : null },

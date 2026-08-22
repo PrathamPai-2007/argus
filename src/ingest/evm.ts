@@ -10,7 +10,7 @@ import {
   type Transport,
   toEventSelector,
 } from "viem";
-import { probeTraceCapability } from "./probe.ts";
+import { probeArchiveDepth, probeTraceCapability } from "./probe.ts";
 import type { ChainConfig } from "../config.ts";
 import { log, redactUrl } from "../logger.ts";
 import type { Address, FundingEvent, StandardEvent, TokenMeta } from "../types.ts";
@@ -58,7 +58,6 @@ export interface AdapterCallbacks {
   onFinalized(chainId: number, upToBlock: number): void;
   /** Canonical chain diverged; engine must rewind all unfinalized state ≥ fromBlock. */
   onReorg(chainId: number, fromBlock: number): void | Promise<void>;
-  onHead(chainId: number, blockNumber: number, timestamp: number): void;
   onStatus(chainId: number, status: AdapterStatus, detail?: Record<string, unknown>): void;
   onBackfillProgress?(chainId: number, progress: { phase: string; nextBlock: number; fromBlock: number; toBlock: number; provider: string }): void | Promise<void>;
   getBackfillProgress?(chainId: number): { phase: string; nextBlock: number; fromBlock: number; toBlock: number; provider: string } | null;
@@ -80,6 +79,7 @@ export interface ChainAdapter {
   recover(reason: string): Promise<void>;
   flushEvents(): Promise<void>;
   backfillToken(token: Address, fromBlock: bigint, toBlock: bigint): Promise<number>;
+  getMaxArchiveDepth(): number;
   status(): { status: AdapterStatus; endpoint: string; lastHead: number; lastHeadAt: number; tracesAvailable: boolean | null };
 }
 
@@ -125,11 +125,11 @@ export class EvmAdapter implements ChainAdapter {
   private recentHeads: Array<{ number: number; hash: string; parentHash: string }> = [];
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private infuraRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private consecutiveFailures = 0;
   private lastRecoverAt = 0;
   private busy = false;
-  private backfilling = false;
   private lastFinalizedSent = 0;
   private traces: boolean | null = null;
   private deferredHead: Block<bigint, true> | null = null;
@@ -154,7 +154,7 @@ export class EvmAdapter implements ChainAdapter {
       this.eventDispatch = this.eventDispatch.then(dispatch);
     }
     this.eventDispatch = this.eventDispatch.catch((err: unknown) => {
-      log.error("event dispatch failed", { chainId: this.chainId, err: String(err) });
+      log.error("event dispatch failed", { chainId: this.chainId, err });
     });
     return this.eventDispatch;
   }
@@ -194,8 +194,10 @@ export class EvmAdapter implements ChainAdapter {
     this.running = false;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    if (this.infuraRetryTimer) clearTimeout(this.infuraRetryTimer);
     this.heartbeatTimer = null;
     this.watchdogTimer = null;
+    this.infuraRetryTimer = null;
     this.teardownSubs();
     this.setStatus("stopped");
   }
@@ -290,16 +292,18 @@ export class EvmAdapter implements ChainAdapter {
     return this.client;
   }
 
-  private buildClient(url: string): PublicClient {
+  private buildClient(url: string, silentMode = false): PublicClient {
     let transport: Transport;
     if (/^wss?:\/\//.test(url)) {
       transport = webSocket(url, { retryCount: 2, retryDelay: 500, timeout: 20_000 });
     } else {
-      log.warn("HTTP endpoint configured — falling back to polling (higher latency)", { chainId: this.chainId });
+      if (!silentMode) log.warn("HTTP endpoint configured — falling back to polling (higher latency)", { chainId: this.chainId });
       transport = http(url, { retryCount: 2, retryDelay: 500, timeout: 20_000 });
     }
     return createPublicClient({ transport });
   }
+
+  private maxArchiveDepth = 100_000;
 
   /** Connect to the healthiest endpoint without subscribing (used by start() and the backfill CLI). */
   async connect(): Promise<void> {
@@ -310,19 +314,94 @@ export class EvmAdapter implements ChainAdapter {
         this.client = this.buildClient(this.cfg.rpcs[i] as string);
         await this.withRetry(() => this.mustClient().getBlockNumber());
         this.traces = await this.probeTraceCapability();
-        log.info("connected to endpoint", { chainId: this.chainId, endpoint: this.redact(i), traces: this.traces });
+        this.maxArchiveDepth = await probeArchiveDepth(this.mustClient());
+        log.info("connected to endpoint", { chainId: this.chainId, endpoint: this.redact(i), traces: this.traces, archiveDepth: this.maxArchiveDepth });
+        if (!this.isInfuraUrl(this.cfg.rpcs[i])) this.scheduleInfuraRetry();
         return;
       } catch (err) {
         lastErr = err;
-        log.warn("endpoint failed, trying next", { chainId: this.chainId, endpoint: this.redact(i), err: redactUrl(String(err)) });
+        log.warn("endpoint failed, trying next", { chainId: this.chainId, endpoint: this.redact(i), err });
       }
     }
     throw new Error(`all RPC endpoints failed for chain ${this.chainId}: ${redactUrl(String(lastErr))}`);
   }
 
+  public getMaxArchiveDepth(): number {
+    return this.maxArchiveDepth;
+  }
+
   private redact(i: number): string {
     const url = this.cfg.rpcs[i] ?? "";
     return url.replace(/\/([A-Za-z0-9_-]{16,})$/, "/***");
+  }
+
+  private isInfuraUrl(url?: string): boolean {
+    const u = (url ?? "").toLowerCase();
+    return u.includes("infura.io") || u.includes("infura");
+  }
+
+  private getInfuraIndex(): number {
+    const idx = this.cfg.rpcs.findIndex((r) => this.isInfuraUrl(r));
+    return idx >= 0 ? idx : 0;
+  }
+
+  private scheduleInfuraRetry(): void {
+    const infuraIndex = this.getInfuraIndex();
+    if (!this.isInfuraUrl(this.cfg.rpcs[infuraIndex]) || infuraIndex === this.endpointIdx || this.infuraRetryTimer || this.cfg.rpcs.length < 2) return;
+    const delayMs = this.cfg.infuraRetryMinutes * 60_000;
+    this.infuraRetryTimer = setTimeout(() => {
+      this.infuraRetryTimer = null;
+      void this.tryInfuraRecovery();
+    }, delayMs);
+    log.info("Infura recovery probe scheduled", { chainId: this.chainId, delayMs });
+  }
+
+  private async tryInfuraRecovery(): Promise<void> {
+    if (!this.running || this.endpointIdx === this.getInfuraIndex()) return;
+    if (this.busy) {
+      this.scheduleInfuraRetry();
+      return;
+    }
+    const infuraIndex = this.getInfuraIndex();
+    const probe = this.buildClient(this.cfg.rpcs[infuraIndex] as string, true);
+    try {
+      await probe.getBlockNumber();
+      log.info("Infura recovery probe succeeded", { chainId: this.chainId });
+      this.endpointIdx = infuraIndex;
+      this.consecutiveFailures = 0;
+      await this.recover("infura-retry");
+    } catch (err) {
+      log.warn("Infura recovery probe failed — staying on fallback", { chainId: this.chainId, err });
+      this.scheduleInfuraRetry();
+    }
+  }
+
+  private httpClients = new Map<number, PublicClient>();
+  private httpEndpointIdx = 0;
+
+  private buildHttpClient(url: string): PublicClient {
+    let httpUrl = url;
+    if (/^wss:\/\//i.test(url)) httpUrl = url.replace(/^wss:\/\//i, "https://").replace(/\/ws\/v3\//i, "/v3/");
+    else if (/^ws:\/\//i.test(url)) httpUrl = url.replace(/^ws:\/\//i, "http://");
+    return this.buildClient(httpUrl, true);
+  }
+
+  private getHttpClient(preferSecondary = false): PublicClient {
+    const httpList = this.cfg.httpRpcs && this.cfg.httpRpcs.length > 0 ? this.cfg.httpRpcs : this.cfg.rpcs;
+    if (httpList.length === 0) return this.mustClient();
+    const targetIdx = preferSecondary && httpList.length > 1 ? 1 : (this.httpEndpointIdx % httpList.length);
+    
+    // In tests or single-rpc setups without explicit HTTP urls, if the primary client is an HTTP client, reuse it:
+    if (this.client && targetIdx === 0 && !/^wss?:\/\//i.test(this.cfg.rpcs[0] ?? "")) {
+      return this.client;
+    }
+
+    let client = this.httpClients.get(targetIdx);
+    if (!client) {
+      client = this.buildHttpClient(httpList[targetIdx]!);
+      this.httpClients.set(targetIdx, client);
+    }
+    return client;
   }
 
   /** Probe trace-API support (PLAN.md §6, §11.4). */
@@ -346,7 +425,18 @@ export class EvmAdapter implements ChainAdapter {
       s.includes("rate limit") ||
       s.includes("rate_limit") ||
       s.includes("too many requests") ||
+      s.includes("usage limit") ||
+      s.includes("logs.map is not a function") ||
+      s.includes("method not available") ||
+      s.includes("301") ||
       s.includes("429") ||
+      s.includes("500") ||
+      s.includes("502") ||
+      s.includes("503") ||
+      s.includes("521") ||
+      s.includes("522") ||
+      s.includes("status: 5") ||
+      s.includes("web server is down") ||
       s.includes("request exceeded") ||
       s.includes("over capacity") ||
       s.includes("timeout") ||
@@ -361,8 +451,7 @@ export class EvmAdapter implements ChainAdapter {
       s.includes("invalidparams") ||
       s.includes("invalid parameters") ||
       s.includes("invalidinputrpcerror") ||
-      s.includes("request blocked") ||
-      s.includes("internal error")
+      s.includes("request blocked")
     );
   }
 
@@ -425,6 +514,7 @@ export class EvmAdapter implements ChainAdapter {
     fromBlock: bigint,
     toBlock: bigint,
     allowFailover = true,
+    overrideClient?: PublicClient | undefined,
   ): Promise<ViemLog[]> {
     if (Array.isArray(addrs)) {
       if (addrs.length === 0) return [];
@@ -462,10 +552,24 @@ export class EvmAdapter implements ChainAdapter {
         };
         return await fetchBigQueryLogs(bigQueryArgs);
       } catch (err) {
-        log.warn("historical provider failed — falling back to RPC", { chainId: this.chainId, provider: this.selectedBackfillProvider, err: redactUrl(String(err)) });
+        log.warn("historical provider failed — falling back to RPC", { chainId: this.chainId, provider: this.selectedBackfillProvider, err });
         this.selectedBackfillProvider = "rpc";
       }
     }
+
+    // Policy: Small gaps (<= 64 blocks) use the primary HTTP RPC to preserve the
+    // live WebSocket provider's quota; the secondary HTTP RPC is only failover.
+    let activeClient = overrideClient;
+    if (!activeClient) {
+      if (span <= 64n) {
+        activeClient = this.getHttpClient(false);
+      } else if (this.selectedBackfillProvider === "rpc" && this.endpointIdx === this.getInfuraIndex() && this.cfg.rpcs.length > 1) {
+        activeClient = this.getHttpClient(false);
+      } else {
+        activeClient = this.getHttpClient(false);
+      }
+    }
+
     try {
       // Large address arrays regularly time out on hosted RPCs even when the
       // equivalent single-address queries succeed. Fan out with a hard
@@ -473,13 +577,13 @@ export class EvmAdapter implements ChainAdapter {
       if (Array.isArray(addrs) && addrs.length > 1) {
         const out: ViemLog[] = [];
         await mapLimit(addrs, BACKFILL_CONCURRENCY, async (address) => {
-          out.push(...(await this.getLogsAdaptive(address, event, fromBlock, toBlock, false)));
+          out.push(...(await this.getLogsAdaptive(address, event, fromBlock, toBlock, allowFailover, activeClient)));
           this.lastProgressAt = Date.now();
         });
         return out;
       }
       return await this.withRetry(
-        () => this.mustClient().getLogs({ address: addrs as `0x${string}` | `0x${string}`[], event, fromBlock, toBlock }),
+        () => activeClient.getLogs({ address: addrs as `0x${string}` | `0x${string}`[], event, fromBlock, toBlock }),
         THROTTLE_RETRIES,
       );
     } catch (err) {
@@ -490,41 +594,47 @@ export class EvmAdapter implements ChainAdapter {
         // whole backfill phase (Bug: recovery aborted with a stale lastHead).
         let head: bigint | null = null;
         try {
-          head = await this.withRetry(() => this.mustClient().getBlockNumber(), 1);
+          head = await this.withRetry(() => activeClient.getBlockNumber(), 1);
         } catch {
           /* keep null */
         }
+        let clamped: bigint | null = null;
         if (head !== null && head < toBlock) {
-          const clamped = BigInt(Math.min(Number(head), Number(toBlock)));
+          clamped = BigInt(Math.min(Number(head), Number(toBlock)));
+        } else if (toBlock > fromBlock) {
+          // If the load balancer routed getBlockNumber to a node ahead of the getLogs node,
+          // step back 1 block.
+          clamped = toBlock - 1n;
+        }
+        if (clamped !== null && clamped >= fromBlock) {
           log.warn("getLogs range beyond serving node's head — clamping", {
             chainId: this.chainId,
             from: Number(fromBlock),
             to: Number(toBlock),
-            head: Number(head),
+            clamped: Number(clamped),
+            head: head !== null ? Number(head) : null,
           });
-          if (clamped < fromBlock) throw err; // nothing to fetch yet
-          return await this.getLogsAdaptive(addrs, event, fromBlock, clamped, allowFailover);
+          return await this.getLogsAdaptive(addrs, event, fromBlock, clamped, allowFailover, activeClient);
         }
-        // head didn't come back or is at/above the range — surface the original error
+        // Block is not yet mined on the serving RPC node
+        return [];
+      }
+      if (this.isArchiveUnsupported(err)) {
+        if (this.selectedBackfillProvider === "rpc" && this.cfg.backfill.etherscan.enabled && this.cfg.backfill.etherscan.apiKey) {
+          log.warn("RPC endpoint does not support archive logs — switching to Etherscan", { chainId: this.chainId, endpoint: this.redact(this.endpointIdx) });
+          this.selectedBackfillProvider = "etherscan";
+          return await this.getLogsAdaptive(addrs, event, fromBlock, toBlock, allowFailover, overrideClient);
+        }
+        // Free RPC archive block depth restriction cannot be fixed by range subdivision.
         throw err;
       }
-      if (this.selectedBackfillProvider === "rpc" && this.isArchiveUnsupported(err) && this.cfg.backfill.etherscan.enabled && this.cfg.backfill.etherscan.apiKey) {
-        log.warn("RPC endpoint does not support archive logs — switching to Etherscan", { chainId: this.chainId, endpoint: this.redact(this.endpointIdx) });
-        this.selectedBackfillProvider = "etherscan";
-        return await this.getLogsAdaptive(addrs, event, fromBlock, toBlock, allowFailover);
-      }
       // Endpoint rejected the multi-address form (free tiers block arrays): fall
-      // back to one adaptive call per address, run concurrently. No endpoint
-      // switching inside the fan-out — we already know THIS endpoint serves
-      // single-address queries, and parallel failovers would race
-      // this.client/endpointIdx. If the per-address retries still fail, the
-      // error is transient (Infura flakes eth_getLogs with "internal error")
-      // and we fall through to the single failover below.
+      // back to one adaptive call per address, run concurrently.
       if (Array.isArray(addrs) && addrs.length > 1 && this.isParamsRejected(err)) {
         try {
           const out: ViemLog[] = [];
           await mapLimit(addrs, BACKFILL_CONCURRENCY, async (a) => {
-            out.push(...(await this.getLogsAdaptive(a, event, fromBlock, toBlock, false)));
+            out.push(...(await this.getLogsAdaptive(a, event, fromBlock, toBlock, allowFailover, activeClient)));
             this.lastProgressAt = Date.now(); // long splits must not trip the stall watchdog
           });
           return out;
@@ -532,29 +642,19 @@ export class EvmAdapter implements ChainAdapter {
           err = perAddrErr;
         }
       }
-      if (allowFailover && this.isThrottleError(err) && this.cfg.rpcs.length > 1) {
-        const previousIdx = this.endpointIdx;
-        const nextIdx = (previousIdx + 1) % this.cfg.rpcs.length;
-        const previousClient = this.client;
-        try {
-          this.endpointIdx = nextIdx;
-          this.client = this.buildClient(this.cfg.rpcs[nextIdx] as string);
-          await this.withRetry(() => this.mustClient().getBlockNumber(), 1);
-          log.warn("RPC throttled — failed over for backfill", {
-            chainId: this.chainId,
-            from: Number(fromBlock),
-            to: Number(toBlock),
-            endpoint: this.redact(nextIdx),
-          });
-          return await this.getLogsAdaptive(addrs, event, fromBlock, toBlock, false);
-        } catch {
-          this.endpointIdx = previousIdx;
-          this.client = previousClient;
-        }
+      const httpList = this.cfg.httpRpcs.length > 0 ? this.cfg.httpRpcs : this.cfg.rpcs;
+      if (allowFailover && this.isThrottleError(err) && httpList.length > 1 && !overrideClient) {
+        this.httpEndpointIdx++;
+        const nextClient = this.getHttpClient(true);
+        log.warn("RPC throttled — failing over for backfill query", {
+          chainId: this.chainId,
+          from: Number(fromBlock),
+          to: Number(toBlock),
+          endpoint: this.httpEndpointIdx % httpList.length,
+        });
+        return await this.getLogsAdaptive(addrs, event, fromBlock, toBlock, false, nextClient);
       }
-      // Address fan-out deliberately disables endpoint rotation inside workers
-      // to avoid races. Bubble a timeout/throttle to the outer fan-out so it can
-      // rotate once, instead of recursively splitting the same dead endpoint.
+      // Bubble a timeout/throttle up so the outer phase can gracefully fail or retry.
       if (!allowFailover && this.isThrottleError(err)) throw err;
       if (span <= GETLOGS_THROTTLE_CHUNK) throw err; // nothing left to subdivide
       const mid = fromBlock + span / 2n - 1n;
@@ -563,31 +663,37 @@ export class EvmAdapter implements ChainAdapter {
         address: Array.isArray(addrs) ? addrs.length : addrs,
         from: Number(fromBlock),
         to: Number(toBlock),
-        err: String(err),
+        err,
       });
-      const a = await this.getLogsAdaptive(addrs, event, fromBlock, mid, false);
-      const b = await this.getLogsAdaptive(addrs, event, mid + 1n, toBlock, false);
+      const a = await this.getLogsAdaptive(addrs, event, fromBlock, mid, false, activeClient);
+      const b = await this.getLogsAdaptive(addrs, event, mid + 1n, toBlock, false, activeClient);
       return [...a, ...b];
     }
   }
 
-  private async withRetry<T>(fn: () => Promise<T>, attempts = 4): Promise<T> {
+  private async withRetry<T>(fn: () => Promise<T>, attempts = 5, endpointUrl?: string): Promise<T> {
     let err: unknown = null;
+    const currentUrl = endpointUrl ?? this.cfg.rpcs[this.endpointIdx] ?? "";
+    const isInfura = this.isInfuraUrl(currentUrl) || this.endpointIdx === this.getInfuraIndex();
     for (let i = 0; i < attempts; i++) {
       try {
         return await fn();
       } catch (e) {
         err = e;
+        this.lastProgressAt = Date.now(); // active recovery must not trip stall watchdog
         if (i + 1 >= attempts) break;
-        // Throttle responses need long, non-piling backoff (a 500ms retry makes
-        // free-tier rate limiting worse and fails ~instantly). Non-throttle errors
-        // (transient network) keep the short exponential schedule.
+        
         const throttled = this.isThrottleError(e);
-        const base = throttled ? 2_000 : 500;
+        // Fast-fail if not Infura and heavily throttled, since public RPCs often ban us outright.
+        if (throttled && !isInfura && i >= 1) break;
+
+        // Throttle responses on Infura start at 5s backoff up to 60s max.
+        // Non-Infura throttle starts at 2s; non-throttle starts at 500ms.
+        const base = isInfura && throttled ? 5_000 : (throttled ? 2_000 : 500);
         const cap = throttled ? MAX_THROTTLE_WAIT_MS : 4_000;
         const jitter = Math.floor(Math.random() * 250);
         const delay = Math.min(2 ** i * base, cap) + jitter;
-        log.warn("rpc retry scheduled", { chainId: this.chainId, attempt: i + 1, throttled, delayMs: delay, err: String(err) });
+        log.warn("rpc retry scheduled", { chainId: this.chainId, attempt: i + 1, throttled, isInfura, delayMs: delay, err });
         await sleep(delay);
       }
     }
@@ -615,7 +721,7 @@ export class EvmAdapter implements ChainAdapter {
     this.unwatchers.push(
       c.watchBlocks({
         onBlock: (block) => void this.onNewHead(block as Block<bigint, true>).catch((err) => {
-          log.error("head processing failed", { chainId: this.chainId, err: String(err) });
+          log.error("head processing failed", { chainId: this.chainId, err });
           void this.recover("head-processing-failed");
         }),
         onError: (err) => this.onStreamError("newHeads", err),
@@ -682,7 +788,7 @@ export class EvmAdapter implements ChainAdapter {
   }
 
   private onStreamError(kind: string, err: unknown): void {
-    log.error("stream error", { chainId: this.chainId, kind, err: redactUrl(String(err)) });
+    log.error("stream error", { chainId: this.chainId, kind, err });
     void this.recover("stream-error");
   }
 
@@ -711,6 +817,7 @@ export class EvmAdapter implements ChainAdapter {
       if (this._status === "live" || this._status === "stopped") return;
       const stuckFor = Date.now() - this.lastProgressAt;
       if (stuckFor > WATCHDOG_STALL_MS) {
+        this.lastProgressAt = Date.now();
         log.error("no progress while recovering — forcing restart", { chainId: this.chainId, status: this._status, stuckForMs: stuckFor });
         void this.recover("stalled");
       }
@@ -722,10 +829,15 @@ export class EvmAdapter implements ChainAdapter {
    *  dampens repeated failures; recentHeads/blockTimes are cleared so phantom
    *  parentHash mismatches from a previous backend can't fake a deep reorg. */
   async recover(reason: string): Promise<void> {
-    if (!this.running || this.busy) return;
+    if (!this.running) return;
+    if (this.busy) {
+      this.lastProgressAt = Date.now();
+      return;
+    }
     this.busy = true;
+    this.lastProgressAt = Date.now();
     const now = Date.now();
-    if (now - this.lastRecoverAt < RECOVER_COOLDOWN_MS && reason !== "stale" && reason !== "stream-error") {
+    if (now - this.lastRecoverAt < RECOVER_COOLDOWN_MS && reason !== "stale" && reason !== "stream-error" && reason !== "recovery-failed") {
       this.busy = false;
       return;
     }
@@ -742,10 +854,14 @@ export class EvmAdapter implements ChainAdapter {
     this.fundingIndex.clear();
     this.lastProgressAt = Date.now();
 
-    // Rotate endpoint only after repeated failures; stay on a working one otherwise.
-    if (this.consecutiveFailures >= 2) {
+    // Rotate after one failed recovery so a dead provider does not hold recovery hostage.
+    if (this.consecutiveFailures >= 1) {
+      const previousEndpoint = this.endpointIdx;
       this.endpointIdx = (this.endpointIdx + 1) % this.cfg.rpcs.length;
       this.consecutiveFailures = 0;
+      if (this.isInfuraUrl(this.cfg.rpcs[previousEndpoint]) && !this.isInfuraUrl(this.cfg.rpcs[this.endpointIdx])) {
+        this.scheduleInfuraRetry();
+      }
     }
     const backoff = Math.min(30_000, 2 ** Math.min(this.reconnectAttempt, 6) * 500) + Math.floor(Math.random() * 500);
     await sleep(backoff);
@@ -782,7 +898,7 @@ export class EvmAdapter implements ChainAdapter {
             chainId: this.chainId,
             resumeStart,
             head,
-            err: redactUrl(String(err)),
+            err,
           });
         }
       }
@@ -798,7 +914,7 @@ export class EvmAdapter implements ChainAdapter {
             chainId: this.chainId,
             from: caughtUpThrough + 1,
             to: Number(pendingNumber),
-            err: redactUrl(String(err)),
+            err,
           });
           break;
         }
@@ -812,9 +928,9 @@ export class EvmAdapter implements ChainAdapter {
       this.busy = false;
     } catch (err) {
       this.consecutiveFailures++;
-      log.error("recovery failed", { chainId: this.chainId, err: redactUrl(String(err)), attempt: this.consecutiveFailures });
+      log.error("recovery failed", { chainId: this.chainId, err, attempt: this.consecutiveFailures });
       this.busy = false;
-      if (this.running) this.setStatus("error", { err: redactUrl(String(err)) });
+      if (this.running) this.setStatus("error", { err });
       void this.recover("recovery-failed");
     }
   }
@@ -886,7 +1002,6 @@ export class EvmAdapter implements ChainAdapter {
               this.setStatus("live", { head: this.lastHead });
               this.pushHead({ number, hash: blockHash, parentHash: block.parentHash });
               this.lastHead = number;
-              this.cb.onHead(this.chainId, number, timestamp);
               this.finalizeUpTo(number);
               return;
             }
@@ -918,7 +1033,6 @@ export class EvmAdapter implements ChainAdapter {
             this.setStatus("live", { head: this.lastHead });
             this.pushHead({ number, hash: blockHash, parentHash: block.parentHash });
             this.lastHead = number;
-            this.cb.onHead(this.chainId, number, timestamp);
             this.finalizeUpTo(number);
             return;
           }
@@ -947,7 +1061,6 @@ export class EvmAdapter implements ChainAdapter {
 
     this.pushHead({ number, hash: blockHash, parentHash: block.parentHash });
     if (number > this.lastHead) this.lastHead = number;
-    this.cb.onHead(this.chainId, number, timestamp);
 
     const funding = this.extractFundingFromBlock(block);
     if (funding.length > 0) this.bufferFunding(funding);
@@ -1283,11 +1396,9 @@ export class EvmAdapter implements ChainAdapter {
     let release = () => {};
     this.backfillTail = new Promise<void>((r) => (release = r));
     await prev;
-    this.backfilling = true;
     try {
       return await this.backfillRangeInner(fromBlock, toBlock, resumePhase, jobFromBlock, onlyToken);
     } finally {
-      this.backfilling = false;
       release();
     }
   }
@@ -1350,29 +1461,73 @@ export class EvmAdapter implements ChainAdapter {
 
     // 1. Transfer logs for all watched tokens, batched per chunk
     const tokens = onlyToken ? [onlyToken] : [...this.watchedTokens];
+    const isDualRpcCatchUp = this.cfg.rpcs.length > 1 && this.selectedBackfillProvider === "rpc";
+    const clientInfura = isDualRpcCatchUp ? this.getHttpClient(false) : undefined;
+    const clientPublic = isDualRpcCatchUp ? this.getHttpClient(true) : undefined;
+
     if (tokens.length > 0 && shouldRun("tokens")) {
       const first = startPhase === "tokens" && savedProgress ? BigInt(Math.max(Number(fromBlock), savedProgress.nextBlock)) : fromBlock;
+      const chunks: Array<{ from: bigint; to: bigint; client?: PublicClient | undefined }> = [];
+      let idx = 0;
       for (let from = first; from <= toBlock; from += GETLOGS_CHUNK) {
-        markProgress();
-        setStep(doneSteps);
         const to = from + GETLOGS_CHUNK - 1n > toBlock ? toBlock : from + GETLOGS_CHUNK - 1n;
-        try {
-          const logs = await this.getLogsAdaptive(tokens, TRANSFER_ABI, from, to);
-          const timestamps = await this.blockTimesFor(logs);
-          const batch: StandardEvent[] = [];
-          for (const l of logs) {
-            const ts = timestamps.get(Number(l.blockNumber)) ?? Math.floor(Date.now() / 1000);
-            const evt = normalizeTransfer(this.toRaw(l), this.chainId, ts);
-            if (evt) batch.push(evt);
+        const targetClient = isDualRpcCatchUp
+          ? (idx % 2 === 0 ? clientInfura : clientPublic)
+          : undefined;
+        chunks.push(targetClient !== undefined ? { from, to, client: targetClient } : { from, to });
+        idx++;
+      }
+
+      if (isDualRpcCatchUp && chunks.length > 1) {
+        log.info("dual-RPC parallel catch-up backfilling tokens phase", {
+          chainId: this.chainId,
+          chunks: chunks.length,
+          from: Number(fromBlock),
+          to: Number(toBlock),
+        });
+        await mapLimit(chunks, 2, async (c) => {
+          markProgress();
+          setStep(doneSteps);
+          try {
+            const logs = await this.getLogsAdaptive(tokens, TRANSFER_ABI, c.from, c.to, true, c.client);
+            const timestamps = await this.blockTimesFor(logs);
+            const batch: StandardEvent[] = [];
+            for (const l of logs) {
+              const ts = timestamps.get(Number(l.blockNumber)) ?? Math.floor(Date.now() / 1000);
+              const evt = normalizeTransfer(this.toRaw(l), this.chainId, ts);
+              if (evt) batch.push(evt);
+            }
+            await emit(batch);
+          } catch (err) {
+            log.error("backfill getLogs parallel chunk failed", { chainId: this.chainId, from: Number(c.from), to: Number(c.to), err });
+            await progress("tokens", c.from);
+            throw err;
           }
-          await emit(batch);
-        } catch (err) {
-          log.error("backfill getLogs failed", { chainId: this.chainId, from: Number(from), to: Number(to), err: String(err) });
-          await progress("tokens", from);
-          throw err;
+          await progress("tokens", c.to + 1n);
+          setStep(++doneSteps);
+        });
+      } else {
+        for (const c of chunks) {
+          markProgress();
+          setStep(doneSteps);
+          try {
+            const logs = await this.getLogsAdaptive(tokens, TRANSFER_ABI, c.from, c.to, true, c.client);
+            const timestamps = await this.blockTimesFor(logs);
+            const batch: StandardEvent[] = [];
+            for (const l of logs) {
+              const ts = timestamps.get(Number(l.blockNumber)) ?? Math.floor(Date.now() / 1000);
+              const evt = normalizeTransfer(this.toRaw(l), this.chainId, ts);
+              if (evt) batch.push(evt);
+            }
+            await emit(batch);
+          } catch (err) {
+            log.error("backfill getLogs failed", { chainId: this.chainId, from: Number(c.from), to: Number(c.to), err });
+            await progress("tokens", c.from);
+            throw err;
+          }
+          await progress("tokens", c.to + 1n);
+          setStep(++doneSteps);
         }
-        await progress("tokens", to + 1n);
-        setStep(++doneSteps);
       }
     }
     await progress("factory", fromBlock);
@@ -1397,7 +1552,7 @@ export class EvmAdapter implements ChainAdapter {
           }
         }
       } catch (err) {
-        log.warn("backfill factory getLogs failed — skipping phase", { chainId: this.chainId, factory: f, err: redactUrl(String(err)) });
+        log.warn("backfill factory getLogs failed — skipping phase", { chainId: this.chainId, factory: f, err });
         await progress("factory", toBlock + 1n);
         setStep(++doneSteps);
         break;
@@ -1433,7 +1588,7 @@ export class EvmAdapter implements ChainAdapter {
           }
           await emit(batch);
         } catch (err) {
-          log.warn("backfill pool LP logs failed — skipping phase", { chainId: this.chainId, from: Number(from), to: Number(to), err: redactUrl(String(err)) });
+          log.warn("backfill pool LP logs failed — skipping phase", { chainId: this.chainId, from: Number(from), to: Number(to), err });
           await progress("lp", toBlock + 1n);
           setStep(++doneSteps);
           break;
@@ -1469,7 +1624,7 @@ export class EvmAdapter implements ChainAdapter {
           }
           await emit(batch);
         } catch (err) {
-          log.warn("backfill pool swap logs failed — skipping phase", { chainId: this.chainId, from: Number(from), to: Number(to), err: redactUrl(String(err)) });
+          log.warn("backfill pool swap logs failed — skipping phase", { chainId: this.chainId, from: Number(from), to: Number(to), err });
           await progress("swap", toBlock + 1n);
           setStep(++doneSteps);
           break;
@@ -1485,8 +1640,10 @@ export class EvmAdapter implements ChainAdapter {
     if (gap <= 128 && shouldRun("funding")) {
       setStep(doneSteps++);
       const funding: FundingEvent[] = [];
+      let fundingFailed = false;
       for (let n = fromBlock; n <= toBlock; n++) {
         markProgress();
+        if (fundingFailed) continue;
         try {
           const block = (await this.withRetry(() =>
             this.mustClient().getBlock({ blockNumber: n, includeTransactions: true }),
@@ -1495,7 +1652,8 @@ export class EvmAdapter implements ChainAdapter {
           this.blockTimes.set(Number(n), Number(block.timestamp));
           funding.push(...this.extractFundingFromBlock(block));
         } catch (err) {
-          log.error("backfill getBlock failed", { chainId: this.chainId, block: Number(n), err: String(err) });
+          fundingFailed = true;
+          log.warn("backfill getBlock failed — skipping funding extraction for the rest of this gap", { chainId: this.chainId, block: Number(n), err });
         }
       }
       if (funding.length > 0) this.bufferFunding(funding);

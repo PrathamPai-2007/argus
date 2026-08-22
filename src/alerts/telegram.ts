@@ -52,6 +52,14 @@ export function formatAlertMessage(p: AlertPayload, alertId: number, confirmed: 
   return lines.join("\n");
 }
 
+export function formatPrice(price: number): string {
+  if (!isFinite(price) || price <= 0) return "—";
+  if (price >= 1000) return price.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (price >= 1) return price.toFixed(4);
+  if (price >= 0.0001) return price.toFixed(6);
+  return price.toPrecision(6).replace(/\.?0+$/, "");
+}
+
 export function formatPerformanceOutcomeMessage(s: {
   outcome: string;
   token_address: string;
@@ -82,8 +90,8 @@ export function formatPerformanceOutcomeMessage(s: {
     `<b>Token:</b> <code>${esc(s.token_address)}</code>`,
     `<b>Chain:</b> ${esc(chain.name)}`,
     `<b>Return:</b> ${sign}${pct}%`,
-    `<b>Entry price:</b> $${entry > 0 ? entry.toFixed(6) : "—"}`,
-    `<b>Final price:</b> $${current > 0 ? current.toFixed(6) : "—"}`,
+    `<b>Entry price:</b> ${formatPrice(entry)}`,
+    `<b>Final price:</b> ${formatPrice(current)}`,
     "",
     `<i>linked to alert #${s.alert_id}</i>`,
   ].join("\n");
@@ -126,7 +134,7 @@ export async function probeTelegram(botToken: string): Promise<{ ok: boolean; us
     if (j.ok) return j.result?.username ? { ok: true, username: j.result.username } : { ok: true };
     return { ok: false, error: j.description ?? `http ${res.status}` };
   } catch (err) {
-    log.debug("telegram probe failed", { err: String(err) });
+    log.debug("telegram probe failed", { err });
     return { ok: false, error: String(err) };
   }
 }

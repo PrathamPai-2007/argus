@@ -66,44 +66,70 @@ export interface TokenPrice {
   poolAddress: Address;
   quoteToken: Address;
   symbol?: string | undefined;
+  liquidityUsd: number | null;
 }
+
+export type TokenPriceObservation =
+  | { kind: "price"; value: TokenPrice }
+  | { kind: "pool_missing" }
+  | { kind: "liquidity_lost" }
+  | { kind: "provider_error" };
 
 /** Fetch current pool-relative token price and DEX pool details for any token from DexScreener as fallback. */
 export async function fetchTokenPrice(chainId: number, token: Address): Promise<TokenPrice | null> {
+  const observation = await fetchTokenPriceForPool(chainId, token);
+  return observation.kind === "price" ? observation.value : null;
+}
+
+/** Fetch a price while keeping the performance session pinned to its original pool. */
+export async function fetchTokenPriceForPool(chainId: number, token: Address, poolAddress?: Address): Promise<TokenPriceObservation> {
   const chainName = chainId === 1 ? "ethereum" : String(chainId);
   const url = `${API_ROOT}/tokens/v1/${chainName}/${token}`;
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS), headers: { "user-agent": "argus" } });
-    if (!response.ok) return null;
+    if (!response.ok) return { kind: "provider_error" };
     const pairs = asPairs(await response.json());
-    if (pairs.length === 0) return null;
+    if (pairs.length === 0) return { kind: "pool_missing" };
 
-    const best = pairs.sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0))[0];
-    if (!best) return null;
+    const wantedPool = poolAddress?.toLowerCase();
+    const best = wantedPool
+      ? pairs.find((pair) => pair.pairAddress?.toLowerCase() === wantedPool)
+      : pairs.sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0))[0];
+    if (!best) return { kind: "pool_missing" };
 
     const baseAddr = best.baseToken?.address?.toLowerCase() as Address | undefined;
     const quoteAddr = best.quoteToken?.address?.toLowerCase() as Address | undefined;
     const poolAddr = best.pairAddress?.toLowerCase() as Address | undefined;
     const priceUsdStr = best.priceUsd;
     const priceNativeStr = best.priceNative;
-    if (!baseAddr || !quoteAddr || !poolAddr) return null;
+    if (!baseAddr || !quoteAddr || !poolAddr) return { kind: "pool_missing" };
 
     const isBase = baseAddr === token.toLowerCase();
     const priceUsd = typeof priceUsdStr === "string" ? parseFloat(priceUsdStr) : null;
     const priceNative = typeof priceNativeStr === "string" ? parseFloat(priceNativeStr) : null;
-    const effPrice = priceUsd ?? priceNative;
-    if (effPrice === null || !isFinite(effPrice) || effPrice <= 0) return null;
+    // DexScreener reports the base token's price. Invert it when the watched
+    // token is the quote side so this remains quote-per-watched-token.
+    const basePrice = priceNative ?? priceUsd;
+    const effPrice = isBase ? basePrice : (basePrice !== null && basePrice > 0 ? 1 / basePrice : null);
+    if (effPrice === null || !isFinite(effPrice) || effPrice < 0) return { kind: "pool_missing" };
+    if (effPrice === 0 || (best.liquidity?.usd !== null && best.liquidity?.usd !== undefined && best.liquidity.usd <= 0)) {
+      return { kind: "liquidity_lost" };
+    }
 
-    const scaledPrice = BigInt(Math.round(effPrice * 1e18));
-    return {
+    const str = effPrice.toFixed(18);
+    const parts = str.split(".");
+    const scaledPrice = parts.length === 2 ? BigInt((parts[0] ?? "0") + (parts[1] ?? "").slice(0, 18).padEnd(18, "0")) : null;
+    if (scaledPrice === null) return { kind: "pool_missing" };
+    return { kind: "price", value: {
       price: scaledPrice,
       poolAddress: poolAddr,
       quoteToken: isBase ? quoteAddr : baseAddr,
       symbol: isBase ? best.baseToken?.symbol : best.quoteToken?.symbol,
-    };
+      liquidityUsd: typeof best.liquidity?.usd === "number" ? best.liquidity.usd : null,
+    } };
   } catch (err) {
-    log.warn("DexScreener fetchTokenPrice failed", { chainId, token, err: String(err) });
-    return null;
+    log.warn("DexScreener fetchTokenPrice failed", { chainId, token, err });
+    return { kind: "provider_error" };
   }
 }
 
@@ -115,13 +141,7 @@ export async function rankStablecoinVolume(chainId: number, topN: number): Promi
   const stableSet = new Set(stablecoins.map((s) => s.toLowerCase()));
   const totals = new Map<Address, { volume: number; pools: RankedPool[] }>();
   for (const stablecoin of stablecoins) {
-    let pairs: DexPair[];
-    try {
-      pairs = await fetchPairs(chainId, stablecoin);
-    } catch (err) {
-      log.warn("DexScreener volume query failed", { chainId, stablecoin, err: String(err) });
-      continue;
-    }
+    let pairs: DexPair[] = await fetchPairs(chainId, stablecoin);
     for (const pair of pairs) {
       const base = pair.baseToken?.address?.toLowerCase();
       const quote = pair.quoteToken?.address?.toLowerCase();

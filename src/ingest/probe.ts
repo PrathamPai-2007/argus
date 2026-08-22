@@ -9,6 +9,7 @@ export interface EndpointProbe {
   blockNumber: number | null;
   latencyMs: number | null;
   tracesAvailable: boolean | null;
+  maxArchiveDepth: number;
   error: string | null;
 }
 
@@ -31,8 +32,6 @@ export async function probeTraceCapability(client: PublicClient): Promise<boolea
       if (msg.includes("method") && (msg.includes("not found") || msg.includes("does not exist") || msg.includes("not supported") || msg.includes("unsupported") || msg.includes("not available") || msg.includes("missing"))) {
         continue; // method doesn't exist
       }
-      // Only method-level validation errors prove the method exists. Auth,
-      // timeout, and rate-limit failures are not capability evidence.
       if (msg.includes("transaction not found") || msg.includes("invalid params") || msg.includes("invalid argument")) return true;
       return false;
     }
@@ -40,8 +39,28 @@ export async function probeTraceCapability(client: PublicClient): Promise<boolea
   return false;
 }
 
+/** Probe non-archive vs archive eth_getLogs block depth capability. */
+export async function probeArchiveDepth(client: PublicClient): Promise<number> {
+  try {
+    const head = await client.getBlockNumber();
+    if (head <= 64n) return 100_000;
+    const testBlock = head - 300n > 0n ? head - 300n : 0n;
+    await client.getLogs({
+      fromBlock: testBlock,
+      toBlock: testBlock,
+    });
+    return 100_000;
+  } catch (err) {
+    const msg = String(err).toLowerCase();
+    if (msg.includes("archive") || msg.includes("personal token") || msg.includes("pruned")) {
+      return 128;
+    }
+    return 128;
+  }
+}
+
 export async function probeEndpoint(url: string, withTraces = true): Promise<EndpointProbe> {
-  const out: EndpointProbe = { url, reachable: false, blockNumber: null, latencyMs: null, tracesAvailable: null, error: null };
+  const out: EndpointProbe = { url, reachable: false, blockNumber: null, latencyMs: null, tracesAvailable: null, maxArchiveDepth: 128, error: null };
   try {
     const client = buildClient(url);
     const t0 = Date.now();
@@ -50,6 +69,7 @@ export async function probeEndpoint(url: string, withTraces = true): Promise<End
     out.blockNumber = Number(bn);
     out.reachable = true;
     if (withTraces) out.tracesAvailable = await probeTraceCapability(client);
+    out.maxArchiveDepth = await probeArchiveDepth(client);
   } catch (err) {
     out.error = redactUrl(String(err));
   }

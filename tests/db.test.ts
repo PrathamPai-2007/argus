@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { closeDb, getToken, insertEvents, loadEvents, openDb, upsertToken } from "../src/db.ts";
-import type { FundingEvent, StandardTransferEvent, SwapEvent } from "../src/types.ts";
+import { closeDb, getToken, insertEvents, insertSignal, listSignals, listSignalsForToken, loadEvents, openDb, recentSignals, upsertToken } from "../src/db.ts";
+import type { FundingEvent, Signal, StandardTransferEvent, SwapEvent } from "../src/types.ts";
 
 // Regression: payload_json round-trips bigints to strings; loadEvents must revive them
 // so replay / rebuild-from-events never hit "Invalid mix of BigInt and other type".
@@ -61,5 +61,22 @@ describe("db.loadEvents", () => {
     upsertToken({ chainId: 1, address: addr, symbol: "TST", decimals: 18, totalSupply: 10n, source: "factory" });
     expect(getToken(1, addr)?.expires_at).toBe(2000);
     expect(getToken(1, addr)?.symbol).toBe("TST");
+  });
+
+  test("maps signal rows consistently across signal queries", () => {
+    const signal: Signal = {
+      chainId: 1,
+      tokenAddress: "0x" + "aa".repeat(20),
+      ruleId: "R1",
+      weight: 35,
+      evidence: { freshWalletPct: 12.5 },
+      blockNumber: 10,
+      timestamp: 1_700_000_000,
+    };
+    insertSignal(signal);
+
+    expect(recentSignals(1, signal.tokenAddress, 1_600_000_000)).toEqual([signal]);
+    expect(listSignals(1)).toEqual([signal]);
+    expect(listSignalsForToken(1, signal.tokenAddress)).toEqual([signal]);
   });
 });

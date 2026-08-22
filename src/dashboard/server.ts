@@ -312,14 +312,23 @@ export class DashboardServer {
 
 function authorized(req: Request, token: string): boolean {
   const header = req.headers.get("authorization") ?? "";
-  if (header.startsWith("Bearer ")) return header.slice(7) === token;
-  if (!header.startsWith("Basic ")) return false;
-  try {
-    const decoded = atob(header.slice(6));
-    return decoded.slice(decoded.indexOf(":") + 1) === token;
-  } catch {
-    return false;
+  if (header.startsWith("Bearer ") && header.slice(7) === token) return true;
+  if (header.startsWith("Basic ")) {
+    try {
+      const decoded = atob(header.slice(6));
+      if (decoded.slice(decoded.indexOf(":") + 1) === token) return true;
+    } catch {
+      /* ignore decoding error */
+    }
   }
+  try {
+    const url = new URL(req.url);
+    const queryToken = url.searchParams.get("token");
+    if (queryToken && queryToken === token) return true;
+  } catch {
+    /* ignore url parse error */
+  }
+  return false;
 }
 
 function round2(n: number): number {

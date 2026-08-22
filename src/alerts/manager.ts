@@ -27,18 +27,22 @@ export class AlertManager {
       const cooldownSecs = this.alertsCfg.cooldownMinutes * 60;
       const timeSinceLast = now - last.created_at;
       const inCooldown = timeSinceLast < cooldownSecs;
+      
+      let lastPayloadSev: string | null = null;
+      try { lastPayloadSev = JSON.parse(last.payload_json).severity; } catch {}
+      const newCritical = payload.severity === "critical" && lastPayloadSev !== "critical";
+      
       if (inCooldown) {
-        let lastPayloadSev: string | null = null;
-        try { lastPayloadSev = JSON.parse(last.payload_json).severity; } catch {}
-        const newCritical = payload.severity === "critical" && lastPayloadSev !== "critical";
-        const minEscalationInterval = 180; // 3 minutes between escalation re-alerts
-        const escalated = payload.score >= last.score + this.alertsCfg.escalationDelta;
-        
-        if (!escalated || (timeSinceLast < minEscalationInterval && !newCritical)) {
+        if (!newCritical) {
           log.debug("alert suppressed by cooldown", { token: payload.tokenAddress, score: payload.score, lastScore: last.score, timeSinceLast });
           return null;
         }
         log.info("alert escalation inside cooldown", { token: payload.tokenAddress, from: last.score, to: payload.score });
+      } else {
+        if (payload.score <= last.score && payload.severity === lastPayloadSev) {
+          log.debug("alert suppressed (score didn't increase)", { token: payload.tokenAddress, score: payload.score });
+          return null;
+        }
       }
     }
 
@@ -53,7 +57,7 @@ export class AlertManager {
       try {
         await sink.send(payload, id, confirmed);
       } catch (err) {
-        log.error("alert sink failed", { sink: sink.name, err: String(err) });
+        log.error("alert sink failed", { sink: sink.name, err });
       }
     }
     return id;
@@ -71,7 +75,7 @@ export class AlertManager {
         try {
           await sink.sendText(text);
         } catch (err) {
-          log.error("retraction sink failed", { sink: sink.name, err: String(err) });
+          log.error("retraction sink failed", { sink: sink.name, err });
         }
       }
     }

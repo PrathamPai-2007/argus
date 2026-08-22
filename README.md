@@ -10,20 +10,22 @@
 
 ## Features
 
-- **Live ingestion** — WebSocket subscription with automatic RPC failover, heartbeat/staleness detection, and watchdog recovery.
+- **Live ingestion** — WebSocket subscription with automatic RPC failover, 5s–60s Infura rate-limit backoff, heartbeat/staleness detection, and watchdog recovery.
+- **Dual-RPC parallel catch-up** — when falling behind the live head, block chunks are fetched in parallel across the configured HTTP RPC pool to catch up at 2x speed before resuming the live WebSocket stream.
+- **Quota-aware RPC backfilling** — standard historical RPC backfills automatically route to Public ETH RPCs (or Etherscan/BigQuery), preserving Infura API credits exclusively for real-time streaming and catch-up.
 - **Live-first startup** — connects and processes new blocks immediately; historical enrichment never gates ingestion.
 - **Reorg-safe state** — a rollback-friendly union-find graph (`RollbackDSU`, no path compression) rewinds to any block when the chain reorgs; confirmed alerts are confirmed, unfinalized ones are retracted.
 - **Gap recovery** — startup begins at the current head, while bounded reconnect, queue-overflow, and parent-hash reorg recovery run in-process. DexScreener stablecoin volume prioritizes optional background enrichment for the top tokens.
 - **Funding extraction** — native ETH transfers, `Disperse` calldata decoding, and internal calls via trace APIs when the endpoint exposes them (graceful degradation otherwise).
 - **Auto-watch** — tracks Uniswap V2-style factories, registers every new pool, and auto-watches newly minted tokens for a configurable window.
 - **8 heuristic rules** (R1–R8) with tunable thresholds, weights, and replay presets.
-- **Webhook push** — POST alerts, signals, reorg retractions, and performance outcomes to validated HTTP(S) endpoints (Discord/Slack/n8n/your own server); HMAC-signed when a secret is set.
+- **Webhook push** — POST alerts, signals, and reorg retractions to validated HTTP(S) endpoints (Discord/Slack/n8n/your own server); HMAC-signed when a secret is set.
 - **Graph API & SQL Materialization** — per-token wallet clusters and funding edges as JSON and materialized SQL tables (`clusters`, `cluster_members`), ready to feed your own visualizations.
-- **Alert performance journal & TP/SL tracking** — pool-relative watches start on real alerts, auto-register pool subscriptions, resolve entry prices via DexScreener fallback, poll DEX prices every 15 seconds, track a 12-hour `+50% / -20%` target/stop window, and send Telegram outcome alerts (`🎯 TP HIT`, `🛑 SL HIT`).
+- **Alert performance journal & TP/SL tracking** — pool-relative watches start on real alerts, auto-register pool subscriptions, resolve quote-aligned prices via DexScreener fallback, poll DEX prices every 15 seconds, track a 12-hour `+50% / -20%` target/stop window with single-tick anomaly guards ($>20\times$), format sub-micro prices without `$0.000000` truncation, and send Telegram outcome alerts (`🎯 TP HIT`, `🛑 SL HIT`).
 - **Selective cross-session persistence** — alerts, alert history, active performance tracking sessions, and alerted tokens persist cleanly across engine restarts.
 - **Real-time WebSocket dashboard** — `Bun.serve` + native WebSockets (`ws://127.0.0.1:3737/ws`) + SSE on `127.0.0.1:3737`, zero dependencies; optionally protected with `ARGUS_DASHBOARD_TOKEN`.
 - **Hot-reloadable config** — edit `argus.config.ts` and rule/scoring/alert/auto-watch/webhook settings apply without a restart.
-- **Secrets stay out of logs & test isolation** — RPC keys and URL credentials are redacted centrally in the logger; test runs route logs strictly to `logs/argus-test.log`; log level is configurable with `ARGUS_LOG_LEVEL`.
+- **Secrets stay out of logs & test isolation** — RPC keys and URL credentials are redacted centrally in the logger; test runs use timestamped `logs/argus-test-*.log` files; log level is configurable with `ARGUS_LOG_LEVEL`.
 - **Volume prioritization** — DexScreener ranks Ethereum tokens by recent USDC/USDT/DAI-quoted volume; the top 10 receive slow, targeted enrichment.
 
 ## How it works
@@ -69,7 +71,7 @@ src/
   config.ts            hand-rolled config validation + .env loader + hot reload
   db.ts                bun:sqlite repositories (WAL)
   types.ts             StandardEvent union, Signal, AlertPayload
-   queue.ts             weighted ring buffer (drop-oldest, never blocks ingestion)
+  queue.ts              weighted ring buffer (drop-oldest, never blocks ingestion)
   engine.ts            orchestrator: queue → persist → graph → rules → score → alerts
   scorer.ts            per-rule weight sum → 0–100 → severity
   seeds.ts             starter labels (CEX hot wallets, routers, Disperse)
@@ -85,8 +87,8 @@ src/
   alerts/manager.ts    cooldown / escalation / rate limit / retractions
   alerts/telegram.ts   single fetch POST; no SDK
   webhooks.ts          HMAC-signed outbound POST of alerts/signals/retractions (plain fetch)
-   dashboard/server.ts  local Bun.serve + SSE + JSON API + graph API + optional auth
-  dashboard/page.ts    single-page dashboard HTML
+  dashboard/server.ts   local Bun.serve + SSE + JSON API + graph API + optional auth
+  dashboard/page.ts     single-page dashboard HTML
   cli/                 doctor, replay, backfill entrypoints
 tests/                 bun:test suites (adapter, graph, dsu, db, rules, scorer, alerts, config, queue, dashboard, performance, normalizer)
 ```
@@ -124,7 +126,11 @@ A high-velocity token exercises the whole pipeline (ingest → graph → rules �
 TELEGRAM_BOT_TOKEN=...       # via @BotFather
 TELEGRAM_CHAT_ID=...         # via @userinfobot
 RPC_ETH_MAINNET=wss://mainnet.infura.io/ws/v3/<key>
-# ETHERSCAN_API_KEY=...      # optional historical enrichment (free tier ~3 req/s)
+# RPC_ETH_HTTP=https://mainnet.infura.io/v3/<key>
+# RPC_ETH_BACKUP=wss://ethereum-rpc.publicnode.com
+# RPC_ETH_BACKUP_HTTP=https://ethereum-rpc.publicnode.com
+# ANKR_API_KEY=...            # primary keyed HTTP RPC: https://rpc.ankr.com/eth/<key>
+# ETHERSCAN_API_KEY=...       # required by the enabled sample Etherscan config
 # ARGUS_DASHBOARD_TOKEN=...  # optional Basic/Bearer token for dashboard/API access
 # ARGUS_LOG_LEVEL=info        # optional: debug | info | warn | error
 
@@ -147,11 +153,11 @@ bun run doctor [--config path]                               # pre-flight checks
 bun run replay --chain 1 --from N --to M [--token 0x...] [--preset name]
 bun run backfill --chain 1 --from N --to M                   # historical ingest (RPC or configured providers)
 bun test                                                       # unit tests
-bun run typecheck                                            # tsc --noEmit (strict)
+bun run typecheck                                               # tsc --noEmit (strict)
 ```
 
-- **replay** — offline backtest over the `events` table; apply a tuning preset (`default` | `cautious` | `strict`) without touching config.
-- **backfill** — ingest a historical block range into `events` for later replay. Uses the same provider selection as gap backfill (Etherscan if configured, otherwise the RPC).
+- **replay** — offline backtest over the `events` table; apply a tuning preset (`default` | `cautious` | `strict`) without touching config. Add `--config path` to use a non-default config.
+- **backfill** — ingest a historical block range into `events` for later replay. Uses the same provider selection as gap backfill (Etherscan if configured, otherwise the RPC). Add `--config path` to use a non-default config.
 - **doctor** — validates config, DB, RPC reachability (including `debug_traceTransaction` capability), Telegram credentials, and disk space.
 
 The live engine is intentionally not a historical replay service: it starts from the current
@@ -189,9 +195,9 @@ reference pool and remain quote-denominated; sessions close at `+50%`, `-20%`, o
 
 All tuning lives in `argus.config.ts` (validated in `src/config.ts`, no schema lib):
 
-- **chains** — per-chain RPC list (used in order with automatic failover), finality depth, staleness timeout.
+- **chains** — per-chain WebSocket RPC list (`rpcs`, used in order with automatic failover), HTTP RPC pool (`httpRpcs`, Ankr first and PublicNode second by default), Infura recovery cooldown (`infuraRetryMinutes`, default 5), finality depth, and staleness timeout (`staleAfterMs`, default 30s). All stateless `eth_getLogs` queries are routed via cached HTTP RPC clients to prevent provider WS errors.
 - **chains.backfill** — optional historical-log providers for bounded recovery and targeted enrichment; never required for startup.
-  - `etherscan` (disabled by default in the sample config) — API key + rate limit. Handles pagination, throttling, and recursive range splitting to stay under Etherscan's per-address 10,000-row window.
+  - `etherscan` (enabled in the sample config) — API key + rate limit. Handles pagination, throttling, and recursive range splitting to stay under Etherscan's per-address 10,000-row window. Disable it or provide `ETHERSCAN_API_KEY` before starting.
   - `bigquery` (disabled by default) — needs a Google service-account JSON and project; only selected when the estimated range exceeds `bigqueryThresholdHours`, and protected by `maxBytesBilled`.
 - **watchlist** — permanent tokens to watch.
 - **autoWatch** — `enabled`, `factories` (Uniswap V2-style; each entry is a raw `0x` address or a known name like `"uniswap-v2"` — names expand to the chain's canonical factory), `watchHours` (how long factory-discovered tokens stay watched; `NULL` = permanent).
@@ -203,7 +209,7 @@ All tuning lives in `argus.config.ts` (validated in `src/config.ts`, no schema l
 - **volumeRanking** — DexScreener poll interval, top-token count, and targeted enrichment window.
 - **dbPath** — SQLite storage location.
 
-Changes to rules/scoring/alerts/autoWatch/webhooks hot-reload on save; chain/watchlist changes require a restart. Webhook delivery is fire-and-forget, uses request timeouts and bounded exponential retries, rejects redirects, and refuses loopback/private/link-local/metadata destinations.
+Changes to rules/scoring/autoWatch/volumeRanking/webhooks hot-reload on save; alert settings, chain, and watchlist changes require a restart. Webhook delivery is fire-and-forget, uses request timeouts and bounded exponential retries, rejects redirects, and refuses loopback/private/link-local/metadata destinations.
 
 ## Design invariants
 
@@ -238,7 +244,8 @@ The test suite (`bun:test`) covers adapter startup/reorg behavior, the rollback 
 
 ## Notes & limitations
 
-- Free-tier RPCs throttle or reject `eth_getLogs`. Argus adapts: multi-address queries fan out per-address with bounded concurrency, throttle/timeout errors retry then fail over to the next endpoint, and archive-unsupported errors (e.g. PublicNode's "archive requests require a personal token") switch the backfill to Etherscan automatically. `doctor` verifies endpoint health including trace API availability.
+- Free-tier RPCs throttle or reject `eth_getLogs`. Argus adapts: routine historical backfilling bypasses the live WebSocket in favor of configured HTTP RPCs (or Etherscan/BigQuery) to preserve WebSocket quotas; Infura rate-limit throttling uses an exponential backoff starting at 5s up to 60s max; when falling behind the live head during recovery, chunk backfills execute across the configured HTTP RPC pool in parallel before resuming the live WebSocket stream.
+- Multi-address queries fan out per-address with bounded concurrency, throttle/timeout errors retry then fail over to the next endpoint, and archive-unsupported errors (e.g. PublicNode's "archive requests require a personal token") switch the backfill to Etherscan automatically. `doctor` verifies endpoint health including trace API availability.
 - Some endpoints (Infura free tier) intermittently reject `eth_getLogs` with `-32603`/`"internal error"`. Argus classifies these as transient, retries and fails over where possible, and keeps live ingestion independent of optional enrichment/recovery failures.
 - Etherscan provides historical logs only; native and trace-based funding still depends on RPC coverage and is reported as degraded when unavailable.
 - Etherscan's free tier caps each address/topic result window at 10,000 rows and ~3 requests/sec. Argus starts every query at a 256-block range and recursively splits only when Etherscan reports "Result window is too large", backs off on rate limits (5 retries), and sleeps between requests. Preferring the historical provider for larger gaps keeps the RPC's archive limits out of the picture; the watchdog uses per-request heartbeats rather than a fixed stall timeout.

@@ -6,9 +6,9 @@ import * as db from "./db.ts";
 import { resolveFactories } from "./factories.ts";
 import { GraphEngine, DEFAULT_GRAPH_TUNING } from "./graph/engine.ts";
 import { EvmAdapter, type AdapterStatus, type ChainAdapter } from "./ingest/evm.ts";
-import { rankStablecoinVolume, fetchTokenPrice, type RankedToken } from "./ingest/dexscreener.ts";
+import { rankStablecoinVolume, fetchTokenPrice, fetchTokenPriceForPool, type RankedToken } from "./ingest/dexscreener.ts";
 import { log, redactUrl } from "./logger.ts";
-import { priceFromSwap, thresholds, updateSession, PERFORMANCE_WINDOW_SECS, type PerformanceEvent, type PerformanceSession } from "./performance.ts";
+import { decimalsForAddress, priceFromSwap, thresholds, updateSession, PERFORMANCE_WINDOW_SECS, type PerformanceEvent, type PerformanceSession } from "./performance.ts";
 import { EventQueue } from "./queue.ts";
 import { RULES } from "./rules/index.ts";
 import { scoreToken } from "./scorer.ts";
@@ -65,6 +65,7 @@ export class ArgusEngine {
   private draining = false;
   private pruneTimer: ReturnType<typeof setInterval> | null = null;
   private performanceTimer: ReturnType<typeof setInterval> | null = null;
+  private performancePollRunning = false;
   private volumeTimer: ReturnType<typeof setInterval> | null = null;
   private configWatcher: ReturnType<typeof watch> | null = null;
   private significance = new Map<string, { lastAt: number; lastValue: number | null }>();
@@ -87,8 +88,6 @@ export class ArgusEngine {
   private signalHook?: (signal: Signal) => void;
   private eventHook?: (event: StandardEvent) => void;
   private tokenHook?: (token: TokenMeta) => void;
-  private statusHook?: () => void;
-
   /** Optional live hook for emitted alerts (Phase 4 dashboard SSE/WS). */
   setAlertHook(hook: (payload: AlertPayload, id: number) => void): void {
     this.alertHook = hook;
@@ -108,10 +107,6 @@ export class ArgusEngine {
 
   setTokenHook(hook: (token: TokenMeta) => void): void {
     this.tokenHook = hook;
-  }
-
-  setStatusHook(hook: () => void): void {
-    this.statusHook = hook;
   }
 
   /** Active chain ids (Phase 4 dashboard). */
@@ -200,7 +195,6 @@ export class ArgusEngine {
         },
         onFinalized: (chainId, upTo) => this.onFinalized(chainId, upTo),
         onReorg: (chainId, from) => this.onReorg(chainId, from),
-          onHead: () => {},
           onStatus: (chainId, status, detail) => this.onAdapterStatus(chainId, status, detail),
           getAppliedBlock: (chainId) => this.chains.get(chainId)?.lastAppliedBlock ?? 0,
       });
@@ -233,6 +227,7 @@ export class ArgusEngine {
         this.onAdapterStatus(chainId, "error", { err: safeErr });
       });
     }
+    void this.primeWatchlistPools();
 
     this.watchConfigFile();
     this.volumeTimer = setInterval(() => void this.refreshVolumeRankings(), this.cfg.volumeRanking.pollMinutes * 60_000);
@@ -299,7 +294,7 @@ export class ArgusEngine {
         this.finalizing.delete(chainId);
         if (this.pendingFinalized.has(chainId)) this.onFinalized(chainId, this.pendingFinalized.get(chainId) as number);
       }
-    }).catch((err) => log.error("finalization failed", { chainId, err: String(err) }));
+    }).catch((err) => log.error("finalization failed", { chainId, err }));
   }
 
   private async onReorg(chainId: number, fromBlock: number): Promise<void> {
@@ -372,7 +367,7 @@ export class ArgusEngine {
         else this.queue.push({ chainId, events: [evt] });
         this.failedEventRetries.delete(key);
       } catch (err) {
-        log.error("event retry failed", { chainId, block: evt.blockNumber, kind: evt.kind, err: String(err) });
+        log.error("event retry failed", { chainId, block: evt.blockNumber, kind: evt.kind, err });
         this.scheduleEventRetry(chainId, evt, graphApplied);
       }
       void this.drain();
@@ -414,7 +409,7 @@ export class ArgusEngine {
               chainId,
               block: evt.blockNumber,
               kind: evt.kind,
-              err: String(err),
+              err,
               stack: (err as Error)?.stack,
             });
           }
@@ -440,6 +435,25 @@ export class ArgusEngine {
       db.insertFundingEdge({ funder: evt.funder, funded: evt.funded, chainId, amount: evt.amount, blockNumber: evt.blockNumber, method: evt.method });
       // funders of relevant wallets are themselves relevant (feeds R6 funder chains)
       this.chains.get(chainId)?.adapter.addRelevantAddresses([evt.funder]);
+      
+      // Re-evaluate rules for tokens this wallet bought, since retroactive funding
+      // arrives after the transfer event that discovered the wallet.
+      const tokens = this.graphFor(chainId).getTokensBoughtBy(evt.funded);
+      for (const token of tokens) {
+        const syn: StandardEvent = {
+          kind: "transfer",
+          chainId,
+          blockNumber: evt.blockNumber,
+          timestamp: evt.timestamp,
+          txHash: evt.txHash,
+          logIndex: 0,
+          tokenAddress: token,
+          sender: "0x0000000000000000000000000000000000000000",
+          receiver: evt.funded,
+          amount: 0n,
+        };
+        this.runRules(chainId, syn);
+      }
       return;
     }
 
@@ -487,12 +501,16 @@ export class ArgusEngine {
       if (graph.isFresh(evt.receiver, evt.timestamp, 30) && graph.nonceOf(evt.receiver) === null) {
         this.fetchNonce(chainId, evt.receiver);
       }
-    }
-
       this.runRules(chainId, evt);
+    } else {
+      const poolDb = db.getDb().query("SELECT token_address FROM pools WHERE chain_id = ? AND pool_address = ?").get(chainId, token) as { token_address: string } | undefined;
+      if (poolDb) {
+        this.runRules(chainId, evt, poolDb.token_address as Address);
+      }
+    }
   }
 
-  private runRules(chainId: number, evt: StandardEvent): void {
+  private runRules(chainId: number, evt: StandardEvent, targetTokenOverride?: Address): void {
     for (const [id, rule] of Object.entries(RULES)) {
       const ruleCfg = this.cfg.rules[id as keyof typeof this.cfg.rules];
       if (!ruleCfg?.enabled) continue;
@@ -500,10 +518,13 @@ export class ArgusEngine {
       try {
         signal = rule(evt, this.graphFor(chainId), this.cfg.rules);
       } catch (err) {
-        log.error("rule evaluation failed", { rule: id, err: String(err) });
+        log.error("rule evaluation failed", { rule: id, err });
         continue;
       }
-       if (signal) this.handleSignal(signal, false, evt); // live events are unfinalized — alerts ship tagged "unconfirmed" (PLAN.md §11.1)
+      if (signal) {
+        if (targetTokenOverride) signal.tokenAddress = targetTokenOverride;
+        this.handleSignal(signal, false, evt);
+      }
     }
   }
 
@@ -538,11 +559,13 @@ export class ArgusEngine {
         this.refreshWatchSubscription(payload.chainId);
         await this.ensureTokenPoolsRegistered(payload.chainId, payload.tokenAddress);
         await this.openPerformanceSession(id, signal.chainId, signal.tokenAddress, sourceEvent);
+        const clusters = this.graphFor(signal.chainId).clusterBreakdown(payload.tokenAddress);
+        db.syncClusters(clusters);
         this.alertHook?.(payload, id);
         this.webhooks.dispatchAlert(payload, id, finalized);
       }
     }).catch((err) => {
-      log.error("alert pipeline failed", { token: payload.tokenAddress, err: String(err), stack: (err as Error)?.stack });
+      log.error("alert pipeline failed", { token: payload.tokenAddress, err });
     });
   }
 
@@ -571,9 +594,35 @@ export class ArgusEngine {
     }
   }
 
+  private async primeWatchlistPools(): Promise<void> {
+    for (const watch of this.cfg.watchlist) {
+      const runtime = this.chains.get(watch.chainId);
+      if (!runtime || db.listPoolsForToken(watch.chainId, watch.address).length > 0) continue;
+      const fallback = await fetchTokenPrice(watch.chainId, watch.address);
+      if (!fallback) continue;
+      db.insertPool({
+        chainId: watch.chainId,
+        poolAddress: fallback.poolAddress,
+        tokenAddress: watch.address,
+        quoteToken: fallback.quoteToken,
+        factory: "dexscreener",
+        createdBlock: runtime.adapter.status().lastHead,
+      });
+      runtime.adapter.registerPool(fallback.poolAddress, watch.address, fallback.quoteToken);
+      this.graphFor(watch.chainId).registerPool(fallback.poolAddress);
+      log.info("watchlist pool primed", { chainId: watch.chainId, token: watch.address, pool: fallback.poolAddress });
+    }
+  }
+
   private async openPerformanceSession(alertId: number, chainId: number, tokenAddress: Address, sourceEvent?: StandardEvent): Promise<void> {
     let swap = sourceEvent?.kind === "swap" ? sourceEvent : db.latestSwapForToken(chainId, tokenAddress);
-    let entryPrice = swap ? priceFromSwap(swap) : null;
+    const swapPool = swap ? db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
+      .get(chainId, swap.poolAddress, tokenAddress) as { quote_token: Address | null } | undefined : undefined;
+    const tokenDecimals = db.getToken(chainId, tokenAddress)?.decimals ?? 18;
+    const quoteDecimals = swapPool?.quote_token
+      ? db.getToken(chainId, swapPool.quote_token)?.decimals ?? decimalsForAddress(swapPool.quote_token)
+      : 18;
+    let entryPrice = swap ? priceFromSwap(swap, tokenDecimals, quoteDecimals) : null;
     let poolAddress = swap?.poolAddress;
     let quoteToken: Address | null = null;
     const openedAt = sourceEvent?.timestamp ?? (swap?.timestamp ?? Math.floor(Date.now() / 1000));
@@ -619,13 +668,19 @@ export class ArgusEngine {
   }
 
   private updatePerformance(swap: StandardEvent & { kind: "swap" }): void {
-    const price = priceFromSwap(swap);
+    const pool = db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
+      .get(swap.chainId, swap.poolAddress, swap.tokenAddress) as { quote_token: Address | null } | undefined;
+    const tokenDecimals = db.getToken(swap.chainId, swap.tokenAddress)?.decimals ?? 18;
+    const quoteDecimals = pool?.quote_token
+      ? db.getToken(swap.chainId, pool.quote_token)?.decimals ?? decimalsForAddress(pool.quote_token)
+      : 18;
+    const price = priceFromSwap(swap, tokenDecimals, quoteDecimals);
     if (price === null) return;
     const sessions = db.listPerformanceSessions({ chainId: swap.chainId, tokenAddress: swap.tokenAddress, activeOnly: true });
     for (const session of sessions) {
       if (session.pool_address !== swap.poolAddress) continue;
       const result = updateSession(session, price, swap.timestamp);
-      db.updatePerformanceSession({
+        db.updatePerformanceSession({
         id: session.id,
         outcome: result.outcome,
         currentPrice: result.currentPrice,
@@ -633,8 +688,10 @@ export class ArgusEngine {
         maxPrice: result.maxPrice,
         lastBlock: swap.blockNumber,
         updatedAt: swap.timestamp,
-        closedAt: result.closedAt,
-      });
+          closedAt: result.closedAt,
+          missingObservations: 0,
+          closeReason: result.outcome === "active" ? null : "price_threshold",
+        });
       const updated = db.getPerformanceSession(session.id);
       if (!updated) continue;
       this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
@@ -645,23 +702,67 @@ export class ArgusEngine {
   }
 
   private async expirePerformance(): Promise<void> {
-    const ids = db.expirePerformanceSessions(Math.floor(Date.now() / 1000));
-    for (const id of ids) {
-      const session = db.getPerformanceSession(id);
-      if (session) {
-        this.performanceHook?.({ type: "performance_closed", session });
-        this.dispatchOutcomeNotification(session);
+    if (this.performancePollRunning || !this.running) return;
+    this.performancePollRunning = true;
+    try {
+      const ids = db.expirePerformanceSessions(Math.floor(Date.now() / 1000));
+      for (const id of ids) {
+        const session = db.getPerformanceSession(id);
+        if (session) {
+          this.performanceHook?.({ type: "performance_closed", session });
+          this.dispatchOutcomeNotification(session);
+        }
       }
-    }
 
-    // Polling check for active sessions with low swap frequency
-    const activeSessions = db.listPerformanceSessions({ activeOnly: true });
-    const now = Math.floor(Date.now() / 1000);
-    for (const session of activeSessions) {
-      if (now - session.updated_at >= 15) {
-        const priceData = await fetchTokenPrice(session.chain_id, session.token_address);
-        if (priceData && priceData.price > 0n) {
-          const result = updateSession(session, priceData.price, now);
+      // Polling check for active sessions with low swap frequency.
+      const activeSessions = db.listPerformanceSessions({ activeOnly: true });
+      const now = Math.floor(Date.now() / 1000);
+      for (const session of activeSessions) {
+        if (now - session.updated_at < 15) continue;
+        const observation = await fetchTokenPriceForPool(session.chain_id, session.token_address, session.pool_address);
+        if (observation.kind === "provider_error") continue;
+        if (observation.kind === "pool_missing" || observation.kind === "liquidity_lost") {
+          const missing = session.missing_observations + 1;
+          if (observation.kind === "liquidity_lost" || missing >= 3) {
+            const currentPrice = 0n;
+            db.updatePerformanceSession({
+              id: session.id,
+              outcome: "stop_hit",
+              currentPrice,
+              minPrice: 0n,
+              maxPrice: session.max_price,
+              lastBlock: session.last_block,
+              updatedAt: now,
+              closedAt: now,
+              lastPollAt: now,
+              missingObservations: missing,
+              closeReason: "liquidity_lost",
+            });
+            const closed = db.getPerformanceSession(session.id);
+            if (closed) {
+              this.performanceHook?.({ type: "performance_closed", session: closed });
+              this.dispatchOutcomeNotification(closed);
+            }
+          } else {
+            db.updatePerformanceSession({
+              id: session.id,
+              outcome: session.outcome,
+              currentPrice: session.current_price,
+              minPrice: session.min_price,
+              maxPrice: session.max_price,
+              lastBlock: session.last_block,
+              updatedAt: session.updated_at,
+              closedAt: session.closed_at,
+              lastPollAt: now,
+              missingObservations: missing,
+            });
+          }
+          continue;
+        }
+
+        const latest = db.getPerformanceSession(session.id);
+        if (!latest || latest.outcome !== "active" || latest.updated_at > session.updated_at) continue;
+        const result = updateSession(session, observation.value.price, now);
           db.updatePerformanceSession({
             id: session.id,
             outcome: result.outcome,
@@ -671,6 +772,9 @@ export class ArgusEngine {
             lastBlock: session.last_block,
             updatedAt: now,
             closedAt: result.closedAt,
+            lastPollAt: now,
+            missingObservations: 0,
+            closeReason: result.outcome === "active" ? null : "price_threshold",
           });
           const updated = db.getPerformanceSession(session.id);
           if (updated) {
@@ -679,15 +783,16 @@ export class ArgusEngine {
               this.dispatchOutcomeNotification(updated);
             }
           }
-        }
       }
+    } finally {
+      this.performancePollRunning = false;
     }
   }
 
   private dispatchOutcomeNotification(session: PerformanceSession): void {
     const msg = formatPerformanceOutcomeMessage(session);
     for (const sink of this.alertManager["sinks"]) {
-      void sink.sendText(msg).catch((err) => log.error("outcome sink failed", { sink: sink.name, err: String(err) }));
+      void sink.sendText(msg).catch((err) => log.error("outcome sink failed", { sink: sink.name, err }));
     }
   }
 
@@ -712,6 +817,8 @@ export class ArgusEngine {
 
   // ---- metadata / nonces (lazy, once per token/wallet) ---------------------------------
 
+  private metaAttempts = new Map<string, number>();
+
   private fetchMeta(chainId: number, token: Address): void {
     const key = `${chainId}:${token}`;
     if (this.metaInFlight.has(key) || this.metaFailed.has(key)) return;
@@ -735,14 +842,19 @@ export class ArgusEngine {
           source: existing?.source ?? "manual",
         });
         if (totalSupply) this.graphFor(chainId).setTotalSupply(token, totalSupply);
-        // Non-standard / reverting totalSupply(): remember it so the per-transfer
-        // lazy check stops firing RPC calls for every event on this token.
         if (totalSupply === null) this.metaFailed.add(key);
+        else this.metaAttempts.delete(key);
         log.info("fetched token metadata", { chainId, token, symbol: meta.symbol, totalSupply: totalSupply?.toString() });
       })
       .catch((err) => {
-        log.warn("metadata fetch failed", { chainId, token, err: String(err) });
-        this.metaFailed.add(key);
+        const attempts = (this.metaAttempts.get(key) ?? 0) + 1;
+        this.metaAttempts.set(key, attempts);
+        if (attempts >= 3) {
+          this.metaFailed.add(key);
+          log.warn("metadata fetch failed permanently after retries", { chainId, token, err });
+        } else {
+          log.warn("metadata fetch failed (will retry on next event)", { chainId, token, attempts, err });
+        }
       })
       .finally(() => this.metaInFlight.delete(key));
   }
@@ -889,7 +1001,7 @@ export class ArgusEngine {
         this.refreshWatchSubscription(chain.chainId);
         log.info("volume ranking refreshed", { chainId: chain.chainId, tokens: ranked.map((token) => ({ token: token.address, volume: token.volume })) });
       } catch (err) {
-        log.warn("volume ranking refresh failed", { chainId: chain.chainId, err: String(err) });
+        log.warn("volume ranking refresh failed", { chainId: chain.chainId, err });
       }
     }
     void this.drainEnrichmentQueue();
@@ -913,14 +1025,23 @@ export class ArgusEngine {
         const runtime = this.chains.get(token.chainId);
         if (!runtime) continue;
         const head = runtime.adapter.status().lastHead;
-        const blocks = Math.max(1, Math.ceil(this.cfg.volumeRanking.backfillHours * 300));
+        if (head === 0) {
+          this.enrichmentQueue.unshift(token);
+          this.enrichmentQueued.add(key);
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        const requestedBlocks = Math.max(1, Math.ceil(this.cfg.volumeRanking.backfillHours * 300));
+        const maxDepth = runtime.adapter.getMaxArchiveDepth();
+        const blocks = Math.min(requestedBlocks, maxDepth);
         const from = BigInt(Math.max(0, head - blocks));
         try {
           await runtime.adapter.backfillToken(token.address, from, BigInt(head));
           log.info("ranked token enrichment complete", { chainId: token.chainId, token: token.address, from: Number(from), to: head });
         } catch (err) {
-          log.warn("ranked token enrichment failed", { chainId: token.chainId, token: token.address, err: String(err) });
+          log.warn("ranked token enrichment skipped (archive/rate-limited on free RPC)", { chainId: token.chainId, token: token.address, err });
         }
+        await new Promise((r) => setTimeout(r, 200));
       }
     } finally {
       this.enrichmentRunning = false;
@@ -935,7 +1056,7 @@ export class ArgusEngine {
         debounce = setTimeout(() => void this.hotReload(), 500);
       });
     } catch (err) {
-      log.warn("config hot-reload watcher failed", { err: String(err) });
+      log.warn("config hot-reload watcher failed", { err });
     }
   }
 

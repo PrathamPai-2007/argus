@@ -208,7 +208,7 @@ export const R7: RuleFn = (evt, view, cfg) => {
   if (!lpIsPool(view, t.tokenAddress)) return null;
   if (!DEAD_ADDRESSES.has(t.receiver)) return null; // only LP burns matter
   const lp = view.lpStatus(t.tokenAddress);
-  if (!lp || lp.lpMinted <= 0n) return null;
+  if (!lp || lp.lpMinted <= 0n || lp.createdTs <= 0) return null;
   const ageHours = (t.timestamp - lp.createdTs) / 3600;
   if (ageHours < c.minPoolAgeHours) return null;
    const lockedPct = Number((lp.lpBurned * 10_000n) / lp.lpMinted) / 100;
