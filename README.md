@@ -22,7 +22,7 @@
 - **Webhook push** — POST alerts, signals, and reorg retractions to validated HTTP(S) endpoints (Discord/Slack/n8n/your own server); HMAC-signed when a secret is set.
 - **Graph API & SQL Materialization** — per-token wallet clusters and funding edges as JSON and materialized SQL tables (`clusters`, `cluster_members`), ready to feed your own visualizations.
 - **Alert performance journal & TP/SL tracking** — pool-relative watches start on real alerts, auto-register pool subscriptions, resolve quote-aligned prices via DexScreener fallback, poll DEX prices every 15 seconds, track a 12-hour `+50% / -20%` target/stop window with single-tick anomaly guards ($>20\times$), format sub-micro prices without `$0.000000` truncation, and send Telegram outcome alerts (`🎯 TP HIT`, `🛑 SL HIT`).
-- **Selective cross-session persistence** — alerts, alert history, active performance tracking sessions, and alerted tokens persist cleanly across engine restarts.
+- **Clean session restarts & trade journaling** — memory, tokens, alerts, and performance sessions are wiped clean on engine restart to avoid stale state. However, all closed alert performance tracking sessions are permanently appended to a `data/trades.csv` journal for offline analysis.
 - **Real-time WebSocket dashboard** — `Bun.serve` + native WebSockets (`ws://127.0.0.1:3737/ws`) + SSE on `127.0.0.1:3737`, zero dependencies; optionally protected with `ARGUS_DASHBOARD_TOKEN`.
 - **Hot-reloadable config** — edit `argus.config.ts` and rule/scoring/alert/auto-watch/webhook settings apply without a restart.
 - **Secrets stay out of logs & test isolation** — RPC keys and URL credentials are redacted centrally in the logger; test runs use timestamped `logs/argus-test-*.log` files; log level is configurable with `ARGUS_LOG_LEVEL`.
@@ -43,7 +43,7 @@ evm adapter ──► event queue ──► SQLite (facts) ──► graph engin
 2. **Evaluate** (`src/candidates.ts`, `src/graph/engine.ts`) — targeted history measures liquidity, early buyer count, retained buyers, independent funding groups, exchange-funded buyers, and common-funder concentration. Volume is capped at 10% of the score.
 3. **Promote** — candidates must pass both the score threshold and hard evidence gates before entering `tokens` as a live `ranked` or `factory` watch. Evaluation is bounded by candidate count, TTL, and the existing provider limiter.
 4. **Ingest** (`src/ingest/evm.ts`) — subscribes to watched-token `Transfer`s, factory `PairCreated`s, pool LP `Transfer`s and `Swap`s, and native-funding txs of followed wallets. Raw logs are normalized to `StandardEvent`s (`transfer`, `swap`, `pool_created`, `funding`).
-5. **Persist** (`src/db.ts`) — every event lands in the `events` table with a `finalized` flag; candidate state and evidence are persisted separately from facts.
+5. **Persist** (`src/db.ts`) — every event lands in the `events` table with a `finalized` flag; candidate state and evidence are held during the session to evaluate quality.
 6. **Graph** (`src/graph/engine.ts`) — wallets, funding edges, balance ledgers, and clusters via a rollback DSU. Every mutation records an undo closure so `rewindTo(block)` restores exact prior state on reorg. Finalization (`finalize(boundary)`) prunes stale rolling windows (>24h).
 7. **Rules** (`src/rules/index.ts`) — pure functions `(event, graphView, config) → Signal | null`.
 8. **Score** (`src/scorer.ts`) — best-weight-per-rule sum mapped to 0–100 and `info` / `alert` / `critical` severity.
@@ -208,7 +208,7 @@ All tuning lives in `argus.config.ts` (validated in `src/config.ts`, no schema l
   - `bigquery` (disabled by default) — needs a Google service-account JSON and project; only selected when the estimated range exceeds `bigqueryThresholdHours`, and protected by `maxBytesBilled`.
 - **watchlist** — permanent tokens to watch.
 - **autoWatch** — `enabled`, `factories` (Uniswap V2-style; each entry is a raw `0x` address or a known name like `"uniswap-v2"` — names expand to the chain's canonical factory), `watchHours` (how long factory-discovered tokens stay watched; `NULL` = permanent).
-- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. Candidates are persisted but excluded from live subscriptions and alert rules until promoted. Factory candidates enter the candidate table immediately and are evaluated when market metadata is available; disabling this setting restores direct factory/ranked auto-watch behavior.
+- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. Candidates are tracked internally during the session but excluded from live subscriptions and alert rules until promoted. Factory candidates enter the candidate table immediately and are evaluated when market metadata is available; disabling this setting restores direct factory/ranked auto-watch behavior.
 - **rules** — per-rule `enabled`, thresholds, and `weight`.
 - **scoring** — `info < alert < critical` thresholds + signal window.
 - **alerts** — Telegram on/off, cooldown, escalation delta, per-minute rate limit.
