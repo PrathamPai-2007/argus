@@ -31,7 +31,8 @@ export function scoreCandidate(metrics: CandidateMetrics): CandidateScore {
   const earlyBuyers = clamp(metrics.earlyBuyerCount * 12.5);
   const retained = metrics.earlyBuyerCount === 0 ? 0 : clamp((metrics.retainedBuyerCount / metrics.earlyBuyerCount) * 100);
   const independent = clamp(metrics.independentBuyerCount * 20);
-  const age = metrics.poolAgeHours === null ? 0 : metrics.poolAgeHours <= 48 ? 100 : clamp(100 - (metrics.poolAgeHours - 48) * 2);
+  // Unknown age is neutral evidence, not evidence of a new or unsafe pool.
+  const age = metrics.poolAgeHours === null ? 50 : metrics.poolAgeHours <= 48 ? 100 : clamp(100 - (metrics.poolAgeHours - 48) * 2);
   const exchangePenalty = clamp(metrics.exchangeBuyerCount * 15);
   const funderPenalty = clamp(metrics.commonFunderRatio * 100);
   const score = Math.round(clamp(
@@ -42,6 +43,16 @@ export function scoreCandidate(metrics: CandidateMetrics): CandidateScore {
     && metrics.independentBuyerCount >= metrics.minimumIndependentBuyers
     && metrics.earlyBuyerCount >= metrics.minimumIndependentBuyers
     && metrics.commonFunderRatio < 0.75;
+  const rejectionReason = eligible ? null
+    : (metrics.liquidityUsd ?? 0) < metrics.minimumLiquidityUsd ? "insufficient_liquidity"
+      : metrics.independentBuyerCount < metrics.minimumIndependentBuyers ? "insufficient_independent_buyers"
+        : metrics.earlyBuyerCount < metrics.minimumIndependentBuyers ? "insufficient_early_buyers"
+      : "common_funder_concentration";
+  const missingInputs = [
+    ...(metrics.liquidityUsd === null ? ["liquidityUsd"] : []),
+    ...(metrics.poolAgeHours === null ? ["poolAgeHours"] : []),
+    ...(metrics.earlyBuyerCount === 0 ? ["buyerHistory"] : []),
+  ];
   return {
     score,
     eligible,
@@ -54,6 +65,10 @@ export function scoreCandidate(metrics: CandidateMetrics): CandidateScore {
       independentBuyerCount: metrics.independentBuyerCount,
       exchangeBuyerCount: metrics.exchangeBuyerCount,
       commonFunderRatio: metrics.commonFunderRatio,
+      eligible,
+      rejectionReason,
+      missingInputs,
+      promotionThreshold: null,
       components: { liquidity, volume, earlyBuyers, retained, independent, age, exchangePenalty, funderPenalty },
     },
   };

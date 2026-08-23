@@ -184,7 +184,8 @@ Served on `127.0.0.1:3737` (local-only). The page is a single HTML file with SSE
 |----------|-------------|
 | `/` | dashboard page |
 | `/events/stream` | SSE push of alerts + 5s status ticks |
-| `/api/status` | per-chain adapter status, checkpoint, queue depth, and candidate lifecycle counts |
+| `/api/status` | per-chain adapter status, checkpoint, queue depth, candidate lifecycle counts, and volume-ranking provider health |
+| `/api/metrics` | truthful 24-hour event/signal/alert aggregates, performance outcomes, and candidate selection funnel metrics |
 | `/api/tokens` | promoted/live watched tokens (with `?chain=` filter) |
 | `/api/candidates` | candidate tokens, score, evidence, lifecycle status (with optional `?chain=` filter) |
 | `/api/alerts` | alert history |
@@ -213,7 +214,7 @@ All tuning lives in `argus.config.ts` (validated in `src/config.ts`, no schema l
   - `bigquery` (disabled by default) — needs a Google service-account JSON and project; only selected when the estimated range exceeds `bigqueryThresholdHours`, and protected by `maxBytesBilled`.
 - **watchlist** — permanent tokens to watch.
 - **autoWatch** — `enabled`, `factories` (Uniswap V2-style; each entry is a raw `0x` address or a known name like `"uniswap-v2"` — names expand to the chain's canonical factory), `watchHours` (how long factory-discovered tokens stay watched; `NULL` = permanent).
-- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. Candidates are tracked internally during the session but excluded from live subscriptions and alert rules until promoted. Factory candidates enter the candidate table immediately and are evaluated when market metadata is available; disabling this setting restores direct factory/ranked auto-watch behavior.
+- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. Candidates persist across restarts, remain excluded from live subscriptions and alert rules until promoted, and retain explainable evidence and rejection reasons. Factory candidates enter the candidate table immediately and are evaluated when market metadata is available; disabling this setting restores direct factory/ranked auto-watch behavior.
 - **rules** — per-rule `enabled`, thresholds, and `weight`.
 - **scoring** — `info < alert < critical` thresholds + signal window.
 - **alerts** — Telegram on/off, cooldown, escalation delta, per-minute rate limit.

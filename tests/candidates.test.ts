@@ -25,4 +25,11 @@ describe("candidate scoring", () => {
     const result = scoreCandidate({ ...base, volumeUsd: 50_000_000, commonFunderRatio: 1, independentBuyerCount: 1 });
     expect(result.eligible).toBe(false);
   });
+
+  test("treats unknown pool age as neutral evidence", () => {
+    const known = scoreCandidate({ ...base, poolAgeHours: 48 });
+    const unknown = scoreCandidate({ ...base, poolAgeHours: null });
+    expect(unknown.score).toBe(known.score - 5);
+    expect((unknown.evidence as any).missingInputs).toContain("poolAgeHours");
+  });
 });

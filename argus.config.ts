@@ -37,8 +37,8 @@ export default {
     maxCandidatesPerCycle: 25,
     evaluationMinutes: 30,
     candidateTtlHours: 24,
-    promotionScore: 50,
-    minimumLiquidityUsd: 50_000,
+    promotionScore: 35,
+    minimumLiquidityUsd: 10_000,
     minimumIndependentBuyers: 2,
   },
 

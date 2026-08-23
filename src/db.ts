@@ -209,40 +209,40 @@ export function listFundingEdgesForWallets(chainId: number, addresses: Address[]
   return rows.map((r) => ({ ...r, amount: BigInt(r.amount) }));
 }
 
-/** Clean up transient unfinalized events and wipe tokens, alerts, signals, and performance sessions on startup. */
+/** Remove only forkable work; durable facts and projections survive process restarts. */
 export function resetSessionData(): void {
-  const d = getDb();
-  d.transaction(() => {
-    d.run("DELETE FROM events WHERE finalized = 0");
-    d.run("DELETE FROM performance_sessions");
-    d.run("DELETE FROM alerts");
-    d.run("DELETE FROM signals");
-    d.run("DELETE FROM token_candidates");
-    d.run("DELETE FROM tokens");
-    d.run("DELETE FROM pools");
-    d.run("DELETE FROM cluster_members");
-    d.run("DELETE FROM clusters");
-  })();
+  getDb().run("DELETE FROM events WHERE finalized = 0");
 }
 
 export interface ClusterMaterialized {
+  chainId: number;
   clusterId: string;
   memberCount: number;
   members: Address[];
 }
 
 /** Materialize in-memory DSU cluster state into SQL clusters and cluster_members tables. */
-export function syncClusters(clusters: ClusterMaterialized[]): void {
+export function syncClusters(clusters: ClusterMaterialized[], chainIds?: number[]): void {
   const d = getDb();
   d.transaction(() => {
-    const insCluster = d.prepare("INSERT OR REPLACE INTO clusters (id, member_count) VALUES (?, ?)");
-    const insMember = d.prepare("INSERT OR REPLACE INTO cluster_members (cluster_id, address) VALUES (?, ?)");
-    const delMember = d.prepare("DELETE FROM cluster_members WHERE cluster_id = ?");
+    if (chainIds) {
+      for (const chainId of chainIds) {
+        d.run("DELETE FROM clusters WHERE chain_id = ?", [chainId]);
+      }
+    } else {
+      const delMember = d.prepare("DELETE FROM cluster_members WHERE chain_id = ? AND cluster_id = ?");
+      for (const c of clusters) {
+        delMember.run(c.chainId, c.clusterId);
+      }
+    }
+    const insCluster = d.prepare("INSERT OR IGNORE INTO clusters (chain_id, id, member_count) VALUES (?, ?, ?)");
+    const updateCluster = d.prepare("UPDATE clusters SET member_count = ? WHERE chain_id = ? AND id = ?");
+    const insMember = d.prepare("INSERT OR IGNORE INTO cluster_members (chain_id, cluster_id, address) VALUES (?, ?, ?)");
     for (const c of clusters) {
-      delMember.run(c.clusterId);
-      insCluster.run(c.clusterId, c.memberCount);
+      insCluster.run(c.chainId, c.clusterId, c.memberCount);
+      updateCluster.run(c.memberCount, c.chainId, c.clusterId);
       for (const m of c.members) {
-        insMember.run(c.clusterId, m);
+        insMember.run(c.chainId, c.clusterId, m);
       }
     }
   })();
@@ -254,13 +254,83 @@ export function upsertToken(t: TokenMeta & { expiresAt?: number | null }): void 
   getDb().run(
     `INSERT INTO tokens (chain_id, address, symbol, decimals, total_supply, source, expires_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(chain_id, address) DO UPDATE SET
-       symbol = COALESCE(excluded.symbol, tokens.symbol),
+      ON CONFLICT(chain_id, address) DO UPDATE SET
+        source = excluded.source,
+        symbol = COALESCE(excluded.symbol, tokens.symbol),
        decimals = COALESCE(excluded.decimals, tokens.decimals),
        total_supply = COALESCE(excluded.total_supply, tokens.total_supply),
        expires_at = COALESCE(excluded.expires_at, tokens.expires_at)`,
     [t.chainId, t.address, t.symbol, t.decimals, t.totalSupply?.toString() ?? null, t.source, t.expiresAt ?? null],
   );
+}
+
+export interface DashboardMetrics {
+  activeWatches: number;
+  openAlerts: number;
+  signalsToday: number;
+  events24h: number;
+  performance: { active: number; targetHit: number; stopHit: number; expired: number; retracted: number };
+  candidates: {
+    total: number;
+    discovered: number;
+    evaluating: number;
+    evaluated: number;
+    eligible: number;
+    promoted: number;
+    rejected: number;
+    expired: number;
+    promotionRate: number;
+    evaluationCompletionRate: number;
+    rejectionReasons: Record<string, number>;
+  };
+}
+
+/** Server-side dashboard aggregates; list endpoints remain intentionally bounded. */
+export function dashboardMetrics(nowSecs = Math.floor(Date.now() / 1000)): DashboardMetrics {
+  const activeWatches = Number((getDb().query(
+    "SELECT COUNT(*) AS n FROM tokens WHERE source <> 'candidate' AND (expires_at IS NULL OR expires_at > ?)",
+  ).get(nowSecs) as { n: number }).n);
+  const openAlerts = Number((getDb().query("SELECT COUNT(*) AS n FROM alerts WHERE retracted = 0").get() as { n: number }).n);
+  const signalsToday = Number((getDb().query("SELECT COUNT(*) AS n FROM signals WHERE created_at >= ?").get(nowSecs - 86_400) as { n: number }).n);
+  const events24h = Number((getDb().query(
+    "SELECT COUNT(*) AS n FROM events WHERE CAST(json_extract(payload_json, '$.timestamp') AS INTEGER) >= ?",
+  ).get(nowSecs - 86_400) as { n: number }).n);
+  const performanceRows = getDb().query("SELECT outcome, COUNT(*) AS n FROM performance_sessions GROUP BY outcome").all() as { outcome: string; n: number }[];
+  const performance = { active: 0, targetHit: 0, stopHit: 0, expired: 0, retracted: 0 };
+  for (const row of performanceRows) {
+    const count = Number(row.n);
+    if (row.outcome === "active") performance.active = count;
+    else if (row.outcome === "target_hit") performance.targetHit = count;
+    else if (row.outcome === "stop_hit") performance.stopHit = count;
+    else if (row.outcome === "expired") performance.expired = count;
+    else if (row.outcome === "retracted") performance.retracted = count;
+  }
+  const candidates = listCandidates();
+  const evaluated = candidates.filter((c) => c.lastEvaluatedAt !== null).length;
+  const eligible = candidates.filter((c) => c.evidence["eligible"] === true).length;
+  const rejectionReasons: Record<string, number> = {};
+  for (const candidate of candidates) {
+    const reason = typeof candidate.evidence["rejectionReason"] === "string" ? candidate.evidence["rejectionReason"] : null;
+    if (reason) rejectionReasons[reason] = (rejectionReasons[reason] ?? 0) + 1;
+  }
+  const total = candidates.length;
+  const started = candidates.filter((c) => c.status !== "discovered").length;
+  return {
+    activeWatches, openAlerts, signalsToday, events24h, performance,
+    candidates: {
+      total,
+      discovered: candidates.filter((c) => c.status === "discovered").length,
+      evaluating: candidates.filter((c) => c.status === "evaluating").length,
+      evaluated,
+      eligible,
+      promoted: candidates.filter((c) => c.status === "promoted").length,
+      rejected: candidates.filter((c) => c.status === "rejected").length,
+      expired: candidates.filter((c) => c.status === "expired").length,
+      promotionRate: evaluated === 0 ? 0 : Math.round((candidates.filter((c) => c.status === "promoted").length / evaluated) * 10_000) / 100,
+      evaluationCompletionRate: started === 0 ? 0 : Math.round((evaluated / started) * 10_000) / 100,
+      rejectionReasons,
+    },
+  };
 }
 
 export function getToken(chainId: number, address: Address): (TokenMeta & { expires_at: number | null }) | null {

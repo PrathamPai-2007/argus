@@ -74,6 +74,11 @@ Operationally, monitor:
 - enrichment queue depth;
 - Etherscan requests and rate-limit retries.
 
+The dashboard `/api/metrics` endpoint exposes the complete funnel: discovered,
+evaluated, eligible, promoted, rejected, expired, promotion rate, evaluation
+completion rate, and rejection reasons. A zero-promotion period is actionable
+only after checking provider health and evaluation completion first.
+
 ## Tuning workflow
 
 1. Run Argus with the default candidate settings.

@@ -19,6 +19,7 @@ describe("DashboardServer", () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     expect(() => new Function(html.slice(start + "<script>".length, end))).not.toThrow();
+    expect(html).not.toContain("sideStatus");
   });
 
   test("serves endpoints and serializes BigInts without throwing", async () => {
@@ -106,6 +107,10 @@ describe("DashboardServer", () => {
       // GET /api/status
       const resStatus = await fetch("http://127.0.0.1:3740/api/status");
       expect(resStatus.status).toBe(200);
+
+      const resMetrics = await fetch("http://127.0.0.1:3740/api/metrics");
+      expect(resMetrics.status).toBe(200);
+      expect(((await resMetrics.json()) as any).activeWatches).toBe(1);
 
       // GET /api/tokens (tests BigInt serialization of totalSupply)
       const resTokens = await fetch("http://127.0.0.1:3740/api/tokens");

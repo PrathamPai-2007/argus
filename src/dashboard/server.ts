@@ -149,6 +149,9 @@ export class DashboardServer {
     if (url.pathname === "/api/status") {
       return this.json(this.engine.status());
     }
+    if (url.pathname === "/api/metrics") {
+      return this.json(db.dashboardMetrics());
+    }
     if (url.pathname === "/api/tokens") {
       const chain = url.searchParams.get("chain");
       const now = Math.floor(Date.now() / 1000);
@@ -327,8 +330,7 @@ function authorized(req: Request, token: string): boolean {
   }
   try {
     const url = new URL(req.url);
-    const queryToken = url.searchParams.get("token");
-    if (queryToken && queryToken === token) return true;
+      // Never accept credentials in URLs: browser history and access logs retain them.
   } catch {
     /* ignore url parse error */
   }

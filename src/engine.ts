@@ -83,6 +83,9 @@ export class ArgusEngine {
   private enrichmentQueue: RankedToken[] = [];
   private enrichmentQueued = new Set<string>();
   private enrichmentRunning = false;
+  private volumeRankingStatus: { lastSuccessAt: number | null; lastErrorAt: number | null; lastResultCount: number; lastError: string | null } = {
+    lastSuccessAt: null, lastErrorAt: null, lastResultCount: 0, lastError: null,
+  };
   private failedEventRetries = new Map<string, number>();
   private failedEventTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -219,7 +222,7 @@ export class ArgusEngine {
 
     this.drainTimer = setInterval(() => this.drain(), 250);
     this.pruneTimer = setInterval(() => this.retentionSweep(), 60 * 60_000);
-    this.performanceTimer = setInterval(() => void this.expirePerformance(), 3_000);
+    this.performanceTimer = setInterval(() => void this.expirePerformance(), 15_000);
 
     for (const [chainId, rt] of this.chains) {
       rt.adapter.start(null).catch((err) => {
@@ -266,6 +269,10 @@ export class ArgusEngine {
     }
     for (const p of db.listPools(chainId)) {
       graph.registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
+    }
+    // Rebuild derived graph state from local finalized facts without waiting for RPC history.
+    for (const event of db.loadEvents(chainId, 0, Number.MAX_SAFE_INTEGER, { finalizedOnly: true })) {
+      graph.applyEvent(event);
     }
   }
 
@@ -571,7 +578,7 @@ export class ArgusEngine {
         await this.ensureTokenPoolsRegistered(payload.chainId, payload.tokenAddress);
         await this.openPerformanceSession(id, signal.chainId, signal.tokenAddress, sourceEvent);
         const clusters = this.graphFor(signal.chainId).clusterBreakdown(payload.tokenAddress);
-        db.syncClusters(clusters);
+         db.syncClusters(clusters.map((cluster) => ({ ...cluster, chainId: signal.chainId })));
         this.alertHook?.(payload, id);
         this.webhooks.dispatchAlert(payload, id, finalized);
       }
@@ -732,6 +739,7 @@ export class ArgusEngine {
       // Polling check for active sessions with low swap frequency.
       const activeSessions = db.listPerformanceSessions({ activeOnly: true });
       const now = Math.floor(Date.now() / 1000);
+      log.debug("performance price poll started", { intervalSeconds: 15, activeSessions: activeSessions.length });
 
       await Promise.all(activeSessions.map(async (session) => {
         if (now - session.updated_at < 3) return;
@@ -828,6 +836,7 @@ export class ArgusEngine {
         });
         const updated = db.getPerformanceSession(session.id);
         if (updated) {
+          log.debug("performance price observation", { chainId: session.chain_id, token: session.token_address, pool: session.pool_address, sessionId: session.id, outcome: updated.outcome, price: observation.value.price.toString() });
           this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
           if (updated.outcome !== "active") {
             this.dispatchOutcomeNotification(updated);
@@ -1016,16 +1025,17 @@ export class ArgusEngine {
       const activeTokens = db.listWatchedTokens(chainId, Math.floor(Date.now() / 1000));
       const allClusters: db.ClusterMaterialized[] = [];
       for (const t of activeTokens) {
-        const breakdown = graph.clusterBreakdown(t.address);
-        for (const c of breakdown) {
-          allClusters.push({
-            clusterId: c.clusterId,
-            memberCount: c.memberCount,
-            members: c.members,
-          });
-        }
-      }
-      db.syncClusters(allClusters);
+         const breakdown = graph.clusterBreakdown(t.address);
+         for (const c of breakdown) {
+           allClusters.push({
+             chainId,
+             clusterId: c.clusterId,
+             memberCount: c.memberCount,
+             members: c.members,
+           });
+         }
+       }
+       db.syncClusters(allClusters, [chainId]);
     }
   }
 
@@ -1042,14 +1052,14 @@ export class ArgusEngine {
         db.expireCandidates(now);
         const runtime = this.chains.get(chain.chainId);
         if (!runtime) continue;
-        const head = runtime.adapter.status().lastHead;
-        const candidates = ranked.slice(0, this.cfg.candidateDiscovery.maxCandidatesPerCycle);
+         const head = runtime.adapter.status().lastHead;
+         const candidates = ranked.slice(0, this.cfg.candidateDiscovery.maxCandidatesPerCycle);
         if (this.cfg.candidateDiscovery.enabled) {
           const dbCandidates = db.listCandidates(chain.chainId).filter((c) =>
             (c.status === "discovered" || c.status === "evaluating" || c.status === "rejected") &&
             (!c.lastEvaluatedAt || now - c.lastEvaluatedAt >= this.cfg.candidateDiscovery.evaluationMinutes * 60)
           );
-          for (const c of dbCandidates) {
+           for (const c of dbCandidates.slice(0, Math.max(0, this.cfg.candidateDiscovery.maxCandidatesPerCycle - candidates.length))) {
             if (candidates.some((r) => r.address === c.address)) continue;
             const fallback = await fetchTokenPrice(chain.chainId, c.address);
             if (fallback) {
@@ -1066,9 +1076,10 @@ export class ArgusEngine {
                   createdAt: null,
                 }],
               });
-            }
           }
-        }
+           }
+         }
+         this.volumeRankingStatus = { lastSuccessAt: now, lastErrorAt: this.volumeRankingStatus.lastErrorAt, lastResultCount: ranked.length, lastError: null };
         for (const token of candidates) {
           const existing = db.getToken(token.chainId, token.address);
           if (existing?.source === "manual" || existing?.source === "factory") continue;
@@ -1106,6 +1117,8 @@ export class ArgusEngine {
         this.refreshWatchSubscription(chain.chainId);
         log.info("token candidates refreshed", { chainId: chain.chainId, candidates: candidates.map((token) => ({ token: token.address, volume: token.volume })) });
       } catch (err) {
+        const now = Math.floor(Date.now() / 1000);
+        this.volumeRankingStatus = { ...this.volumeRankingStatus, lastErrorAt: now, lastError: String(err) };
         log.warn("volume ranking refresh failed", { chainId: chain.chainId, err });
       }
     }
@@ -1140,12 +1153,14 @@ export class ArgusEngine {
         const maxDepth = runtime.adapter.getMaxArchiveDepth();
         const blocks = Math.min(requestedBlocks, maxDepth);
         const from = BigInt(Math.max(0, head - blocks));
+        const startedAt = Date.now();
+        log.info("candidate enrichment started", { chainId: token.chainId, token: token.address, head, from: Number(from), to: head, requestedBlocks, maxArchiveDepth: maxDepth, queueDepth: this.enrichmentQueue.length });
         try {
           await runtime.adapter.backfillToken(token.address, from, BigInt(head));
           await this.evaluateCandidate(token, head);
-          log.info("candidate evaluation complete", { chainId: token.chainId, token: token.address, from: Number(from), to: head });
+          log.info("candidate enrichment completed", { chainId: token.chainId, token: token.address, from: Number(from), to: head, durationMs: Date.now() - startedAt });
         } catch (err) {
-          log.warn("ranked token enrichment skipped (archive/rate-limited on free RPC)", { chainId: token.chainId, token: token.address, err });
+          log.warn("candidate enrichment failed", { chainId: token.chainId, token: token.address, from: Number(from), to: head, durationMs: Date.now() - startedAt, failure: "backfill_or_evaluation", err });
         }
         await new Promise((r) => setTimeout(r, 200));
       }
@@ -1172,7 +1187,23 @@ export class ArgusEngine {
       minimumIndependentBuyers: this.cfg.candidateDiscovery.minimumIndependentBuyers,
     });
     const status = result.eligible && result.score >= this.cfg.candidateDiscovery.promotionScore ? "promoted" : "rejected";
-    db.updateCandidateScore(token.chainId, token.address, result.score, result.evidence, status);
+    const evidence: Record<string, unknown> = { ...result.evidence, promotionThreshold: this.cfg.candidateDiscovery.promotionScore };
+    db.updateCandidateScore(token.chainId, token.address, result.score, evidence, status);
+    log.info("candidate evaluation complete", {
+      chainId: token.chainId,
+      token: token.address,
+      status,
+      score: result.score,
+      promotionThreshold: this.cfg.candidateDiscovery.promotionScore,
+      liquidityUsd,
+      volumeUsd: token.volume,
+      poolAgeHours: createdAt === null ? null : Math.max(0, (now - createdAt) / 3600),
+      ...stats,
+      eligible: result.eligible,
+      rejectionReason: evidence["rejectionReason"],
+      missingInputs: evidence["missingInputs"],
+      components: evidence["components"],
+    });
     if (status === "promoted") {
       db.promoteCandidate(token.chainId, token.address, candidate.source === "factory" ? "factory" : "ranked", now + this.cfg.autoWatch.watchHours * 3600);
       const runtime = this.chains.get(token.chainId);
@@ -1240,6 +1271,7 @@ export class ArgusEngine {
         rejected: candidates.filter((c) => c.status === "rejected").length,
         expired: candidates.filter((c) => c.status === "expired").length,
       },
+      volumeRanking: this.volumeRankingStatus,
     };
   }
 }
