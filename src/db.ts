@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Address, AlertPayload, EventKind, Signal, StandardEvent, SwapEvent, TokenMeta } from "./types.ts";
+import type { Address, AlertPayload, CandidateStatus, EventKind, Signal, StandardEvent, SwapEvent, TokenCandidate, TokenMeta } from "./types.ts";
 import { log } from "./logger.ts";
 import type { PerformanceOutcome, PerformanceSession } from "./performance.ts";
 
@@ -263,7 +263,7 @@ export function upsertToken(t: TokenMeta & { expiresAt?: number | null }): void 
 
 export function getToken(chainId: number, address: Address): (TokenMeta & { expires_at: number | null }) | null {
   const row = getDb().query("SELECT * FROM tokens WHERE chain_id = ? AND address = ?").get(chainId, address) as
-    | { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: "manual" | "factory" | "ranked"; expires_at: number | null }
+    | { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: TokenMeta["source"]; expires_at: number | null }
     | null;
   if (!row) return null;
   return {
@@ -279,8 +279,8 @@ export function getToken(chainId: number, address: Address): (TokenMeta & { expi
 
 export function listWatchedTokens(chainId: number, nowSecs: number): TokenMeta[] {
   const rows = getDb()
-    .query("SELECT * FROM tokens WHERE chain_id = ? AND (expires_at IS NULL OR expires_at > ?)")
-    .all(chainId, nowSecs) as { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: "manual" | "factory" | "ranked" }[];
+    .query("SELECT * FROM tokens WHERE chain_id = ? AND source <> 'candidate' AND (expires_at IS NULL OR expires_at > ?)")
+    .all(chainId, nowSecs) as { chain_id: number; address: Address; symbol: string | null; decimals: number | null; total_supply: string | null; source: Exclude<TokenMeta["source"], "candidate"> }[];
   return rows.map((r) => ({
     chainId: r.chain_id,
     address: r.address,
@@ -289,6 +289,71 @@ export function listWatchedTokens(chainId: number, nowSecs: number): TokenMeta[]
     totalSupply: r.total_supply !== null ? BigInt(r.total_supply) : null,
     source: r.source,
   }));
+}
+
+// ---- Candidate discovery ----------------------------------------------------
+
+export function upsertCandidate(c: Omit<TokenCandidate, "status" | "score" | "evidence" | "lastEvaluatedAt"> & {
+  status?: CandidateStatus;
+  score?: number;
+  evidence?: Record<string, unknown>;
+  lastEvaluatedAt?: number | null;
+}): void {
+  getDb().run(
+    `INSERT INTO token_candidates
+      (chain_id, address, discovery_source, status, score, evidence_json, first_seen_at, last_evaluated_at, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chain_id, address) DO UPDATE SET
+       discovery_source = excluded.discovery_source,
+       score = excluded.score,
+       evidence_json = excluded.evidence_json,
+       last_evaluated_at = COALESCE(excluded.last_evaluated_at, token_candidates.last_evaluated_at),
+       expires_at = excluded.expires_at,
+       status = CASE WHEN token_candidates.status = 'promoted' THEN 'promoted' ELSE excluded.status END`,
+    [c.chainId, c.address, c.source, c.status ?? "discovered", c.score ?? 0, JSON.stringify(c.evidence ?? {}), c.firstSeenAt, c.lastEvaluatedAt ?? null, c.expiresAt],
+  );
+}
+
+export function getCandidate(chainId: number, address: Address): TokenCandidate | null {
+  const row = getDb().query("SELECT * FROM token_candidates WHERE chain_id = ? AND address = ?").get(chainId, address) as {
+    chain_id: number; address: Address; discovery_source: TokenCandidate["source"]; status: CandidateStatus; score: number;
+    evidence_json: string; first_seen_at: number; last_evaluated_at: number | null; expires_at: number;
+  } | null;
+  if (!row) return null;
+  return { chainId: row.chain_id, address: row.address, source: row.discovery_source, status: row.status, score: row.score,
+    evidence: JSON.parse(row.evidence_json) as Record<string, unknown>, firstSeenAt: row.first_seen_at,
+    lastEvaluatedAt: row.last_evaluated_at, expiresAt: row.expires_at };
+}
+
+export function listCandidates(chainId?: number, status?: CandidateStatus): TokenCandidate[] {
+  const clauses = ["1 = 1"]; const params: (number | string)[] = [];
+  if (chainId !== undefined) { clauses.push("chain_id = ?"); params.push(chainId); }
+  if (status !== undefined) { clauses.push("status = ?"); params.push(status); }
+  const rows = getDb().query(`SELECT * FROM token_candidates WHERE ${clauses.join(" AND ")} ORDER BY score DESC, last_evaluated_at DESC`).all(...params) as {
+    chain_id: number; address: Address; discovery_source: TokenCandidate["source"]; status: CandidateStatus; score: number;
+    evidence_json: string; first_seen_at: number; last_evaluated_at: number | null; expires_at: number;
+  }[];
+  return rows.map((row) => ({ chainId: row.chain_id, address: row.address, source: row.discovery_source, status: row.status, score: row.score,
+    evidence: JSON.parse(row.evidence_json) as Record<string, unknown>, firstSeenAt: row.first_seen_at,
+    lastEvaluatedAt: row.last_evaluated_at, expiresAt: row.expires_at }));
+}
+
+export function updateCandidateScore(chainId: number, address: Address, score: number, evidence: Record<string, unknown>, status: CandidateStatus): void {
+  getDb().run("UPDATE token_candidates SET score = ?, evidence_json = ?, status = CASE WHEN status = 'promoted' THEN 'promoted' ELSE ? END, last_evaluated_at = ? WHERE chain_id = ? AND address = ?",
+    [score, JSON.stringify(evidence), status, Math.floor(Date.now() / 1000), chainId, address]);
+}
+
+export function expireCandidates(nowSecs: number): number {
+  const result = getDb().run("UPDATE token_candidates SET status = 'expired' WHERE status IN ('discovered','evaluating','rejected') AND expires_at <= ?", [nowSecs]);
+  getDb().run("UPDATE tokens SET expires_at = ? WHERE source = 'candidate' AND expires_at IS NOT NULL AND expires_at <= ?", [nowSecs, nowSecs]);
+  return Number(result.changes);
+}
+
+export function promoteCandidate(chainId: number, address: Address, source: "factory" | "ranked", expiresAt: number | null): void {
+  getDb().transaction(() => {
+    getDb().run("UPDATE token_candidates SET status = 'promoted', last_evaluated_at = ? WHERE chain_id = ? AND address = ?", [Math.floor(Date.now() / 1000), chainId, address]);
+    getDb().run("UPDATE tokens SET source = ?, expires_at = ? WHERE chain_id = ? AND address = ? AND source = 'candidate'", [source, expiresAt, chainId, address]);
+  })();
 }
 
 /** Expire ranked tokens that were not returned by the latest volume poll. */

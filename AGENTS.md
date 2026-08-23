@@ -43,6 +43,7 @@ src/
   ingest/bigquery.ts   optional BigQuery logs provider (service-account JWT, no SDK)
   ingest/normalizer.ts raw logs → StandardEvents (pure functions, fixture-tested)
   ingest/dexscreener.ts DexScreener stablecoin-volume ranking for targeted enrichment
+  candidates.ts       bounded quality score for candidate-token promotion
   ingest/probe.ts      endpoint probing shared by adapter + doctor
   graph/dsu.ts         RollbackDSU: union by size, NO path compression, op-stack rollback
   graph/engine.ts      GraphEngine: wallets, funding edges, balance ledgers, clusters;
@@ -80,7 +81,10 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
 9. **Outbound safety is enforced.** Webhook validation rejects loopback/private/link-local/metadata
    targets; delivery rejects redirects, uses abortable timeouts, and stops retry timers on shutdown.
 10. **Dashboard exposure is deliberate.** The server binds to `127.0.0.1`; when
-    `ARGUS_DASHBOARD_TOKEN` is set, page/API/SSE requests require Bearer or Basic auth.
+     `ARGUS_DASHBOARD_TOKEN` is set, page/API/SSE requests require Bearer or Basic auth.
+11. **Candidates are not watches.** `token_candidates` and `tokens.source = 'candidate'`
+    hold bounded evaluation state; they are excluded from live subscriptions and alert rules
+    until promotion passes hard evidence gates and the configured score threshold.
 
 ## Status
 
@@ -108,6 +112,9 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
   (free endpoints rarely expose `debug_traceTransaction` — graceful degradation is by design).
 - Security hardening: URL credentials are redacted from logs, dashboard auth is opt-in, and
   webhook requests have SSRF, redirect, timeout, retry, and shutdown safeguards.
+- Quality-driven discovery: factory and DexScreener activity creates bounded candidates;
+  targeted enrichment scores liquidity, early buyer retention, funding independence, and
+  exchange/common-funder risk before promotion. Volume is capped and cannot bypass buyer gates.
 
 ## Smoke testing without a paid RPC
 

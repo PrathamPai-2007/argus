@@ -91,7 +91,21 @@ export interface TokenMeta {
   symbol: string | null;
   decimals: number | null;
   totalSupply: bigint | null;
-  source: "manual" | "factory" | "ranked";
+  source: "manual" | "factory" | "ranked" | "candidate";
+}
+
+export type CandidateStatus = "discovered" | "evaluating" | "promoted" | "rejected" | "expired";
+
+export interface TokenCandidate {
+  chainId: number;
+  address: Address;
+  source: "factory" | "ranked" | "wallet_cohort";
+  status: CandidateStatus;
+  score: number;
+  evidence: Record<string, unknown>;
+  firstSeenAt: number;
+  lastEvaluatedAt: number | null;
+  expiresAt: number;
 }
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";

@@ -163,6 +163,10 @@ export class DashboardServer {
       }
       return this.json(tokens);
     }
+    if (url.pathname === "/api/candidates") {
+      const chain = url.searchParams.get("chain");
+      return this.json(db.listCandidates(chain ? Number(chain) : undefined));
+    }
     if (url.pathname === "/api/alerts") {
       const limit = queryLimit(url.searchParams.get("limit"), 100);
       return this.json(db.listAlerts(limit));

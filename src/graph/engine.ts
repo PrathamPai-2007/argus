@@ -120,6 +120,41 @@ export class GraphEngine {
   getTokensBoughtBy(wallet: Address): Set<Address> {
     return new Set(this.tokensBoughtByWallet.get(wallet)?.keys() ?? []);
   }
+
+  /** Compact buyer-quality view used before a candidate is promoted to a watch. */
+  candidateBuyerStats(token: Address, sinceTs: number, refTs: number): {
+    earlyBuyerCount: number;
+    retainedBuyerCount: number;
+    independentBuyerCount: number;
+    exchangeBuyerCount: number;
+    commonFunderRatio: number;
+  } {
+    const buyers = new Set((this.buysByToken.get(token) ?? [])
+      .filter((buy) => buy.ts >= sinceTs && buy.ts <= refTs)
+      .map((buy) => buy.addr));
+    const funders = new Map<Address, number>();
+    const independentFunders = new Set<Address>();
+    let unfundedCount = 0;
+    let exchangeBuyerCount = 0;
+    for (const addr of buyers) {
+      const wallet = this.wallets.get(addr);
+      if (wallet?.funder) {
+        funders.set(wallet.funder, (funders.get(wallet.funder) ?? 0) + 1);
+        if (this.labels.get(wallet.funder)?.kind === "cex") exchangeBuyerCount++;
+        else independentFunders.add(wallet.funder);
+      } else {
+        unfundedCount++;
+      }
+    }
+    const largestGroup = Math.max(0, ...funders.values());
+    return {
+      earlyBuyerCount: buyers.size,
+      retainedBuyerCount: [...buyers].filter((addr) => this.balanceOf(token, addr) > 0n).length,
+      independentBuyerCount: independentFunders.size + unfundedCount,
+      exchangeBuyerCount,
+      commonFunderRatio: buyers.size === 0 ? 0 : largestGroup / buyers.size,
+    };
+  }
   private sends = new Map<Address, SendEntry[]>();
   private exchangeFundings = new Map<Address, ExchangeFundingEntry[]>();
   private fundingAmountIndex = new Map<string, Array<{ funded: Address; funder: Address; ts: number; block: number }>>();

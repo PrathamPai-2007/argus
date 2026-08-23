@@ -67,6 +67,7 @@ export interface TokenPrice {
   quoteToken: Address;
   symbol?: string | undefined;
   liquidityUsd: number | null;
+  volumeUsd: number | null;
 }
 
 export type TokenPriceObservation =
@@ -126,6 +127,7 @@ export async function fetchTokenPriceForPool(chainId: number, token: Address, po
       quoteToken: isBase ? quoteAddr : baseAddr,
       symbol: isBase ? best.baseToken?.symbol : best.quoteToken?.symbol,
       liquidityUsd: typeof best.liquidity?.usd === "number" ? best.liquidity.usd : null,
+      volumeUsd: typeof best.volume?.h24 === "number" ? best.volume.h24 : null,
     } };
   } catch (err) {
     log.warn("DexScreener fetchTokenPrice failed", { chainId, token, err });

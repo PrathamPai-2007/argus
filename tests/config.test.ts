@@ -28,6 +28,7 @@ describe("validateConfig", () => {
     expect(cfg.chains[0]?.chainId).toBe(1);
     expect(cfg.chains[0]?.infuraRetryMinutes).toBe(5);
     expect(cfg.rules.R1.supplyPct).toBe(15);
+    expect(cfg.candidateDiscovery.promotionScore).toBe(65);
     expect(cfg.dbPath).toBe("data/argus.db"); // default
   });
 
@@ -106,6 +107,12 @@ describe("validateConfig", () => {
     const c = baseConfig();
     ((c["chains"] as unknown[])[0] as Record<string, unknown>)["rpcs"] = ["ftp://nope"];
     expect(() => validateConfig(c)).toThrow(/ws\(s\)/);
+  });
+
+  test("validates candidate promotion threshold", () => {
+    const c = baseConfig();
+    c["candidateDiscovery"] = { enabled: true, promotionScore: 101 };
+    expect(() => validateConfig(c)).toThrow(/promotionScore/);
   });
 
   test("validates Infura retry duration", () => {

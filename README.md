@@ -15,9 +15,9 @@
 - **Quota-aware RPC backfilling** — standard historical RPC backfills automatically route to Public ETH RPCs (or Etherscan/BigQuery), preserving Infura API credits exclusively for real-time streaming and catch-up.
 - **Live-first startup** — connects and processes new blocks immediately; historical enrichment never gates ingestion.
 - **Reorg-safe state** — a rollback-friendly union-find graph (`RollbackDSU`, no path compression) rewinds to any block when the chain reorgs; confirmed alerts are confirmed, unfinalized ones are retracted.
-- **Gap recovery** — startup begins at the current head, while bounded reconnect, queue-overflow, and parent-hash reorg recovery run in-process. DexScreener stablecoin volume prioritizes optional background enrichment for the top tokens.
+- **Gap recovery** — startup begins at the current head, while bounded reconnect, queue-overflow, and parent-hash reorg recovery run in-process. DexScreener results create bounded token candidates; only candidates with independent early-buyer evidence are promoted to live watches.
 - **Funding extraction** — native ETH transfers, `Disperse` calldata decoding, and internal calls via trace APIs when the endpoint exposes them (graceful degradation otherwise).
-- **Auto-watch** — tracks Uniswap V2-style factories, registers every new pool, and auto-watches newly minted tokens for a configurable window.
+- **Candidate-driven discovery** — tracks new factory pools and stablecoin-quoted DEX activity as candidates, evaluates liquidity, early buyers, retention, funding independence, and exchange exposure, then promotes qualifying tokens for live monitoring.
 - **8 heuristic rules** (R1–R8) with tunable thresholds, weights, and replay presets.
 - **Webhook push** — POST alerts, signals, and reorg retractions to validated HTTP(S) endpoints (Discord/Slack/n8n/your own server); HMAC-signed when a secret is set.
 - **Graph API & SQL Materialization** — per-token wallet clusters and funding edges as JSON and materialized SQL tables (`clusters`, `cluster_members`), ready to feed your own visualizations.
@@ -26,23 +26,28 @@
 - **Real-time WebSocket dashboard** — `Bun.serve` + native WebSockets (`ws://127.0.0.1:3737/ws`) + SSE on `127.0.0.1:3737`, zero dependencies; optionally protected with `ARGUS_DASHBOARD_TOKEN`.
 - **Hot-reloadable config** — edit `argus.config.ts` and rule/scoring/alert/auto-watch/webhook settings apply without a restart.
 - **Secrets stay out of logs & test isolation** — RPC keys and URL credentials are redacted centrally in the logger; test runs use timestamped `logs/argus-test-*.log` files; log level is configurable with `ARGUS_LOG_LEVEL`.
-- **Volume prioritization** — DexScreener ranks Ethereum tokens by recent USDC/USDT/DAI-quoted volume; the top 10 receive slow, targeted enrichment.
+- **Quality prioritization** — DexScreener volume is only a bounded candidate source and a capped score component. It cannot promote a token without enough independent early buyers.
 
 ## How it works
 
 ```
+candidate sources ──► candidate table ──► targeted enrichment ──► quality score ──► active token watch
+                                                                        │
 evm adapter ──► event queue ──► SQLite (facts) ──► graph engine ──► rules R1–R8 ──► scorer ──► alerts
    │                                          │      (derived state)     │                          │
    └─ WS subscribe, failover,                 └── rewindTo(block)         └─ pure functions           └─ Telegram / webhooks / SSE
       reorg walk-back, backfill                     on reorg                   (event, view, config)      cooldown / retraction
 ```
 
-1. **Ingest** (`src/ingest/evm.ts`) — subscribes to watched-token `Transfer`s, factory `PairCreated`s, pool LP `Transfer`s and `Swap`s, and native-funding txs of followed wallets. Raw logs are normalized to `StandardEvent`s (`transfer`, `swap`, `pool_created`, `funding`).
-2. **Persist** (`src/db.ts`) — every event lands in the `events` table with a `finalized` flag; the weighted ring buffer drops oldest events rather than blocking ingestion, and dropped ranges trigger best-effort recovery.
-3. **Graph** (`src/graph/engine.ts`) — wallets, funding edges, balance ledgers, and clusters via a rollback DSU. Every mutation records an undo closure so `rewindTo(block)` restores exact prior state on reorg. Finalization (`finalize(boundary)`) prunes stale rolling windows (>24h).
-4. **Rules** (`src/rules/index.ts`) — pure functions `(event, graphView, config) → Signal | null`.
-5. **Score** (`src/scorer.ts`) — best-weight-per-rule sum mapped to 0–100 and `info` / `alert` / `critical` severity.
-6. **Alert** (`src/alerts/`) — cooldown, escalation, global rate limit, Telegram delivery, and explicit retractions for reorged alerts. Live (unfinalized) signals are tagged **unconfirmed** until the block finalizes.
+1. **Discover** (`src/engine.ts`, `src/ingest/dexscreener.ts`) — records new pools and stablecoin-quoted DEX results as candidates. Candidate rows are not active watches and do not produce alerts.
+2. **Evaluate** (`src/candidates.ts`, `src/graph/engine.ts`) — targeted history measures liquidity, early buyer count, retained buyers, independent funding groups, exchange-funded buyers, and common-funder concentration. Volume is capped at 10% of the score.
+3. **Promote** — candidates must pass both the score threshold and hard evidence gates before entering `tokens` as a live `ranked` or `factory` watch. Evaluation is bounded by candidate count, TTL, and the existing provider limiter.
+4. **Ingest** (`src/ingest/evm.ts`) — subscribes to watched-token `Transfer`s, factory `PairCreated`s, pool LP `Transfer`s and `Swap`s, and native-funding txs of followed wallets. Raw logs are normalized to `StandardEvent`s (`transfer`, `swap`, `pool_created`, `funding`).
+5. **Persist** (`src/db.ts`) — every event lands in the `events` table with a `finalized` flag; candidate state and evidence are persisted separately from facts.
+6. **Graph** (`src/graph/engine.ts`) — wallets, funding edges, balance ledgers, and clusters via a rollback DSU. Every mutation records an undo closure so `rewindTo(block)` restores exact prior state on reorg. Finalization (`finalize(boundary)`) prunes stale rolling windows (>24h).
+7. **Rules** (`src/rules/index.ts`) — pure functions `(event, graphView, config) → Signal | null`.
+8. **Score** (`src/scorer.ts`) — best-weight-per-rule sum mapped to 0–100 and `info` / `alert` / `critical` severity.
+9. **Alert** (`src/alerts/`) — cooldown, escalation, global rate limit, Telegram delivery, and explicit retractions for reorged alerts. Live (unfinalized) signals are tagged **unconfirmed** until the block finalizes.
 
 ## Detection rules
 
@@ -76,7 +81,8 @@ src/
   scorer.ts            per-rule weight sum → 0–100 → severity
   seeds.ts             starter labels (CEX hot wallets, routers, Disperse)
   ingest/evm.ts        EVM adapter: WS, failover, heartbeat, reorg walk-back, backfill, funding
-  ingest/dexscreener.ts stablecoin-quoted volume ranking for targeted enrichment
+  candidates.ts       bounded quality score for token promotion
+  ingest/dexscreener.ts stablecoin-quoted candidate source and market metadata
   ingest/etherscan.ts  Etherscan getLogs provider: pagination, rate limit, recursive range splitting
   ingest/bigquery.ts   optional BigQuery logs provider (service-account JWT, no SDK)
   ingest/normalizer.ts raw logs → StandardEvents (pure, fixture-tested)
@@ -173,8 +179,9 @@ Served on `127.0.0.1:3737` (local-only). The page is a single HTML file with SSE
 |----------|-------------|
 | `/` | dashboard page |
 | `/events/stream` | SSE push of alerts + 5s status ticks |
-| `/api/status` | per-chain adapter status, checkpoint, queue depth |
-| `/api/tokens` | watched tokens (with `?chain=` filter) |
+| `/api/status` | per-chain adapter status, checkpoint, queue depth, and candidate lifecycle counts |
+| `/api/tokens` | promoted/live watched tokens (with `?chain=` filter) |
+| `/api/candidates` | candidate tokens, score, evidence, lifecycle status (with optional `?chain=` filter) |
 | `/api/alerts` | alert history |
 | `/api/signals` | recent signals (`?chain=`, `?limit=`) |
 | `/api/performance` | alert outcome sessions (`?chain=`, `?token=`, `?active=1`, `?limit=`) |
@@ -201,15 +208,16 @@ All tuning lives in `argus.config.ts` (validated in `src/config.ts`, no schema l
   - `bigquery` (disabled by default) — needs a Google service-account JSON and project; only selected when the estimated range exceeds `bigqueryThresholdHours`, and protected by `maxBytesBilled`.
 - **watchlist** — permanent tokens to watch.
 - **autoWatch** — `enabled`, `factories` (Uniswap V2-style; each entry is a raw `0x` address or a known name like `"uniswap-v2"` — names expand to the chain's canonical factory), `watchHours` (how long factory-discovered tokens stay watched; `NULL` = permanent).
+- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. Candidates are persisted but excluded from live subscriptions and alert rules until promoted. Factory candidates enter the candidate table immediately and are evaluated when market metadata is available; disabling this setting restores direct factory/ranked auto-watch behavior.
 - **rules** — per-rule `enabled`, thresholds, and `weight`.
 - **scoring** — `info < alert < critical` thresholds + signal window.
 - **alerts** — Telegram on/off, cooldown, escalation delta, per-minute rate limit.
 - **webhooks** — outbound POST targets. Each: `url`, `events` (`"alert"` and/or `"signal"`), optional `secret` (signs the body as `x-argus-signature: sha256=<hex>`; keep it in `.env`), `timeoutMs`, `retries`. Alerts, reorg retractions, and (optionally) signals are delivered as JSON.
 - **retention** — how long raw events are kept.
-- **volumeRanking** — DexScreener poll interval, top-token count, and targeted enrichment window.
+- **volumeRanking** — DexScreener poll interval, candidate-source count, and targeted enrichment window. The ranking is not a quality ranking by itself.
 - **dbPath** — SQLite storage location.
 
-Changes to rules/scoring/autoWatch/volumeRanking/webhooks hot-reload on save; alert settings, chain, and watchlist changes require a restart. Webhook delivery is fire-and-forget, uses request timeouts and bounded exponential retries, rejects redirects, and refuses loopback/private/link-local/metadata destinations.
+Changes to rules/scoring/autoWatch/candidateDiscovery/volumeRanking/webhooks hot-reload on save; alert settings, chain, and watchlist changes require a restart. Webhook delivery is fire-and-forget, uses request timeouts and bounded exponential retries, rejects redirects, and refuses loopback/private/link-local/metadata destinations.
 
 ## Design invariants
 
@@ -221,6 +229,8 @@ Changes to rules/scoring/autoWatch/volumeRanking/webhooks hot-reload on save; al
 6. **Migrations are append-only** — new schema changes are new `NNNN_name.sql` files; applied migrations are never edited.
 7. **Live startup is independent of history** — startup begins at the current head and never waits for historical backfill or restores a previous graph snapshot.
 8. **Recovery is best-effort and in-process** — bounded startup, reconnect, queue-overflow, and reorg ranges may be re-ingested, but no backfill cursor is persisted across sessions and recovery failure never prevents live operation.
+9. **Candidates are not watches** — candidate rows and candidate-source tokens are excluded from live subscriptions and rules; promotion requires configured hard gates plus a score threshold.
+10. **Volume is not conviction** — volume may generate or prioritize candidates, but is capped in promotion scoring and cannot bypass independent-buyer and liquidity gates.
 
 ## Tests
 
@@ -240,7 +250,7 @@ The test suite (`bun:test`) covers adapter startup/reorg behavior, the rollback 
 - **Replay tuning (Phase 5)** — done: `cautious` / `strict` presets.
 - **Output layer** — done: HMAC-signed webhook push (alerts/signals/retractions) with SSRF/redirect/timeout/retry safeguards + graph API endpoints (clusters, funding edges) with optional dashboard authentication.
 - **Multi-chain + polish (Phase 6)** — auto-watch is live; BNB Chain / Base configuration scaffolding remains commented. Internal-call funding probes trace capability and degrades gracefully when the endpoint doesn't expose `debug_traceTransaction`.
-- **Phase 7** — stretch: more chain support, per-token tuning.
+- **Phase 7** — candidate-driven discovery is live: bounded candidates, targeted enrichment, independent early-buyer gates, and explainable promotion evidence. Wallet reputation currently uses behavioral/current-window evidence; realized PnL learning and broader cohort discovery remain follow-up work.
 
 ## Notes & limitations
 
@@ -249,6 +259,7 @@ The test suite (`bun:test`) covers adapter startup/reorg behavior, the rollback 
 - Some endpoints (Infura free tier) intermittently reject `eth_getLogs` with `-32603`/`"internal error"`. Argus classifies these as transient, retries and fails over where possible, and keeps live ingestion independent of optional enrichment/recovery failures.
 - Etherscan provides historical logs only; native and trace-based funding still depends on RPC coverage and is reported as degraded when unavailable.
 - Etherscan's free tier caps each address/topic result window at 10,000 rows and ~3 requests/sec. Argus starts every query at a 256-block range and recursively splits only when Etherscan reports "Result window is too large", backs off on rate limits (5 retries), and sleeps between requests. Preferring the historical provider for larger gaps keeps the RPC's archive limits out of the picture; the watchdog uses per-request heartbeats rather than a fixed stall timeout.
+- Candidate discovery deliberately does not attempt a chain-wide wallet firehose. DexScreener and factory events provide a bounded candidate set; Etherscan/RPC history is queried only for those candidates. This keeps provider use affordable while still selecting tokens through wallet quality, capital retention, and funding independence.
 - BigQuery is optional and disabled by default. Enabling it requires a Google service-account JSON and project; queries are protected by `maxBytesBilled`. It is not a live data source.
 - Internal-tx funding (method `internal_call`) requires `debug_traceTransaction`, which free endpoints rarely expose — extraction degrades gracefully by design.
 - If a key is ever printed to a log, **rotate it immediately** — logs are only redacted going forward.

@@ -1,5 +1,6 @@
 import { watch } from "node:fs";
 import { AlertManager } from "./alerts/manager.ts";
+import { scoreCandidate } from "./candidates.ts";
 import { buildAlertLinks, formatPerformanceOutcomeMessage, TelegramSink, type AlertSink } from "./alerts/telegram.ts";
 import { loadConfig, reloadConfig, type ArgusConfig } from "./config.ts";
 import * as db from "./db.ts";
@@ -211,7 +212,7 @@ export class ArgusEngine {
         this.graphFor(c.chainId).registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
         const t0 = p.token0 ?? p.tokenAddress;
         const t1 = p.token1 ?? p.quoteToken ?? p.tokenAddress;
-        adapter.registerPool(p.poolAddress, t0, t1);
+        if (db.getToken(c.chainId, p.tokenAddress)?.source !== "candidate") adapter.registerPool(p.poolAddress, t0, t1);
       }
       this.chains.set(c.chainId, { adapter, status: "connecting", lastAppliedBlock: 0, eventsApplied: 0 });
     }
@@ -460,8 +461,10 @@ export class ArgusEngine {
     if (evt.kind === "swap") {
       this.updatePerformance(evt);
       // R2 volume anomaly: run rules for watched tokens only
-      if (!db.getToken(chainId, evt.tokenAddress)) return;
+      const tokenMeta = db.getToken(chainId, evt.tokenAddress);
+      if (!tokenMeta) return;
       this.chains.get(chainId)?.adapter.addRelevantAddresses([evt.buyer]);
+      if (tokenMeta.source === "candidate") return;
       this.runRules(chainId, evt);
       return;
     }
@@ -501,6 +504,7 @@ export class ArgusEngine {
       if (graph.isFresh(evt.receiver, evt.timestamp, 30) && graph.nonceOf(evt.receiver) === null) {
         this.fetchNonce(chainId, evt.receiver);
       }
+      if (meta.source === "candidate") return;
       this.runRules(chainId, evt);
     } else {
       const poolDb = db.getDb().query("SELECT token_address FROM pools WHERE chain_id = ? AND pool_address = ?").get(chainId, token) as { token_address: string } | undefined;
@@ -896,13 +900,19 @@ export class ArgusEngine {
         token1: evt.token1,
       });
       this.graphFor(evt.chainId).registerPool(evt.poolAddress, evt.blockNumber, evt.timestamp);
-      this.chains.get(evt.chainId)?.adapter.registerPool(evt.poolAddress, evt.token0, evt.token1);
       if (!this.cfg.autoWatch.enabled) continue;
       const existing = db.getToken(evt.chainId, token);
       if (existing && existing.expires_at === null) continue; // permanent watch already
       const expiresAt = Math.floor(Date.now() / 1000) + this.cfg.autoWatch.watchHours * 3600;
-      db.upsertToken({ chainId: evt.chainId, address: token, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt });
-      log.info("auto-watch: new pool token", { chainId: evt.chainId, token, pool: evt.poolAddress, watchHours: this.cfg.autoWatch.watchHours });
+      if (this.cfg.candidateDiscovery.enabled) {
+        db.upsertCandidate({ chainId: evt.chainId, address: token, source: "factory", firstSeenAt: evt.timestamp, expiresAt });
+        db.upsertToken({ chainId: evt.chainId, address: token, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt });
+        log.info("candidate: new pool token", { chainId: evt.chainId, token, pool: evt.poolAddress });
+      } else {
+        db.upsertToken({ chainId: evt.chainId, address: token, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt });
+        log.info("auto-watch: new pool token", { chainId: evt.chainId, token, pool: evt.poolAddress, watchHours: this.cfg.autoWatch.watchHours });
+        this.chains.get(evt.chainId)?.adapter.registerPool(evt.poolAddress, evt.token0, evt.token1);
+      }
       this.refreshWatchSubscription(evt.chainId);
       this.fetchMeta(evt.chainId, token);
     }
@@ -964,22 +974,52 @@ export class ArgusEngine {
       try {
         const ranked = await rankStablecoinVolume(chain.chainId, this.cfg.volumeRanking.topN);
         const now = Math.floor(Date.now() / 1000);
-        const addresses = ranked.map((token) => token.address);
-        db.expireRankedTokens(chain.chainId, now, addresses);
+        db.expireCandidates(now);
         const runtime = this.chains.get(chain.chainId);
         if (!runtime) continue;
         const head = runtime.adapter.status().lastHead;
-        for (const token of ranked) {
+        const candidates = ranked.slice(0, this.cfg.candidateDiscovery.maxCandidatesPerCycle);
+        if (this.cfg.candidateDiscovery.enabled) {
+          const dbCandidates = db.listCandidates(chain.chainId).filter((c) =>
+            (c.status === "discovered" || c.status === "evaluating" || c.status === "rejected") &&
+            (!c.lastEvaluatedAt || now - c.lastEvaluatedAt >= this.cfg.candidateDiscovery.evaluationMinutes * 60)
+          );
+          for (const c of dbCandidates) {
+            if (candidates.some((r) => r.address === c.address)) continue;
+            const fallback = await fetchTokenPrice(chain.chainId, c.address);
+            if (fallback) {
+              candidates.push({
+                chainId: chain.chainId,
+                address: c.address,
+                volume: fallback.volumeUsd ?? 0,
+                pools: [{
+                  poolAddress: fallback.poolAddress,
+                  tokenAddress: c.address,
+                  quoteToken: fallback.quoteToken,
+                  volume: fallback.volumeUsd ?? 0,
+                  liquidityUsd: fallback.liquidityUsd,
+                  createdAt: null,
+                }],
+              });
+            }
+          }
+        }
+        for (const token of candidates) {
           const existing = db.getToken(token.chainId, token.address);
-          db.upsertToken({
-            chainId: token.chainId,
-            address: token.address,
-            symbol: null,
-            decimals: null,
-            totalSupply: null,
-            source: "ranked",
-            ...(existing?.source === "manual" ? {} : { expiresAt: now + this.cfg.volumeRanking.pollMinutes * 120 }),
-          });
+          if (existing?.source === "manual" || existing?.source === "factory") continue;
+          if (this.cfg.candidateDiscovery.enabled && existing?.source === "ranked") continue;
+          const candidate = db.getCandidate(token.chainId, token.address);
+          const due = !candidate?.lastEvaluatedAt || now - candidate.lastEvaluatedAt >= this.cfg.candidateDiscovery.evaluationMinutes * 60;
+          if (this.cfg.candidateDiscovery.enabled) {
+            db.upsertCandidate({
+              chainId: token.chainId, address: token.address, source: "ranked",
+              firstSeenAt: db.getCandidate(token.chainId, token.address)?.firstSeenAt ?? now,
+              expiresAt: now + this.cfg.candidateDiscovery.candidateTtlHours * 3600,
+            });
+            db.upsertToken({ chainId: token.chainId, address: token.address, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt: now + this.cfg.candidateDiscovery.candidateTtlHours * 3600 });
+          } else {
+            db.upsertToken({ chainId: token.chainId, address: token.address, symbol: null, decimals: null, totalSupply: null, source: "ranked", expiresAt: now + this.cfg.volumeRanking.pollMinutes * 120 });
+          }
           for (const pool of token.pools) {
             db.insertPool({
               chainId: token.chainId,
@@ -993,13 +1033,13 @@ export class ArgusEngine {
               token1: pool.quoteToken,
             });
             this.graphFor(token.chainId).registerPool(pool.poolAddress, head, pool.createdAt ?? undefined);
-            runtime.adapter.registerPool(pool.poolAddress, pool.tokenAddress, pool.quoteToken);
+            if (!this.cfg.candidateDiscovery.enabled) runtime.adapter.registerPool(pool.poolAddress, pool.tokenAddress, pool.quoteToken);
           }
           this.fetchMeta(token.chainId, token.address);
-          this.enqueueEnrichment(token);
+          if (due) this.enqueueEnrichment(token);
         }
         this.refreshWatchSubscription(chain.chainId);
-        log.info("volume ranking refreshed", { chainId: chain.chainId, tokens: ranked.map((token) => ({ token: token.address, volume: token.volume })) });
+        log.info("token candidates refreshed", { chainId: chain.chainId, candidates: candidates.map((token) => ({ token: token.address, volume: token.volume })) });
       } catch (err) {
         log.warn("volume ranking refresh failed", { chainId: chain.chainId, err });
       }
@@ -1037,7 +1077,8 @@ export class ArgusEngine {
         const from = BigInt(Math.max(0, head - blocks));
         try {
           await runtime.adapter.backfillToken(token.address, from, BigInt(head));
-          log.info("ranked token enrichment complete", { chainId: token.chainId, token: token.address, from: Number(from), to: head });
+          await this.evaluateCandidate(token, head);
+          log.info("candidate evaluation complete", { chainId: token.chainId, token: token.address, from: Number(from), to: head });
         } catch (err) {
           log.warn("ranked token enrichment skipped (archive/rate-limited on free RPC)", { chainId: token.chainId, token: token.address, err });
         }
@@ -1045,6 +1086,37 @@ export class ArgusEngine {
       }
     } finally {
       this.enrichmentRunning = false;
+    }
+  }
+
+  private async evaluateCandidate(token: RankedToken, head: number): Promise<void> {
+    const candidate = db.getCandidate(token.chainId, token.address);
+    if (!candidate || candidate.status === "promoted" || candidate.expiresAt <= Math.floor(Date.now() / 1000)) return;
+    const now = Math.floor(Date.now() / 1000);
+    db.updateCandidateScore(token.chainId, token.address, candidate.score, candidate.evidence, "evaluating");
+    const liquidityUsd = token.pools.reduce((max, pool) => Math.max(max, pool.liquidityUsd ?? 0), 0) || null;
+    const created = token.pools.map((pool) => pool.createdAt).filter((value): value is number => value !== null);
+    const createdAt = created.length > 0 ? Math.min(...created) : null;
+    const stats = this.graphFor(token.chainId).candidateBuyerStats(token.address, now - 86_400, now);
+    const result = scoreCandidate({
+      liquidityUsd,
+      volumeUsd: token.volume,
+      poolAgeHours: createdAt === null ? null : Math.max(0, (now - createdAt) / 3600),
+      ...stats,
+      minimumLiquidityUsd: this.cfg.candidateDiscovery.minimumLiquidityUsd,
+      minimumIndependentBuyers: this.cfg.candidateDiscovery.minimumIndependentBuyers,
+    });
+    const status = result.eligible && result.score >= this.cfg.candidateDiscovery.promotionScore ? "promoted" : "rejected";
+    db.updateCandidateScore(token.chainId, token.address, result.score, result.evidence, status);
+    if (status === "promoted") {
+      db.promoteCandidate(token.chainId, token.address, candidate.source === "factory" ? "factory" : "ranked", now + this.cfg.autoWatch.watchHours * 3600);
+      const runtime = this.chains.get(token.chainId);
+      for (const pool of db.listPoolsForToken(token.chainId, token.address)) {
+        this.graphFor(token.chainId).registerPool(pool.pool_address, head);
+        runtime?.adapter.registerPool(pool.pool_address, token.address, pool.quote_token ?? token.address);
+      }
+      this.refreshWatchSubscription(token.chainId);
+      log.info("promoted quality token candidate", { chainId: token.chainId, token: token.address, score: result.score, head });
     }
   }
 
@@ -1071,10 +1143,11 @@ export class ArgusEngine {
     this.cfg.scoring = next.scoring;
     this.cfg.alerts = next.alerts;
     this.cfg.autoWatch = next.autoWatch;
+    this.cfg.candidateDiscovery = next.candidateDiscovery;
     this.cfg.volumeRanking = next.volumeRanking;
     this.cfg.webhooks = next.webhooks;
     this.webhooks.setTargets(next.webhooks);
-    log.info("config hot-reloaded (rules/scoring/alerts/autoWatch/volumeRanking/webhooks)");
+    log.info("config hot-reloaded (rules/scoring/alerts/autoWatch/candidateDiscovery/volumeRanking/webhooks)");
   }
 
   // ---- status ------------------------------------------------------------------------------
@@ -1088,7 +1161,21 @@ export class ArgusEngine {
         eventsApplied: rt.eventsApplied,
       };
     }
-    return { chains, queueDepth: this.queue.depth, queueDropped: this.queue.dropped, wallets: [...this.graphs.values()].reduce((n, graph) => n + graph.wallets.size, 0) };
+    const candidates = db.listCandidates();
+    return {
+      chains,
+      queueDepth: this.queue.depth,
+      queueDropped: this.queue.dropped,
+      wallets: [...this.graphs.values()].reduce((n, graph) => n + graph.wallets.size, 0),
+      candidates: {
+        total: candidates.length,
+        discovered: candidates.filter((c) => c.status === "discovered").length,
+        evaluating: candidates.filter((c) => c.status === "evaluating").length,
+        promoted: candidates.filter((c) => c.status === "promoted").length,
+        rejected: candidates.filter((c) => c.status === "rejected").length,
+        expired: candidates.filter((c) => c.status === "expired").length,
+      },
+    };
   }
 }
 

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { closeDb, getToken, insertEvents, insertSignal, listSignals, listSignalsForToken, loadEvents, openDb, recentSignals, upsertToken } from "../src/db.ts";
+import { closeDb, getCandidate, getToken, insertEvents, insertSignal, listCandidates, listSignals, listSignalsForToken, listWatchedTokens, loadEvents, openDb, promoteCandidate, recentSignals, updateCandidateScore, upsertCandidate, upsertToken } from "../src/db.ts";
 import type { FundingEvent, Signal, StandardTransferEvent, SwapEvent } from "../src/types.ts";
 
 // Regression: payload_json round-trips bigints to strings; loadEvents must revive them
@@ -78,5 +78,18 @@ describe("db.loadEvents", () => {
     expect(recentSignals(1, signal.tokenAddress, 1_600_000_000)).toEqual([signal]);
     expect(listSignals(1)).toEqual([signal]);
     expect(listSignalsForToken(1, signal.tokenAddress)).toEqual([signal]);
+  });
+
+  test("keeps candidates out of active watches until promotion", () => {
+    const addr = "0x" + "cd".repeat(20);
+    upsertCandidate({ chainId: 1, address: addr, source: "ranked", firstSeenAt: 10, expiresAt: 1000 });
+    upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt: 1000 });
+    expect(listWatchedTokens(1, 20).some((t) => t.address === addr)).toBe(false);
+    updateCandidateScore(1, addr, 80, { independentBuyerCount: 4 }, "promoted");
+    promoteCandidate(1, addr, "ranked", 2000);
+    expect(getCandidate(1, addr)?.status).toBe("promoted");
+    expect(getToken(1, addr)?.source).toBe("ranked");
+    expect(listWatchedTokens(1, 20).some((t) => t.address === addr)).toBe(true);
+    expect(listCandidates(1)).toHaveLength(1);
   });
 });

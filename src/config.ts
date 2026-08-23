@@ -35,6 +35,16 @@ export interface AutoWatchConfig {
   watchHours: number;
 }
 
+export interface CandidateDiscoveryConfig {
+  enabled: boolean;
+  maxCandidatesPerCycle: number;
+  evaluationMinutes: number;
+  candidateTtlHours: number;
+  promotionScore: number;
+  minimumLiquidityUsd: number;
+  minimumIndependentBuyers: number;
+}
+
 export interface RuleConfig {
   enabled: boolean;
   weight: number;
@@ -82,6 +92,7 @@ export interface ArgusConfig {
   chains: ChainConfig[];
   watchlist: WatchlistEntry[];
   autoWatch: AutoWatchConfig;
+  candidateDiscovery: CandidateDiscoveryConfig;
   volumeRanking: { pollMinutes: number; topN: number; backfillHours: number };
   rules: RulesConfig;
   scoring: ScoringConfig;
@@ -256,6 +267,17 @@ export function validateConfig(raw: unknown): ArgusConfig {
     watchHours: reqNumber(awRaw, "watchHours", "autoWatch", { min: 1 }),
   };
 
+  const cdRaw = isObj(raw["candidateDiscovery"]) ? raw["candidateDiscovery"] as Record<string, unknown> : {};
+  const candidateDiscovery: CandidateDiscoveryConfig = {
+    enabled: cdRaw["enabled"] === undefined ? true : reqBool(cdRaw, "enabled", "candidateDiscovery"),
+    maxCandidatesPerCycle: typeof cdRaw["maxCandidatesPerCycle"] === "number" ? reqNumber(cdRaw, "maxCandidatesPerCycle", "candidateDiscovery", { int: true, min: 1, max: 100 }) : 25,
+    evaluationMinutes: typeof cdRaw["evaluationMinutes"] === "number" ? reqNumber(cdRaw, "evaluationMinutes", "candidateDiscovery", { min: 1 }) : 30,
+    candidateTtlHours: typeof cdRaw["candidateTtlHours"] === "number" ? reqNumber(cdRaw, "candidateTtlHours", "candidateDiscovery", { min: 1 }) : 24,
+    promotionScore: typeof cdRaw["promotionScore"] === "number" ? reqNumber(cdRaw, "promotionScore", "candidateDiscovery", { min: 0, max: 100 }) : 65,
+    minimumLiquidityUsd: typeof cdRaw["minimumLiquidityUsd"] === "number" ? reqNumber(cdRaw, "minimumLiquidityUsd", "candidateDiscovery", { min: 0 }) : 100_000,
+    minimumIndependentBuyers: typeof cdRaw["minimumIndependentBuyers"] === "number" ? reqNumber(cdRaw, "minimumIndependentBuyers", "candidateDiscovery", { int: true, min: 1, max: 50 }) : 3,
+  };
+
   const vrRaw = isObj(raw["volumeRanking"]) ? raw["volumeRanking"] as Record<string, unknown> : {};
   const volumeRanking = {
     pollMinutes: typeof vrRaw["pollMinutes"] === "number" ? reqNumber(vrRaw, "pollMinutes", "volumeRanking", { min: 1 }) : 5,
@@ -337,6 +359,7 @@ export function validateConfig(raw: unknown): ArgusConfig {
     chains,
     watchlist,
     autoWatch,
+    candidateDiscovery,
     volumeRanking,
     rules,
     scoring,

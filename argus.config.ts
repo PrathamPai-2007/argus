@@ -31,6 +31,17 @@ export default {
 
   autoWatch: { enabled: true, factories: ["uniswap-v2"], watchHours: 24 },
 
+  // Candidates are evaluated with targeted history before they become live watches.
+  candidateDiscovery: {
+    enabled: true,
+    maxCandidatesPerCycle: 25,
+    evaluationMinutes: 30,
+    candidateTtlHours: 24,
+    promotionScore: 65,
+    minimumLiquidityUsd: 100_000,
+    minimumIndependentBuyers: 3,
+  },
+
   // DexScreener stablecoin-quoted volume drives slow background enrichment.
   volumeRanking: { pollMinutes: 5, topN: 10, backfillHours: 1 },
 
