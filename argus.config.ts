@@ -37,9 +37,9 @@ export default {
     maxCandidatesPerCycle: 25,
     evaluationMinutes: 30,
     candidateTtlHours: 24,
-    promotionScore: 65,
-    minimumLiquidityUsd: 100_000,
-    minimumIndependentBuyers: 3,
+    promotionScore: 50,
+    minimumLiquidityUsd: 50_000,
+    minimumIndependentBuyers: 2,
   },
 
   // DexScreener stablecoin-quoted volume drives slow background enrichment.

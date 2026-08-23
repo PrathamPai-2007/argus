@@ -158,6 +158,7 @@ Logs are written to `logs/` with UTC timestamps in `YYYY-MM-DD-HH-MM-SS` format.
 
 ```text
 bun run start [--config path] [--no-dashboard] [--verbose]   # live engine
+bun run preview                                              # standalone dashboard UI preview (port 3738)
 bun run doctor [--config path]                               # pre-flight checks
 bun run replay --chain 1 --from N --to M [--token 0x...] [--preset name]
 bun run backfill --chain 1 --from N --to M                   # historical ingest (RPC or configured providers)
@@ -165,6 +166,7 @@ bun test                                                       # unit tests
 bun run typecheck                                               # tsc --noEmit (strict)
 ```
 
+- **preview** — start a standalone dashboard preview server on `http://127.0.0.1:3738` (override with `ARGUS_PREVIEW_PORT`) without launching the live blockchain ingestion engine.
 - **replay** — offline backtest over the `events` table; apply a tuning preset (`default` | `cautious` | `strict`) without touching config. Add `--config path` to use a non-default config.
 - **backfill** — ingest a historical block range into `events` for later replay. Uses the same provider selection as gap backfill (Etherscan if configured, otherwise the RPC). Add `--config path` to use a non-default config.
 - **doctor** — validates config, DB, RPC reachability (including `debug_traceTransaction` capability), Telegram credentials, and disk space.

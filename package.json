@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts run",
+    "preview": "bun run src/dashboard/preview.ts",
     "doctor": "bun run src/index.ts doctor",
     "replay": "bun run src/index.ts replay",
     "backfill": "bun run src/index.ts backfill",
