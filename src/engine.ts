@@ -798,6 +798,18 @@ export class ArgusEngine {
     for (const sink of this.alertManager["sinks"]) {
       void sink.sendText(msg).catch((err) => log.error("outcome sink failed", { sink: sink.name, err }));
     }
+    try {
+      const fs = require("node:fs");
+      const path = "data/trades.csv";
+      if (!fs.existsSync(path)) {
+        fs.writeFileSync(path, "Timestamp,ChainID,TokenAddress,PoolAddress,Outcome,EntryPrice,CurrentPrice,TargetPrice,StopPrice,CloseReason\n");
+      }
+      const ts = new Date((session.closed_at ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
+      const line = [ts, session.chain_id, session.token_address, session.pool_address, session.outcome, session.entry_price.toString(), session.current_price.toString(), session.target_price.toString(), session.stop_price.toString(), session.close_reason ?? ""].join(",") + "\n";
+      fs.appendFileSync(path, line);
+    } catch (err) {
+      log.error("failed to write trade to csv", { err });
+    }
   }
 
   private buildAlertPayload(chainId: number, token: Address, score: number, severity: AlertPayload["severity"], signals: Signal[]): AlertPayload {

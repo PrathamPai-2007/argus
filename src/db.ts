@@ -209,17 +209,17 @@ export function listFundingEdgesForWallets(chainId: number, addresses: Address[]
   return rows.map((r) => ({ ...r, amount: BigInt(r.amount) }));
 }
 
-/** Clean up transient unfinalized events and un-alerted expired ranked tokens on startup while preserving alerts, alerted tokens, pools, and active performance tracking across sessions. */
+/** Clean up transient unfinalized events and wipe tokens, alerts, signals, and performance sessions on startup. */
 export function resetSessionData(): void {
   const d = getDb();
   d.transaction(() => {
     d.run("DELETE FROM events WHERE finalized = 0");
-    d.run(
-      "DELETE FROM tokens WHERE source = 'ranked' AND expires_at IS NOT NULL AND address NOT IN (SELECT token_address FROM alerts)",
-    );
-    d.run(
-      "DELETE FROM pools WHERE token_address NOT IN (SELECT address FROM tokens)",
-    );
+    d.run("DELETE FROM tokens");
+    d.run("DELETE FROM pools");
+    d.run("DELETE FROM alerts");
+    d.run("DELETE FROM signals");
+    d.run("DELETE FROM performance_sessions");
+    d.run("DELETE FROM token_candidates");
   })();
 }
 
