@@ -27,4 +27,8 @@ desktop.ini
 .idea/
 *.swp
 *.swo
-
+# Scratch & temporary
+scratch/
+page.html
+script.js
+style.css
