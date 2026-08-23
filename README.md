@@ -12,9 +12,12 @@
 
 - **Live ingestion** — WebSocket subscription with automatic RPC failover, 5s–60s Infura rate-limit backoff, heartbeat/staleness detection, and watchdog recovery.
 - **Dual-RPC parallel catch-up** — when falling behind the live head, block chunks are fetched in parallel across the configured HTTP RPC pool to catch up at 2x speed before resuming the live WebSocket stream.
-- **Quota-aware RPC backfilling** — standard historical RPC backfills automatically route to Public ETH RPCs (or Etherscan/BigQuery), preserving Infura API credits exclusively for real-time streaming and catch-up.
+- **Quota-aware RPC backfilling & Multicall** — standard historical RPC backfills automatically route to Public ETH RPCs (or Etherscan/BigQuery), preserving Infura API credits. ERC-20 metadata queries (`totalSupply`, `decimals`, `symbol`) are batched via single on-chain `multicall`s with native JSON-RPC HTTP transport batching.
 - **Live-first startup** — connects and processes new blocks immediately; historical enrichment never gates ingestion.
 - **Reorg-safe state** — a rollback-friendly union-find graph (`RollbackDSU`, no path compression) rewinds to any block when the chain reorgs; confirmed alerts are confirmed, unfinalized ones are retracted.
+- **O(1) cluster balance tracking** — `GraphEngine` incrementally maintains cluster totals as transfers and merges occur, dropping Rule 4 evaluation time from 60ms to <1ms with lazy-loaded member trees.
+- **Memory retention & garbage collection** — periodic `retentionSweep` safely prunes unwatched token ledgers and inactive wallets from memory, preventing memory leaks during long-running sessions.
+- **Fast on-chain DEX pricing & hub protection** — on-chain Uniswap V2 reserve polling eliminates DexScreener HTTP rate-limits, while hub-degree limits (>25 counterparties) prevent common infrastructure/routers from merging disjoint clusters.
 - **Gap recovery** — startup begins at the current head, while bounded reconnect, queue-overflow, and parent-hash reorg recovery run in-process. DexScreener results create bounded token candidates; only candidates with independent early-buyer evidence are promoted to live watches.
 - **Funding extraction** — native ETH transfers, `Disperse` calldata decoding, and internal calls via trace APIs when the endpoint exposes them (graceful degradation otherwise).
 - **Candidate-driven discovery** — tracks new factory pools and stablecoin-quoted DEX activity as candidates, evaluates liquidity, early buyers, retention, funding independence, and exchange exposure, then promotes qualifying tokens for live monitoring.

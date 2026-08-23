@@ -160,10 +160,101 @@ export class GraphEngine {
   private fundingAmountIndex = new Map<string, Array<{ funded: Address; funder: Address; ts: number; block: number }>>();
   private fanoutSenders = new Map<string, number>(); // key → last union timestamp
   private identicalAmountUnioned = new Map<string, number>(); // amount key → last union timestamp
+  private fundingDegree = new Map<Address, Set<Address>>(); // wallet -> distinct counterparties
+
+  private clusterBalances = new Map<Address, Map<Address, bigint>>(); 
+  private clusterTokens = new Map<Address, Set<Address>>(); 
 
   private history: Array<{ block: number; undo: UndoFn }> = [];
 
   constructor(private tuning: GraphTuning = DEFAULT_GRAPH_TUNING) {}
+
+  private updateClusterBalance(token: Address, root: Address, delta: bigint, undos: UndoFn[]): void {
+    let balances = this.clusterBalances.get(token);
+    if (!balances) { balances = new Map(); this.clusterBalances.set(token, balances); }
+    const prev = balances.get(root) ?? 0n;
+    const next = prev + delta;
+    balances.set(root, next);
+
+    let tokens = this.clusterTokens.get(root);
+    if (!tokens) { tokens = new Set(); this.clusterTokens.set(root, tokens); }
+    const wasInSet = tokens.has(token);
+    if (next > 0n && !wasInSet) tokens.add(token);
+    else if (next <= 0n && wasInSet) tokens.delete(token);
+
+    undos.push(() => {
+      balances!.set(root, prev);
+      if (wasInSet) tokens!.add(token);
+      else tokens!.delete(token);
+    });
+  }
+
+  private unionAndMergeBalances(a: Address, b: Address, undos: UndoFn[]): void {
+    const ra = this.dsu.find(a);
+    const rb = this.dsu.find(b);
+    if (ra === rb) return;
+    
+    this.dsu.union(a, b);
+    const newRoot = this.dsu.find(a);
+    const lostRoot = newRoot === ra ? rb : ra;
+
+    const tokensToMerge = Array.from(this.clusterTokens.get(lostRoot) ?? []);
+    for (const t of tokensToMerge) {
+      const bal = this.clusterBalances.get(t)?.get(lostRoot) ?? 0n;
+      if (bal > 0n) {
+        this.updateClusterBalance(t, newRoot, bal, undos);
+        this.updateClusterBalance(t, lostRoot, -bal, undos);
+      }
+    }
+  }
+
+  prune(activeTokens: Set<Address>): void {
+    const activeWallets = new Set<Address>();
+    
+    for (const [token, ledger] of this.balances) {
+      if (!activeTokens.has(token)) {
+        this.balances.delete(token);
+        this.burned.delete(token);
+        this.totalSupply.delete(token);
+        this.deployers.delete(token);
+        this.clusterBalances.delete(token);
+      } else {
+        for (const [addr, bal] of ledger) {
+          if (bal > 0n) activeWallets.add(addr);
+        }
+      }
+    }
+
+    this.buys = this.buys.filter((b) => activeTokens.has(b.token));
+    this.buysByToken.clear();
+    this.tokensBoughtByWallet.clear();
+    for (const b of this.buys) {
+      let tBuys = this.buysByToken.get(b.token);
+      if (!tBuys) { tBuys = []; this.buysByToken.set(b.token, tBuys); }
+      tBuys.push(b);
+      let wTokens = this.tokensBoughtByWallet.get(b.addr);
+      if (!wTokens) { wTokens = new Map(); this.tokensBoughtByWallet.set(b.addr, wTokens); }
+      wTokens.set(b.token, (wTokens.get(b.token) ?? 0) + 1);
+    }
+
+    for (const [addr, list] of this.sends) {
+      const filtered = list.filter((s) => activeTokens.has(s.token));
+      if (filtered.length === 0) this.sends.delete(addr);
+      else this.sends.set(addr, filtered);
+    }
+    
+    for (const b of this.buys) activeWallets.add(b.addr);
+    for (const list of this.sends.values()) for (const s of list) activeWallets.add(s.to);
+    for (const pool of this.pools) activeWallets.add(pool);
+    for (const addr of this.labels.keys()) activeWallets.add(addr);
+
+    for (const addr of this.wallets.keys()) {
+      if (!activeWallets.has(addr)) {
+        this.wallets.delete(addr);
+        this.fundingDegree.delete(addr);
+      }
+    }
+  }
 
   // ---- label / pool / metadata administration ---------------------------------
 
@@ -300,11 +391,13 @@ export class GraphEngine {
       const prev = ledger.get(from) ?? 0n;
       ledger.set(from, prev - evt.amount);
       undos.push(() => ledger.set(from, prev));
+      if (!this.pools.has(from)) this.updateClusterBalance(token, this.dsu.find(from), -evt.amount, undos);
     }
     if (!DEAD_ADDRESSES.has(to)) {
       const prev = ledger.get(to) ?? 0n;
       ledger.set(to, prev + evt.amount);
       undos.push(() => ledger.set(to, prev));
+      if (!this.pools.has(to)) this.updateClusterBalance(token, this.dsu.find(to), evt.amount, undos);
     } else {
       const prevB = this.burned.get(token) ?? 0n;
       this.burned.set(token, prevB + evt.amount);
@@ -336,7 +429,7 @@ export class GraphEngine {
     }
 
     // token fan-out detection (linkage signal #3, feeds R3)
-    if (!this.isInfra(from)) {
+    if (from !== ZERO_ADDRESS && !this.isInfra(from)) {
       const list = this.sends.get(from) ?? [];
       if (!this.sends.has(from)) {
         this.sends.set(from, list);
@@ -353,7 +446,7 @@ export class GraphEngine {
         this.fanoutSenders.set(key, evt.timestamp);
         undos.push(() => this.fanoutSenders.delete(key));
         const mark = this.dsu.mark();
-        for (let i = 1; i < distinct.length; i++) this.dsu.union(distinct[0] as Address, distinct[i] as Address);
+        for (let i = 1; i < distinct.length; i++) this.unionAndMergeBalances(distinct[0] as Address, distinct[i] as Address, undos);
         undos.push(() => this.dsu.rollback(mark));
         effects.push({ type: "fanout", sender: from, token, amount: evt.amount, receivers: distinct, ts: evt.timestamp, block: evt.blockNumber });
       }
@@ -374,6 +467,24 @@ export class GraphEngine {
     const fresh = this.isFresh(evt.funded, evt.timestamp, 1);
     this.ensureWallet(evt.funded, evt.blockNumber, evt.timestamp, evt.funder, undos);
     this.ensureWallet(evt.funder, evt.blockNumber, evt.timestamp, null, undos);
+    
+    let fundedDeg = this.fundingDegree.get(evt.funded);
+    if (!fundedDeg) { fundedDeg = new Set(); this.fundingDegree.set(evt.funded, fundedDeg); }
+    if (!fundedDeg.has(evt.funder)) {
+      fundedDeg.add(evt.funder);
+      undos.push(() => fundedDeg.delete(evt.funder));
+    }
+    
+    let funderDeg = this.fundingDegree.get(evt.funder);
+    if (!funderDeg) { funderDeg = new Set(); this.fundingDegree.set(evt.funder, funderDeg); }
+    if (!funderDeg.has(evt.funded)) {
+      funderDeg.add(evt.funded);
+      undos.push(() => funderDeg.delete(evt.funded));
+    }
+    
+    const isFunderHub = funderDeg.size > 25;
+    const isFundedHub = fundedDeg.size > 25;
+
     const wFunded = this.wallets.get(evt.funded);
     if (wFunded && !wFunded.funder && evt.funder) {
       wFunded.funder = evt.funder;
@@ -389,13 +500,13 @@ export class GraphEngine {
       }
       list.push({ funded: evt.funded, amount: evt.amount, ts: evt.timestamp, block: evt.blockNumber });
       undos.push(() => void list.pop());
-    } else if (fresh && !this.isInfra(evt.funded) && !this.pools.has(evt.funded) && !this.pools.has(evt.funder)) {
+    } else if (fresh && !this.isInfra(evt.funded) && !this.isInfra(evt.funder) && !isFunderHub && !isFundedHub && !this.pools.has(evt.funded) && !this.pools.has(evt.funder)) {
       // common gas funder → hard cluster edge (linkage signal #1), up to 2 hops
       const mark = this.dsu.mark();
-      this.dsu.union(evt.funded, evt.funder);
+      this.unionAndMergeBalances(evt.funded, evt.funder, undos);
       const w = this.wallets.get(evt.funder);
       if (w?.funder && !this.isInfra(w.funder) && this.labels.get(w.funder)?.kind !== "cex") {
-        this.dsu.union(evt.funded, w.funder);
+        this.unionAndMergeBalances(evt.funded, w.funder, undos);
       }
       undos.push(() => this.dsu.rollback(mark));
     }
@@ -417,7 +528,7 @@ export class GraphEngine {
          this.identicalAmountUnioned.set(key, evt.timestamp);
          undos.push(() => this.identicalAmountUnioned.delete(key));
         const mark = this.dsu.mark();
-        for (let i = 1; i < distinctFunded.length; i++) this.dsu.union(distinctFunded[0] as Address, distinctFunded[i] as Address);
+        for (let i = 1; i < distinctFunded.length; i++) this.unionAndMergeBalances(distinctFunded[0] as Address, distinctFunded[i] as Address, undos);
         undos.push(() => this.dsu.rollback(mark));
         effects.push({ type: "identical_amount", amount: evt.amount, wallets: distinctFunded, ts: evt.timestamp, block: evt.blockNumber });
       }
@@ -640,32 +751,34 @@ export class GraphEngine {
 
   /** Per-cluster balance breakdown for a token (R4 + alerts, PLAN.md §6 "Supply % per cluster"). */
   clusterBreakdown(token: Address): ClusterStat[] {
-    const ledger = this.balances.get(token);
     const circ = this.circulatingSupply(token);
-    if (!ledger || circ === null || circ <= 0n) return [];
-    const byRoot = new Map<Address, bigint>();
-    for (const [addr, bal] of ledger) {
-      if (bal <= 0n) continue;
-      if (this.pools.has(addr) || DEAD_ADDRESSES.has(addr)) continue;
-      const root = this.dsu.find(addr);
-      byRoot.set(root, (byRoot.get(root) ?? 0n) + bal);
-    }
+    if (circ === null || circ <= 0n) return [];
+    
     const stats: ClusterStat[] = [];
-    // ONE pass over DSU keys for all clusters instead of members() per root (USDT: 46k ledger
-    // entries x 18k keys was ~87s/event; now single O(n·depth) grouping).
-    const membersByRoot = this.dsu.membersFor(new Set(byRoot.keys()));
-    for (const [root, balance] of byRoot) {
-      const members = membersByRoot.get(root) ?? [root];
-      let clusterId = root;
-      for (const m of members) if (m < clusterId) clusterId = m;
-      stats.push({
-        clusterId,
-        root,
-        members,
-        memberCount: members.length,
-        balance,
-        pctOfSupply: (Number(balance) / Number(circ)) * 100,
+    const balances = this.clusterBalances.get(token);
+    if (!balances) return [];
+
+    const dsu = this.dsu;
+    for (const [root, balance] of balances) {
+      if (balance <= 0n) continue;
+      const stat = { root, balance, memberCount: dsu.memberCount(root), pctOfSupply: (Number(balance) / Number(circ)) * 100 } as ClusterStat;
+      
+      let _members: Address[] | null = null;
+      let _clusterId: Address | null = null;
+      Object.defineProperty(stat, 'members', {
+        get: () => { if (!_members) _members = dsu.members(root); return _members; },
+        enumerable: true
       });
+      Object.defineProperty(stat, 'clusterId', {
+        get: () => {
+          if (_clusterId) return _clusterId;
+          let min = root;
+          for (const m of stat.members) if (m < min) min = m;
+          return (_clusterId = min);
+        },
+        enumerable: true
+      });
+      stats.push(stat);
     }
     return stats.sort((a, b) => b.pctOfSupply - a.pctOfSupply);
   }
@@ -690,8 +803,10 @@ export class GraphEngine {
         sends: [...this.sends.entries()],
         exchangeFundings: [...this.exchangeFundings.entries()],
         fundingAmountIndex: [...this.fundingAmountIndex.entries()],
-         fanoutSenders: [...this.fanoutSenders.entries()],
-         identicalAmountUnioned: [...this.identicalAmountUnioned.entries()],
+        fanoutSenders: [...this.fanoutSenders.entries()],
+        identicalAmountUnioned: [...this.identicalAmountUnioned.entries()],
+        clusterBalances: [...this.clusterBalances.entries()].map(([t, m]) => [t, [...m.entries()]]),
+        clusterTokens: [...this.clusterTokens.entries()].map(([r, s]) => [r, [...s]]),
       },
       replacer,
     );
@@ -725,6 +840,8 @@ export class GraphEngine {
     g.fundingAmountIndex = new Map((j["fundingAmountIndex"] as [string, { funded: Address; funder: Address; ts: number; block: number }[]][]) ?? []);
     g.fanoutSenders = new Map((j["fanoutSenders"] as [string, number][] | string[] ?? []).map((v) => Array.isArray(v) ? v : [v, 0]));
     g.identicalAmountUnioned = new Map((j["identicalAmountUnioned"] as [string, number][] | string[] ?? []).map((v) => Array.isArray(v) ? v : [v, 0]));
+    for (const [t, entries] of (j["clusterBalances"] as [Address, [Address, bigint][]][] ?? [])) g.clusterBalances.set(t, new Map(entries));
+    for (const [r, entries] of (j["clusterTokens"] as [Address, Address[]][] ?? [])) g.clusterTokens.set(r, new Set(entries));
     return g;
   }
 }

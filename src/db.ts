@@ -214,12 +214,14 @@ export function resetSessionData(): void {
   const d = getDb();
   d.transaction(() => {
     d.run("DELETE FROM events WHERE finalized = 0");
-    d.run("DELETE FROM tokens");
-    d.run("DELETE FROM pools");
+    d.run("DELETE FROM performance_sessions");
     d.run("DELETE FROM alerts");
     d.run("DELETE FROM signals");
-    d.run("DELETE FROM performance_sessions");
     d.run("DELETE FROM token_candidates");
+    d.run("DELETE FROM tokens");
+    d.run("DELETE FROM pools");
+    d.run("DELETE FROM cluster_members");
+    d.run("DELETE FROM clusters");
   })();
 }
 

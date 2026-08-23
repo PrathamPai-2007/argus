@@ -7,7 +7,7 @@ import * as db from "./db.ts";
 import { resolveFactories } from "./factories.ts";
 import { GraphEngine, DEFAULT_GRAPH_TUNING } from "./graph/engine.ts";
 import { EvmAdapter, type AdapterStatus, type ChainAdapter } from "./ingest/evm.ts";
-import { rankStablecoinVolume, fetchTokenPrice, fetchTokenPriceForPool, type RankedToken } from "./ingest/dexscreener.ts";
+import { rankStablecoinVolume, fetchTokenPrice, fetchTokenPriceForPool, type RankedToken, type TokenPriceObservation } from "./ingest/dexscreener.ts";
 import { log, redactUrl } from "./logger.ts";
 import { decimalsForAddress, priceFromSwap, thresholds, updateSession, PERFORMANCE_WINDOW_SECS, type PerformanceEvent, type PerformanceSession } from "./performance.ts";
 import { EventQueue } from "./queue.ts";
@@ -219,7 +219,7 @@ export class ArgusEngine {
 
     this.drainTimer = setInterval(() => this.drain(), 250);
     this.pruneTimer = setInterval(() => this.retentionSweep(), 60 * 60_000);
-    this.performanceTimer = setInterval(() => void this.expirePerformance(), 15_000);
+    this.performanceTimer = setInterval(() => void this.expirePerformance(), 3_000);
 
     for (const [chainId, rt] of this.chains) {
       rt.adapter.start(null).catch((err) => {
@@ -441,6 +441,13 @@ export class ArgusEngine {
       // arrives after the transfer event that discovered the wallet.
       const tokens = this.graphFor(chainId).getTokensBoughtBy(evt.funded);
       for (const token of tokens) {
+        const meta = db.getToken(chainId, token);
+        if (!meta || meta.source === "candidate" || (meta.expires_at !== null && meta.expires_at <= now)) continue;
+
+        // Ensure token has had on-chain activity recently (e.g. within 15 minutes)
+        const lastSwap = db.latestSwapForToken(chainId, token);
+        if (lastSwap && now - lastSwap.timestamp > 900) continue;
+
         const syn: StandardEvent = {
           kind: "transfer",
           chainId,
@@ -619,7 +626,12 @@ export class ArgusEngine {
   }
 
   private async openPerformanceSession(alertId: number, chainId: number, tokenAddress: Address, sourceEvent?: StandardEvent): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
     let swap = sourceEvent?.kind === "swap" ? sourceEvent : db.latestSwapForToken(chainId, tokenAddress);
+    
+    const isStale = swap ? (now - swap.timestamp > 300) : true;
+    if (isStale) return; // Stale trade guard: skip opening if older than 5 minutes
+
     const swapPool = swap ? db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
       .get(chainId, swap.poolAddress, tokenAddress) as { quote_token: Address | null } | undefined : undefined;
     const tokenDecimals = db.getToken(chainId, tokenAddress)?.decimals ?? 18;
@@ -629,26 +641,25 @@ export class ArgusEngine {
     let entryPrice = swap ? priceFromSwap(swap, tokenDecimals, quoteDecimals) : null;
     let poolAddress = swap?.poolAddress;
     let quoteToken: Address | null = null;
-    const openedAt = sourceEvent?.timestamp ?? (swap?.timestamp ?? Math.floor(Date.now() / 1000));
+    const openedAt = sourceEvent?.timestamp ?? (swap?.timestamp ?? now);
     const entryBlock = sourceEvent?.blockNumber ?? (swap?.blockNumber ?? 0);
 
-    if (entryPrice === null) {
-      const fallback = await fetchTokenPrice(chainId, tokenAddress);
-      if (fallback) {
-        entryPrice = fallback.price;
-        poolAddress = fallback.poolAddress;
-        quoteToken = fallback.quoteToken;
-        db.insertPool({
-          chainId,
-          poolAddress: fallback.poolAddress,
-          tokenAddress,
-          quoteToken: fallback.quoteToken,
-          factory: "dexscreener",
-          createdBlock: entryBlock,
-        });
-        this.chains.get(chainId)?.adapter.registerPool(fallback.poolAddress, tokenAddress, fallback.quoteToken);
-        this.graphFor(chainId).registerPool(fallback.poolAddress);
-      }
+    const observation = await fetchTokenPriceForPool(chainId, tokenAddress, poolAddress);
+    if (observation.kind === "liquidity_lost" || observation.kind === "pool_missing") return; // verify current liquidity
+    if (observation.kind === "price") {
+      entryPrice = observation.value.price;
+      poolAddress = observation.value.poolAddress;
+      quoteToken = observation.value.quoteToken;
+      db.insertPool({
+        chainId,
+        poolAddress: observation.value.poolAddress,
+        tokenAddress,
+        quoteToken: observation.value.quoteToken,
+        factory: "dexscreener",
+        createdBlock: entryBlock,
+      });
+      this.chains.get(chainId)?.adapter.registerPool(observation.value.poolAddress, tokenAddress, observation.value.quoteToken);
+      this.graphFor(chainId).registerPool(observation.value.poolAddress);
     }
 
     if (entryPrice === null || !poolAddress) return;
@@ -721,10 +732,45 @@ export class ArgusEngine {
       // Polling check for active sessions with low swap frequency.
       const activeSessions = db.listPerformanceSessions({ activeOnly: true });
       const now = Math.floor(Date.now() / 1000);
-      for (const session of activeSessions) {
-        if (now - session.updated_at < 15) continue;
-        const observation = await fetchTokenPriceForPool(session.chain_id, session.token_address, session.pool_address);
-        if (observation.kind === "provider_error") continue;
+
+      await Promise.all(activeSessions.map(async (session) => {
+        if (now - session.updated_at < 3) return;
+        
+        let observation: TokenPriceObservation | null = null;
+        const adapter = this.chains.get(session.chain_id)?.adapter as EvmAdapter | undefined;
+
+        if (adapter && session.quote_token) {
+          try {
+            const res = await adapter.fetchPoolReserves(session.pool_address);
+            if (res) {
+              if (res.reserve0 === 0n || res.reserve1 === 0n) {
+                observation = { kind: "liquidity_lost" };
+              } else {
+                const tokenA = session.token_address.toLowerCase();
+                const tokenB = session.quote_token.toLowerCase();
+                const isToken0 = tokenA < tokenB;
+                const tokenAmount = isToken0 ? res.reserve0 : res.reserve1;
+                const quoteAmount = isToken0 ? res.reserve1 : res.reserve0;
+                
+                const tokenDecimals = db.getToken(session.chain_id, session.token_address)?.decimals ?? 18;
+                const quoteDecimals = db.getToken(session.chain_id, session.quote_token)?.decimals ?? decimalsForAddress(session.quote_token);
+                
+                const price = priceFromSwap({ tokenAmount, quoteAmount }, tokenDecimals, quoteDecimals);
+                if (price !== null) {
+                  observation = { kind: "price", value: { price, poolAddress: session.pool_address, quoteToken: session.quote_token, liquidityUsd: null, volumeUsd: null } };
+                }
+              }
+            }
+          } catch (err) {
+            log.warn("On-chain price poll failed, falling back", { chainId: session.chain_id, token: session.token_address, err });
+          }
+        }
+        
+        if (!observation) {
+          observation = await fetchTokenPriceForPool(session.chain_id, session.token_address, session.pool_address);
+        }
+
+        if (observation.kind === "provider_error") return;
         if (observation.kind === "pool_missing" || observation.kind === "liquidity_lost") {
           const missing = session.missing_observations + 1;
           if (observation.kind === "liquidity_lost" || missing >= 3) {
@@ -761,33 +807,33 @@ export class ArgusEngine {
               missingObservations: missing,
             });
           }
-          continue;
+          return;
         }
 
         const latest = db.getPerformanceSession(session.id);
-        if (!latest || latest.outcome !== "active" || latest.updated_at > session.updated_at) continue;
+        if (!latest || latest.outcome !== "active" || latest.updated_at > session.updated_at) return;
         const result = updateSession(session, observation.value.price, now);
-          db.updatePerformanceSession({
-            id: session.id,
-            outcome: result.outcome,
-            currentPrice: result.currentPrice,
-            minPrice: result.minPrice,
-            maxPrice: result.maxPrice,
-            lastBlock: session.last_block,
-            updatedAt: now,
-            closedAt: result.closedAt,
-            lastPollAt: now,
-            missingObservations: 0,
-            closeReason: result.outcome === "active" ? null : "price_threshold",
-          });
-          const updated = db.getPerformanceSession(session.id);
-          if (updated) {
-            this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
-            if (updated.outcome !== "active") {
-              this.dispatchOutcomeNotification(updated);
-            }
+        db.updatePerformanceSession({
+          id: session.id,
+          outcome: result.outcome,
+          currentPrice: result.currentPrice,
+          minPrice: result.minPrice,
+          maxPrice: result.maxPrice,
+          lastBlock: session.last_block,
+          updatedAt: now,
+          closedAt: result.closedAt,
+          lastPollAt: now,
+          missingObservations: 0,
+          closeReason: result.outcome === "active" ? null : "price_threshold",
+        });
+        const updated = db.getPerformanceSession(session.id);
+        if (updated) {
+          this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
+          if (updated.outcome !== "active") {
+            this.dispatchOutcomeNotification(updated);
           }
-      }
+        }
+      }));
     } finally {
       this.performancePollRunning = false;
     }
@@ -940,9 +986,16 @@ export class ArgusEngine {
   // ---- retention / hot reload -------------------------------------------------
 
   private retentionSweep(): void {
+    const now = Math.floor(Date.now() / 1000);
     const pruned = db.pruneEvents(this.cfg.retention.eventDays * 86_400);
     this.refreshWatchSubscriptionForExpiry();
     this.pruneSignificance();
+    
+    for (const chainId of this.chains.keys()) {
+      const activeTokens = new Set(db.listWatchedTokens(chainId, now).map(t => t.address));
+      this.graphFor(chainId).prune(activeTokens);
+    }
+    
     this.syncAllClusters();
     if (pruned > 0) log.info("retention sweep", { prunedEvents: pruned });
   }

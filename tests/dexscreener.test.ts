@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { fetchTokenPriceForPool } from "../src/ingest/dexscreener.ts";
+import { fetchTokenPriceForPool, clearPriceCache } from "../src/ingest/dexscreener.ts";
 
 const TOKEN = "0x" + "aa".repeat(20);
 const POOL = "0x" + "bb".repeat(20);
@@ -19,6 +19,7 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  clearPriceCache();
 });
 
 describe("DexScreener performance observations", () => {

@@ -75,6 +75,7 @@ export interface ChainAdapter {
   /** Register a Uniswap V2-style pool (token0/token1 known) for LP/Swap subscriptions. */
   registerPool(pool: Address, token0: Address, token1: Address): void;
   fetchTokenMeta(address: Address): Promise<Partial<TokenMeta>>;
+  fetchPoolReserves(pool: Address): Promise<{ reserve0: bigint; reserve1: bigint; blockTimestampLast: number } | null>;
   getNonce(address: Address): Promise<number>;
   recover(reason: string): Promise<void>;
   flushEvents(): Promise<void>;
@@ -298,9 +299,9 @@ export class EvmAdapter implements ChainAdapter {
       transport = webSocket(url, { retryCount: 2, retryDelay: 500, timeout: 20_000 });
     } else {
       if (!silentMode) log.warn("HTTP endpoint configured — falling back to polling (higher latency)", { chainId: this.chainId });
-      transport = http(url, { retryCount: 2, retryDelay: 500, timeout: 20_000 });
+      transport = http(url, { retryCount: 2, retryDelay: 500, timeout: 20_000, batch: true });
     }
-    return createPublicClient({ transport });
+    return createPublicClient({ transport, batch: { multicall: true } });
   }
 
   private maxArchiveDepth = 100_000;
@@ -1671,30 +1672,36 @@ export class EvmAdapter implements ChainAdapter {
     const c = this.mustClient();
     const out: Partial<TokenMeta> = {};
     try {
-      out.totalSupply = (await c.readContract({
-        address: address as `0x${string}`,
-        abi: [ERC20_META_ABI] as unknown as Abi,
-        functionName: "totalSupply",
-      })) as bigint;
+      const results = await c.multicall({
+        contracts: [
+          { address: address as `0x${string}`, abi: [ERC20_META_ABI] as unknown as Abi, functionName: "totalSupply" },
+          { address: address as `0x${string}`, abi: [parseAbiItem("function decimals() view returns (uint8)")] as unknown as Abi, functionName: "decimals" },
+          { address: address as `0x${string}`, abi: [parseAbiItem("function symbol() view returns (string)")] as unknown as Abi, functionName: "symbol" },
+        ],
+        allowFailure: true,
+      });
+      if (results[0].status === "success") out.totalSupply = results[0].result as bigint;
+      if (results[1].status === "success") out.decimals = results[1].result as number;
+      if (results[2].status === "success") out.symbol = results[2].result as string;
     } catch {
-      /* non-standard token */
-    }
-    for (const [fn, key] of [
-      ["decimals", "decimals"],
-      ["symbol", "symbol"],
-    ] as const) {
-      try {
-        const v = await c.readContract({
-          address: address as `0x${string}`,
-          abi: [parseAbiItem(`function ${fn}() view returns (${fn === "decimals" ? "uint8" : "string"})`)] as unknown as Abi,
-          functionName: fn,
-        });
-        (out as Record<string, unknown>)[key] = v;
-      } catch {
-        /* ignore */
-      }
+      /* ignore */
     }
     return out;
+  }
+
+  async fetchPoolReserves(pool: Address): Promise<{ reserve0: bigint; reserve1: bigint; blockTimestampLast: number } | null> {
+    const c = this.client;
+    if (!c) return null;
+    try {
+      const res = await c.readContract({
+        address: pool as `0x${string}`,
+        abi: [parseAbiItem("function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)")] as unknown as Abi,
+        functionName: "getReserves",
+      }) as [bigint, bigint, number];
+      return { reserve0: res[0], reserve1: res[1], blockTimestampLast: res[2] };
+    } catch {
+      return null;
+    }
   }
 
   async getNonce(address: Address): Promise<number> {

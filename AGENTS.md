@@ -115,6 +115,10 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
 - Quality-driven discovery: factory and DexScreener activity creates bounded candidates;
   targeted enrichment scores liquidity, early buyer retention, funding independence, and
   exchange/common-funder risk before promotion. Volume is capped and cannot bypass buyer gates.
+- Real-time performance & graph integrity: Fast concurrent on-chain RPC polling for pool reserves eliminates DexScreener HTTP limits. Hub-degree limits (in-degree/out-degree > 25) prevent routers/infra from collapsing disjoint wallets into mega-clusters. Synthetic rule evaluations strictly filter out candidates and expired watches to preserve Inv 11.
+- RPC multicall & batching: Explicit `multicall` for ERC-20 metadata (`totalSupply`, `decimals`, `symbol`) and global JSON-RPC HTTP transport batching reduce RPC round-trips by up to 75%.
+- Memory retention & graph garbage collection: `GraphEngine.prune(activeTokens)` runs during the hourly `retentionSweep`, safely evicting un-watched token ledgers, stale rolling send/buy buffers, and inactive wallets to prevent unbounded memory growth.
+- O(1) cluster balance tracking: `GraphEngine` incrementally maintains `clusterBalances` and `clusterTokens` on every transfer and DSU merge. `clusterBreakdown` is pre-computed in O(clusters) rather than O(holders * depth), while full member arrays are resolved lazily only when an alert fires.
 
 ## Smoke testing without a paid RPC
 

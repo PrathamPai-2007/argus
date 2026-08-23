@@ -308,4 +308,46 @@ describe("GraphEngine pools (Phase 6)", () => {
     // Old buy pruned from accumulation window; recent buy kept
     expect(g.freshAccumulation(TOKEN, 0, now, 30).amount).toBe(200n);
   });
+
+  test("prune garbage collects inactive tokens and stale wallets", () => {
+    const g = new GraphEngine();
+    const tokenA = addr("tokA");
+    const tokenB = addr("tokB");
+    g.setTotalSupply(tokenA, 1_000n);
+    g.setTotalSupply(tokenB, 1_000n);
+    g.applyEvent(transfer(ZERO_ADDRESS, addr("holderA"), 500n, { token: tokenA }));
+    g.applyEvent(transfer(ZERO_ADDRESS, addr("holderB"), 500n, { token: tokenB }));
+    
+    expect(g.wallets.has(addr("holderA"))).toBe(true);
+    expect(g.wallets.has(addr("holderB"))).toBe(true);
+    expect(g.balanceOf(tokenA, addr("holderA"))).toBe(500n);
+    expect(g.balanceOf(tokenB, addr("holderB"))).toBe(500n);
+
+    // Prune with only tokenA active
+    g.prune(new Set([tokenA]));
+
+    expect(g.balanceOf(tokenA, addr("holderA"))).toBe(500n);
+    expect(g.balanceOf(tokenB, addr("holderB"))).toBe(0n); // tokenB dropped
+    expect(g.wallets.has(addr("holderA"))).toBe(true);
+    expect(g.wallets.has(addr("holderB"))).toBe(false); // holderB evicted
+  });
+
+  test("clusterBreakdown lazy evaluation resolves clusterId and members accurately", () => {
+    const g = new GraphEngine();
+    g.setTotalSupply(TOKEN, 1_000_000n);
+    g.applyEvent(funding(FUNDER, addr("c_alpha"), 10n ** 16n));
+    g.applyEvent(funding(FUNDER, addr("c_beta"), 10n ** 16n));
+    g.applyEvent(transfer(ZERO_ADDRESS, addr("c_alpha"), 300_000n));
+    g.applyEvent(transfer(ZERO_ADDRESS, addr("c_beta"), 200_000n));
+
+    const breakdown = g.clusterBreakdown(TOKEN);
+    expect(breakdown.length).toBeGreaterThan(0);
+    const top = breakdown[0]!;
+    expect(top.memberCount).toBe(3); // funder, c_alpha, c_beta
+    expect(top.pctOfSupply).toBeCloseTo(50, 1);
+    expect(top.members).toContain(addr("c_alpha"));
+    expect(top.members).toContain(addr("c_beta"));
+    expect(top.members).toContain(FUNDER);
+    expect(top.clusterId).toBeDefined();
+  });
 });
