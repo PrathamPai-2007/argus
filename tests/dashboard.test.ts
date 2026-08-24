@@ -112,6 +112,12 @@ describe("DashboardServer", () => {
       expect(resMetrics.status).toBe(200);
       expect(((await resMetrics.json()) as any).activeWatches).toBe(1);
 
+      const resSnapshot = await fetch("http://127.0.0.1:3740/api/snapshot");
+      expect(resSnapshot.status).toBe(200);
+      const snapshot = (await resSnapshot.json()) as any;
+      expect(snapshot.tokens).toHaveLength(1);
+      expect(snapshot.metrics.activeWatches).toBe(1);
+
       // GET /api/tokens (tests BigInt serialization of totalSupply)
       const resTokens = await fetch("http://127.0.0.1:3740/api/tokens");
       expect(resTokens.status).toBe(200);
@@ -146,6 +152,9 @@ describe("DashboardServer", () => {
       expect(detailJson.pools.length).toBe(1);
       expect(detailJson.alerts.length).toBe(1);
       expect(detailJson.signals.length).toBe(1);
+      expect(detailJson.recentEvents).toHaveLength(1);
+      expect(detailJson.recentEventSummary).toMatchObject({ count: 1, finalized: 1, latestBlock: 100, kinds: { transfer: 1 } });
+      expect(detailJson.availability).toEqual({ metadata: true, graph: false, history: true, events: true });
 
       // GET /api/token/1/:token with Accept: text/html
       const resTokenHtml = await fetch(`http://127.0.0.1:3740/api/token/1/${testToken}`, {
@@ -153,6 +162,25 @@ describe("DashboardServer", () => {
       });
       expect(resTokenHtml.status).toBe(200);
       expect(resTokenHtml.headers.get("content-type")).toContain("text/html");
+    } finally {
+      dashboard.stop();
+    }
+  });
+
+  test("token deep-link reports missing persisted data without backfilling", async () => {
+    const cfg = await loadConfig();
+    const address = "0x9999999999999999999999999999999999999999";
+    const dashboard = new DashboardServer(new ArgusEngine(cfg), { port: 3744 });
+    dashboard.start();
+    try {
+      const res = await fetch(`http://127.0.0.1:3744/api/token/1/${address}`);
+      expect(res.status).toBe(200);
+      const detail = (await res.json()) as any;
+      expect(detail.token).toBeNull();
+      expect(detail.recentEvents).toEqual([]);
+      expect(detail.recentEventSummary).toMatchObject({ count: 0, latestBlock: null, latestTimestamp: null });
+      expect(detail.availability).toEqual({ metadata: false, graph: false, history: false, events: false });
+      expect(renderPage()).toContain("Missing projections are reported, not backfilled");
     } finally {
       dashboard.stop();
     }

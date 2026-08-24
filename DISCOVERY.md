@@ -23,6 +23,11 @@ Candidates are stored in `token_candidates`. A matching `tokens` row has source
 rules. Promotion changes that source to `ranked` or `factory` and refreshes the
 adapter subscription.
 
+Candidate state is durable, but candidate tokens are not live watches. On restart,
+the engine resets session-scoped derived state and resumes discovery from the
+current head; it does not restore an old in-memory graph or wait for historical
+backfill before ingesting new blocks.
+
 ## Candidate sources
 
 - Factory `PairCreated` events identify new pools early. Their candidates are evaluated once market metadata is available.
@@ -79,6 +84,11 @@ evaluated, eligible, promoted, rejected, expired, promotion rate, evaluation
 completion rate, and rejection reasons. A zero-promotion period is actionable
 only after checking provider health and evaluation completion first.
 
+`/api/status` exposes candidate lifecycle counts and provider health. The token
+detail endpoint also reports whether metadata, graph state, history, and recent
+persisted events are available, so a missing projection is distinguishable from
+an undiscovered token.
+
 ## Tuning workflow
 
 1. Run Argus with the default candidate settings.
@@ -86,3 +96,16 @@ only after checking provider health and evaluation completion first.
 3. Use replay fixtures to test threshold changes before lowering `promotionScore`.
 4. Lower liquidity or buyer thresholds only when provider budget and false-positive rates are understood.
 5. Add realized outcome learning only after enough candidate outcomes are persisted.
+
+The checked-in live profile is intentionally aggressive: candidate evaluation runs every
+15 minutes, up to 10 candidates are admitted per cycle, the liquidity gate is `$5,000`,
+and the promotion score is `25`. The independent-buyer gate remains `2`, and candidates
+are still excluded from rules and live subscriptions until promotion. This increases
+coverage without allowing volume alone to create a watch.
+
+## Reliability Notes
+
+- Candidate evaluation failures are best-effort and must not block live ingestion.
+- Provider responses are validated before they become candidate evidence.
+- Failed event applications are persisted for bounded retry and audit in
+  `failed_events`; they are not represented only by log output.

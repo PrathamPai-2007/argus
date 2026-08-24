@@ -25,7 +25,8 @@
 - **Webhook push** — POST alerts, signals, and reorg retractions to validated HTTP(S) endpoints (Discord/Slack/n8n/your own server); HMAC-signed when a secret is set.
 - **Graph API & SQL Materialization** — per-token wallet clusters and funding edges as JSON and materialized SQL tables (`clusters`, `cluster_members`), ready to feed your own visualizations.
 - **Alert performance journal & TP/SL tracking** — pool-relative watches start on real alerts, auto-register pool subscriptions, resolve quote-aligned prices via DexScreener fallback, poll DEX prices every 15 seconds, track a 12-hour `+50% / -20%` target/stop window with single-tick anomaly guards ($>20\times$), format sub-micro prices without `$0.000000` truncation, and send Telegram outcome alerts (`🎯 TP HIT`, `🛑 SL HIT`).
-- **Clean session restarts & trade journaling** — memory, tokens, alerts, and performance sessions are wiped clean on engine restart to avoid stale state. However, all closed alert performance tracking sessions are permanently appended to a `data/trades.csv` journal for offline analysis.
+- **Explainable detection lifecycle** — every signal records its score, severity, alert outcome, suppression reason, and optional alert link; every alert records whether its observational performance watch opened or why it was skipped.
+- **Clean session restarts & trade journaling** — session-scoped events, signals, alerts, graph state, tokens, and performance sessions are reset on engine restart to avoid stale state. Closed performance sessions are permanently appended to `data/trades.csv`; finalized event facts remain available for replay and audit.
 - **Real-time WebSocket dashboard** — `Bun.serve` + native WebSockets (`ws://127.0.0.1:3737/ws`) + SSE on `127.0.0.1:3737`, zero dependencies; optionally protected with `ARGUS_DASHBOARD_TOKEN`.
 - **Hot-reloadable config** — edit `argus.config.ts` and rule/scoring/alert/auto-watch/webhook settings apply without a restart.
 - **Secrets stay out of logs & test isolation** — RPC keys and URL credentials are redacted centrally in the logger; test runs use timestamped `logs/argus-test-*.log` files; log level is configurable with `ARGUS_LOG_LEVEL`.
@@ -50,7 +51,9 @@ evm adapter ──► event queue ──► SQLite (facts) ──► graph engin
 6. **Graph** (`src/graph/engine.ts`) — wallets, funding edges, balance ledgers, and clusters via a rollback DSU. Every mutation records an undo closure so `rewindTo(block)` restores exact prior state on reorg. Finalization (`finalize(boundary)`) prunes stale rolling windows (>24h).
 7. **Rules** (`src/rules/index.ts`) — pure functions `(event, graphView, config) → Signal | null`.
 8. **Score** (`src/scorer.ts`) — best-weight-per-rule sum mapped to 0–100 and `info` / `alert` / `critical` severity.
-9. **Alert** (`src/alerts/`) — cooldown, escalation, global rate limit, Telegram delivery, and explicit retractions for reorged alerts. Live (unfinalized) signals are tagged **unconfirmed** until the block finalizes.
+9. **Alert** (`src/alerts/`) — cooldown, configurable score escalation, global rate limit, Telegram delivery, and explicit retractions for reorged alerts. Live (unfinalized) signals are tagged **unconfirmed** until the block finalizes.
+10. **Recover** (`src/engine.ts`, `src/db.ts`) — failed event applications are recorded in `failed_events`, retried during bounded recovery, and removed after successful application. Reorg cleanup removes affected unfinalized facts and derived outputs.
+11. **Observe** (`src/db.ts`, `src/dashboard/`) — signal evaluations and alert-to-performance outcomes are durable, so a quiet inbox is distinguishable from a stalled pipeline or an ineligible performance watch.
 
 ## Detection rules
 
@@ -77,7 +80,7 @@ logs/                  UTC timestamped session log files (gitignored)
 src/
   index.ts             CLI router: run | doctor | replay | backfill
   config.ts            hand-rolled config validation + .env loader + hot reload
-  db.ts                bun:sqlite repositories (WAL)
+  db.ts                bun:sqlite repositories (WAL), projections, failed-event recovery
   types.ts             StandardEvent union, Signal, AlertPayload
   queue.ts              weighted ring buffer (drop-oldest, never blocks ingestion)
   engine.ts            orchestrator: queue → persist → graph → rules → score → alerts
@@ -185,13 +188,14 @@ Served on `127.0.0.1:3737` (local-only). The page is a single HTML file with SSE
 | `/` | dashboard page |
 | `/events/stream` | SSE push of alerts + 5s status ticks |
 | `/api/status` | per-chain adapter status, checkpoint, queue depth, candidate lifecycle counts, and volume-ranking provider health |
+| `/api/snapshot` | consistent dashboard snapshot used to resynchronize after reconnects or live updates |
 | `/api/metrics` | truthful 24-hour event/signal/alert aggregates, performance outcomes, and candidate selection funnel metrics |
 | `/api/tokens` | promoted/live watched tokens (with `?chain=` filter) |
 | `/api/candidates` | candidate tokens, score, evidence, lifecycle status (with optional `?chain=` filter) |
 | `/api/alerts` | alert history |
 | `/api/signals` | recent signals (`?chain=`, `?limit=`) |
 | `/api/performance` | alert outcome sessions (`?chain=`, `?token=`, `?active=1`, `?limit=`) |
-| `/api/token/:chain/:address` | signals, alerts, pools for one token |
+| `/api/token/:chain/:address` | token metadata, availability, recent persisted events, signals, alerts, and pools |
 | `/api/graph/token/:chain/:address` | wallet clusters (members, balances, labels, % of supply) + funding edges for a token |
 | `/api/graph/wallet/:chain/:address` | a wallet's cluster, funder chain, and in/out funding edges |
 | `/api/events/recent` | last 100 raw events |
@@ -203,6 +207,7 @@ supply concentration, cluster members, pools, alert/signal history).
 
 Performance sessions are observational, not executed trades. Prices are derived from the alert's
 reference pool and remain quote-denominated; sessions close at `+50%`, `-20%`, or 12 hours.
+Alerts also expose `performance_status` and `performance_reason` when a watch cannot be opened.
 
 ## Configuration
 
@@ -214,16 +219,16 @@ All tuning lives in `argus.config.ts` (validated in `src/config.ts`, no schema l
   - `bigquery` (disabled by default) — needs a Google service-account JSON and project; only selected when the estimated range exceeds `bigqueryThresholdHours`, and protected by `maxBytesBilled`.
 - **watchlist** — permanent tokens to watch.
 - **autoWatch** — `enabled`, `factories` (Uniswap V2-style; each entry is a raw `0x` address or a known name like `"uniswap-v2"` — names expand to the chain's canonical factory), `watchHours` (how long factory-discovered tokens stay watched; `NULL` = permanent).
-- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. Candidates persist across restarts, remain excluded from live subscriptions and alert rules until promoted, and retain explainable evidence and rejection reasons. Factory candidates enter the candidate table immediately and are evaluated when market metadata is available; disabling this setting restores direct factory/ranked auto-watch behavior.
+- **candidateDiscovery** — `enabled`, `maxCandidatesPerCycle`, `evaluationMinutes`, `candidateTtlHours`, `promotionScore`, `minimumLiquidityUsd`, and `minimumIndependentBuyers`. The checked-in profile is intentionally aggressive (`10` candidates/cycle, `15m` evaluation, `$5k` liquidity, score `25`) while hard buyer and funding gates remain active.
 - **rules** — per-rule `enabled`, thresholds, and `weight`.
 - **scoring** — `info < alert < critical` thresholds + signal window.
-- **alerts** — Telegram on/off, cooldown, escalation delta, per-minute rate limit.
+- **alerts** — Telegram on/off, cooldown, escalation delta, per-minute rate limit. Current aggressive defaults are `15m`, `+10`, and `20/min`.
 - **webhooks** — outbound POST targets. Each: `url`, `events` (`"alert"` and/or `"signal"`), optional `secret` (signs the body as `x-argus-signature: sha256=<hex>`; keep it in `.env`), `timeoutMs`, `retries`. Alerts, reorg retractions, and (optionally) signals are delivered as JSON.
 - **retention** — how long raw events are kept.
 - **volumeRanking** — DexScreener poll interval, candidate-source count, and targeted enrichment window. The ranking is not a quality ranking by itself.
 - **dbPath** — SQLite storage location.
 
-Changes to rules/scoring/autoWatch/candidateDiscovery/volumeRanking/webhooks hot-reload on save; alert settings, chain, and watchlist changes require a restart. Webhook delivery is fire-and-forget, uses request timeouts and bounded exponential retries, rejects redirects, and refuses loopback/private/link-local/metadata destinations.
+Changes to rules/scoring/alerts/autoWatch/candidateDiscovery/volumeRanking/webhooks hot-reload on save; chain and watchlist changes require a restart. Webhook delivery is fire-and-forget, uses request timeouts and bounded exponential retries, rejects redirects, and refuses loopback/private/link-local/metadata destinations.
 
 ## Design invariants
 
@@ -237,6 +242,7 @@ Changes to rules/scoring/autoWatch/candidateDiscovery/volumeRanking/webhooks hot
 8. **Recovery is best-effort and in-process** — bounded startup, reconnect, queue-overflow, and reorg ranges may be re-ingested, but no backfill cursor is persisted across sessions and recovery failure never prevents live operation.
 9. **Candidates are not watches** — candidate rows and candidate-source tokens are excluded from live subscriptions and rules; promotion requires configured hard gates plus a score threshold.
 10. **Volume is not conviction** — volume may generate or prioritize candidates, but is capped in promotion scoring and cannot bypass independent-buyer and liquidity gates.
+11. **Failed work is observable** — event-application failures are persisted with payload, attempt count, and last error so recovery does not depend on process logs alone.
 
 ## Tests
 
@@ -246,6 +252,8 @@ bun run typecheck
 ```
 
 The test suite (`bun:test`) covers adapter startup/reorg behavior, the rollback DSU, graph rewinds, funding extraction, rule functions, scorer, alert manager/cooldowns/retractions, config and webhook validation, weighted queue behavior, dashboard auth/SSE, performance tracking, logger redaction, DexScreener ranking, and golden normalizer fixtures.
+
+The current repository passes `bun run typecheck` and the full suite: 150 tests, 0 failures.
 
 ## Status
 
@@ -257,6 +265,8 @@ The test suite (`bun:test`) covers adapter startup/reorg behavior, the rollback 
 - **Output layer** — done: HMAC-signed webhook push (alerts/signals/retractions) with SSRF/redirect/timeout/retry safeguards + graph API endpoints (clusters, funding edges) with optional dashboard authentication.
 - **Multi-chain + polish (Phase 6)** — auto-watch is live; BNB Chain / Base configuration scaffolding remains commented. Internal-call funding probes trace capability and degrades gracefully when the endpoint doesn't expose `debug_traceTransaction`.
 - **Phase 7** — candidate-driven discovery is live: bounded candidates, targeted enrichment, independent early-buyer gates, and explainable promotion evidence. Wallet reputation currently uses behavioral/current-window evidence; realized PnL learning and broader cohort discovery remain follow-up work.
+- **Reliability hardening** — done: canonical event ordering and provider validation, serialized recovery/subscription control paths, queue-drop attribution, durable failed-event tracking, finalized projection rebuilds, signal publication idempotency, and explicit token-detail data availability.
+- **Operational follow-up** — broader multi-chain coverage, realized-PnL reputation, and a long-running provider chaos/load harness remain future work.
 
 ## Notes & limitations
 

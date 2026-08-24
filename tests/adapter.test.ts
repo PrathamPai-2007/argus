@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { parseAbiItem } from "viem";
 import type { ChainConfig } from "../src/config.ts";
-import { EvmAdapter, type AdapterCallbacks } from "../src/ingest/evm.ts";
+import { disperseFundingLogIndex, EvmAdapter, type AdapterCallbacks } from "../src/ingest/evm.ts";
 import type { FundingEvent, StandardEvent } from "../src/types.ts";
 import type { PublicClient } from "viem";
 
@@ -13,6 +13,11 @@ const TOKEN = "0x" + "aa".repeat(20);
 const POOL = "0x" + "dd".repeat(20);
 const TOKEN0 = TOKEN;
 const TOKEN1 = "0x" + "ee".repeat(20);
+
+test("allocates distinct synthetic identities across large Disperse batches", () => {
+  expect(disperseFundingLogIndex(0, 1000)).not.toBe(disperseFundingLogIndex(1, 0));
+  expect(() => disperseFundingLogIndex(0, 1_000_000)).toThrow(/identity range/);
+});
 
 function makeConfig(): ChainConfig {
   return {
@@ -135,6 +140,20 @@ describe("EvmAdapter backfill phase resume", () => {
     // the same edge must never re-emit when the other side later becomes relevant
     adapter.addRelevantAddresses([funder]);
     expect(events).toHaveLength(1);
+  });
+
+  test("groups buffered funding by its actual block", () => {
+    const adapter = new EvmAdapter(makeConfig(), callbacks());
+    const base = { kind: "funding" as const, chainId: 1, logIndex: 1, txHash: "0x" + "44".repeat(32), funder: "0x" + "f1".repeat(20), funded: "0x" + "f2".repeat(20), amount: 1n, method: "native_transfer" as const, timestamp: 1 };
+    (adapter as unknown as { bufferFunding: (entries: FundingEvent[]) => void }).bufferFunding([
+      { ...base, blockNumber: 102 }, { ...base, blockNumber: 100, txHash: "0x" + "55".repeat(32) },
+    ]);
+    expect((adapter as unknown as { fundingBuffer: Array<{ block: number }> }).fundingBuffer.map((entry) => entry.block)).toEqual([100, 102]);
+  });
+
+  test("rejects provider logs missing identity instead of defaulting it", () => {
+    const adapter = new EvmAdapter(makeConfig(), callbacks());
+    expect(() => (adapter as unknown as { toRaw: (log: unknown) => unknown }).toRaw({ address: TOKEN, topics: [], data: "0x" })).toThrow(/missing blockNumber/);
   });
 
   test("unwraps single pool address from array format when querying getLogs", async () => {

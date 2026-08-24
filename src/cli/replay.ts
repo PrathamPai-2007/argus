@@ -175,6 +175,9 @@ function openReplayWatch(watches: Map<string, PerformanceSession>, token: string
     last_poll_at: null,
     missing_observations: 0,
     close_reason: null,
+    entry_source: "swap",
+    last_observation_source: null,
+    last_observation_block: null,
   });
 }
 

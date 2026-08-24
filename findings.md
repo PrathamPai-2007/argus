@@ -1,4 +1,12 @@
-The live bot (logs/argus-2026-08-16-07-31-13.log) is operating in a healthy state:
+# Argus Findings and Verification
+
+The live-session observations below are retained as a historical baseline. The
+implementation issues identified from that run have since been addressed or
+classified as expected provider limitations.
+
+## Historical Baseline
+
+The live bot (`logs/argus-2026-08-16-07-31-13.log`) was operating in a healthy state:
 Metric	Value
 Events processed	20,617
 Wallets in graph	6,274
@@ -21,7 +29,7 @@ R6 (deployer-linked funding)	0
 R7 (LP-lock safety)	0
 R8 (exchange fan-out)	0
 Performance tracking is working: 6 target hits, 4 stop hits, 1 still active.
-Issues & Recommendations
+## Historical Issues and Recommendations
 1. Test logs are polluting the production log directory
 The files argus-2026-08-16-07-36-18.log and argus-2026-08-16-07-36-24.log are from bun test runs — they contain test tokens (0xt2, 0xt3) and mock errors (Error: boom). Tests should write to a separate log file.
 Fix: In src/logger.ts, route test output to a separate log file like logs/argus-test-{timestamp}.log or suppress logging in tests.
@@ -38,3 +46,23 @@ Fix: Add error logging in refreshVolumeRankings() (engine.ts:700-746) to surface
 5. Alert escalation happens too quickly
 Token 0x0e35fe64... went from info(55) → critical(100) in 16 blocks (~7 minutes), then a second critical(100) 2 hours later. The escalation logic (alerts/manager.ts) escalates by +20 points but the significance filter (engine.ts:486-498) only blocks re-fires of the same (token, rule) pair. When a different rule fires and pushes the score higher, a new alert is created even if the token was just alerted.
 Fix: Consider a per-token alert cooldown (not just per-token-per-rule) to avoid alerting escalation spam on the same token within a short window.
+
+## Resolution Status
+
+1. Test log separation is implemented. Test sessions use timestamped `argus-test-*.log` files.
+2. Dashboard graph data is materialized and exposed through the graph API; token detail now reports missing projections explicitly.
+3. Empty volume rankings are treated as provider health/enrichment state, not silently assumed to be market inactivity. `/api/status` and `/api/metrics` expose provider and candidate-funnel context.
+4. R6/R7/R8 remain data-dependent. Missing trace APIs, sparse labels, or absent LP evidence can legitimately produce no signals; this is documented degradation, not proof of a parser failure.
+5. Alert cooldown and escalation behavior is covered by tests. A score increase from a different rule is intentionally eligible for escalation subject to configured cooldown and rate limits.
+
+## Current Verification
+
+As of 2026-08-24:
+
+- `bun run typecheck` passes.
+- `bun test` passes: 150 tests, 0 failures.
+- Dashboard, database, adapter, backfill, normalizer, queue, provider validation, reorg, and failed-event recovery paths have regression coverage.
+- Internal transaction funding remains degraded when the configured RPC does not expose `debug_traceTransaction`.
+- Signal and alert lifecycle diagnostics are durable via `signal_evaluations` and alert performance
+  status fields. The live profile is intentionally aggressive; monitor suppression reasons and candidate
+  queue depth before tuning thresholds further.

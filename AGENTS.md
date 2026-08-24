@@ -29,7 +29,7 @@ migrations/            plain .sql, applied in filename order, tracked in _migrat
 src/
   index.ts             CLI router: run | doctor | replay | backfill
   config.ts            hand-rolled validation (no zod) + .env loader + hot reload
-  db.ts                bun:sqlite repos (WAL). Tests use openDb(":memory:")
+  db.ts                bun:sqlite repos (WAL), projections, failed-event recovery. Tests use openDb(":memory:")
   types.ts             StandardEvent union, Signal, AlertPayload
   queue.ts             weighted ring buffer, drop-oldest + dropped counter (never block ingestion)
   ingest/evm.ts        ChainAdapter: WS subscribe, failover, heartbeat/stale, reorg walk-back,
@@ -51,12 +51,13 @@ src/
                        finalize(boundary) prunes stale rolling windows (>24h)
   rules/index.ts       R1–R8 pure functions (event, graphView, config) → Signal | null
   scorer.ts            best-weight-per-rule sum → 0–100 → severity
-  alerts/manager.ts    cooldown / escalation(+20) / global rate limit / retractions
+  alerts/manager.ts    cooldown / configurable score escalation / global rate limit / retractions
   performance.ts       pool-relative alert watches (12h, +50% target, -20% stop)
   alerts/telegram.ts   one fetch POST; no SDK
   webhooks.ts          outbound HTTP delivery of alerts/signals/retractions (HMAC-signed, SSRF-safe, plain fetch)
   engine.ts            orchestrator: queue drain → persist → graph → rules → score → alerts;
-                       serialized control operations, bounded retries, overflow recovery, shutdown drain
+                       serialized control operations, bounded retries, overflow recovery, shutdown drain,
+                       finalized projection rebuilds
 tests/                 bun:test; adapter/dashboard/config/security regressions; golden fixtures for normalizer; in-memory SQLite
 ```
 
@@ -85,6 +86,10 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
 11. **Candidates are not watches.** `token_candidates` and `tokens.source = 'candidate'`
     hold bounded evaluation state; they are excluded from live subscriptions and alert rules
     until promotion passes hard evidence gates and the configured score threshold.
+12. **Failed event work is durable.** Event application failures are recorded in
+    `failed_events` with their payload and retry metadata; successful application removes the row.
+13. **Session reset is explicit.** Restart cleanup removes session-scoped unfinalized facts and
+    derived outputs, while finalized facts and the closed-trade journal remain durable.
 
 ## Status
 
@@ -119,6 +124,24 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
 - RPC multicall & batching: Explicit `multicall` for ERC-20 metadata (`totalSupply`, `decimals`, `symbol`) and global JSON-RPC HTTP transport batching reduce RPC round-trips by up to 75%.
 - Memory retention & graph garbage collection: `GraphEngine.prune(activeTokens)` runs during the hourly `retentionSweep`, safely evicting un-watched token ledgers, stale rolling send/buy buffers, and inactive wallets to prevent unbounded memory growth.
 - O(1) cluster balance tracking: `GraphEngine` incrementally maintains `clusterBalances` and `clusterTokens` on every transfer and DSU merge. `clusterBreakdown` is pre-computed in O(clusters) rather than O(holders * depth), while full member arrays are resolved lazily only when an alert fires.
+- Reliability hardening: provider identity and log-shape validation, canonical transaction ordering,
+  serialized ingestion handoffs, queue-drop attribution, durable failed-event recovery, and finalized
+  projection rebuilds are covered by regression tests.
+- Dashboard investigation: `/api/token/:chain/:address` reports metadata, history, recent persisted
+  events, and availability flags instead of silently presenting an empty result for a valid deep link.
+- Detection lifecycle: `signal_evaluations` records score, severity, alert outcome, and suppression
+  reason; alerts record performance-watch status and reason; dashboard exposes Activity Log and Positions.
+- Aggressive live tuning: candidate evaluation is bounded at 10/cycle, promotion uses a `$5k` liquidity
+  floor and score `25`, sensitive rule thresholds are enabled, and alert scoring starts at `info: 25`.
+
+## Verification
+
+The current repository passes the strict typecheck and full Bun test suite:
+
+```text
+bun run typecheck  PASS
+bun test           150 pass, 0 fail
+```
 
 ## Smoke testing without a paid RPC
 

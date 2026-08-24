@@ -10,7 +10,13 @@ export interface EndpointProbe {
   latencyMs: number | null;
   tracesAvailable: boolean | null;
   maxArchiveDepth: number;
+  archiveSupported: boolean | null;
   error: string | null;
+}
+
+export interface ArchiveProbe {
+  supported: boolean | null;
+  maxDepth: number;
 }
 
 export function buildClient(url: string): PublicClient {
@@ -41,26 +47,30 @@ export async function probeTraceCapability(client: PublicClient): Promise<boolea
 
 /** Probe non-archive vs archive eth_getLogs block depth capability. */
 export async function probeArchiveDepth(client: PublicClient): Promise<number> {
+  return (await probeArchiveDepthDetailed(client)).maxDepth;
+}
+
+export async function probeArchiveDepthDetailed(client: PublicClient): Promise<ArchiveProbe> {
   try {
     const head = await client.getBlockNumber();
-    if (head <= 64n) return 100_000;
+    if (head <= 64n) return { supported: true, maxDepth: 100_000 };
     const testBlock = head - 300n > 0n ? head - 300n : 0n;
     await client.getLogs({
       fromBlock: testBlock,
       toBlock: testBlock,
     });
-    return 100_000;
+    return { supported: true, maxDepth: 100_000 };
   } catch (err) {
     const msg = String(err).toLowerCase();
     if (msg.includes("archive") || msg.includes("personal token") || msg.includes("pruned")) {
-      return 128;
+      return { supported: false, maxDepth: 128 };
     }
-    return 128;
+    return { supported: null, maxDepth: 100_000 };
   }
 }
 
 export async function probeEndpoint(url: string, withTraces = true): Promise<EndpointProbe> {
-  const out: EndpointProbe = { url, reachable: false, blockNumber: null, latencyMs: null, tracesAvailable: null, maxArchiveDepth: 128, error: null };
+  const out: EndpointProbe = { url, reachable: false, blockNumber: null, latencyMs: null, tracesAvailable: null, maxArchiveDepth: 128, archiveSupported: null, error: null };
   try {
     const client = buildClient(url);
     const t0 = Date.now();
@@ -69,7 +79,9 @@ export async function probeEndpoint(url: string, withTraces = true): Promise<End
     out.blockNumber = Number(bn);
     out.reachable = true;
     if (withTraces) out.tracesAvailable = await probeTraceCapability(client);
-    out.maxArchiveDepth = await probeArchiveDepth(client);
+    const archive = await probeArchiveDepthDetailed(client);
+    out.maxArchiveDepth = archive.maxDepth;
+    out.archiveSupported = archive.supported;
   } catch (err) {
     out.error = redactUrl(String(err));
   }

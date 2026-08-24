@@ -64,6 +64,15 @@ describe("AlertManager", () => {
     expect(sink.sent.length).toBe(2);
   });
 
+  test("configured escalation delta applies without a severity change", async () => {
+    const sink = new FakeSink();
+    const m = new AlertManager(ALERTS_CFG, SCORING_CFG, [sink]);
+    await m.maybeAlert(payload("0xt3b", 60, "alert"), false);
+    const id = await m.maybeAlert(payload("0xt3b", 80, "alert"), false);
+    expect(id).not.toBeNull();
+    expect(sink.sent.length).toBe(2);
+  });
+
   test("global rate limit suppresses non-critical, critical bypasses", async () => {
     const sink = new FakeSink();
     const m = new AlertManager(ALERTS_CFG, SCORING_CFG, [sink]);

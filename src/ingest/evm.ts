@@ -10,7 +10,7 @@ import {
   type Transport,
   toEventSelector,
 } from "viem";
-import { probeArchiveDepth, probeTraceCapability } from "./probe.ts";
+import { probeArchiveDepthDetailed, probeTraceCapability } from "./probe.ts";
 import type { ChainConfig } from "../config.ts";
 import { log, redactUrl } from "../logger.ts";
 import type { Address, FundingEvent, StandardEvent, TokenMeta } from "../types.ts";
@@ -33,6 +33,16 @@ const ERC20_META_ABI = parseAbiItem("function totalSupply() view returns (uint25
 // Synthetic logIndex bases so funding edges derived from txs never collide with real logs.
 const LOGIDX_NATIVE = 10_000_000;
 const LOGIDX_DISPERSE = 20_000_000;
+const DISPERSE_LOG_STRIDE = 1_000_000;
+
+export function disperseFundingLogIndex(transactionIndex: number, recipientIndex: number): number {
+  if (!Number.isSafeInteger(transactionIndex) || transactionIndex < 0 || !Number.isSafeInteger(recipientIndex) || recipientIndex < 0 || recipientIndex >= DISPERSE_LOG_STRIDE) {
+    throw new Error("Disperse payout exceeds synthetic log identity range");
+  }
+  const index = LOGIDX_DISPERSE + transactionIndex * DISPERSE_LOG_STRIDE + recipientIndex;
+  if (!Number.isSafeInteger(index)) throw new Error("Disperse payout synthetic log identity is not safe");
+  return index;
+}
 
 const GETLOGS_CHUNK = 128n; // keep busy-token responses small on free RPC tiers
 const GETLOGS_THROTTLE_CHUNK = 32n; // last-resort sub-chunk after a rate-limit failure
@@ -121,6 +131,7 @@ export class EvmAdapter implements ChainAdapter {
   private lastProgressAt = 0;
   private backfillTail: Promise<void> = Promise.resolve(); // serializes overlapping backfillRange calls
   private eventDispatch: Promise<void> | null = null;
+  private subscriptionTail: Promise<void> = Promise.resolve();
   private backfillProgress: { from: number; to: number; progress: number } | null = null;
   private blockTimes = new Map<number, number>();
   private recentHeads: Array<{ number: number; hash: string; parentHash: string }> = [];
@@ -260,8 +271,6 @@ export class EvmAdapter implements ChainAdapter {
     if (hits.length > 0) void this.emitEvents(hits);
   }
 
-  /** Register a Uniswap V2-style pool (from factory logs or auto-watch); enables
-   *  LP-transfer (R7) and Swap (R2) subscriptions for it. */
   registerPool(pool: Address, token0: Address, token1: Address): void {
     const p = pool.toLowerCase();
     const t0 = token0.toLowerCase();
@@ -270,6 +279,18 @@ export class EvmAdapter implements ChainAdapter {
     this.pools.add(p);
     if (!this.poolSides.has(p)) this.poolSides.set(p, { token0: t0, token1: t1 });
     if (isNew && this.running && this._status === "live") void this.resubscribeLogs();
+  }
+
+  prunePools(activePools: Set<Address>): void {
+    let changed = false;
+    for (const p of this.pools) {
+      if (!activePools.has(p)) {
+        this.pools.delete(p);
+        this.poolSides.delete(p);
+        changed = true;
+      }
+    }
+    if (changed && this.running && this._status === "live") void this.resubscribeLogs();
   }
 
   status() {
@@ -315,7 +336,8 @@ export class EvmAdapter implements ChainAdapter {
         this.client = this.buildClient(this.cfg.rpcs[i] as string);
         await this.withRetry(() => this.mustClient().getBlockNumber());
         this.traces = await this.probeTraceCapability();
-        this.maxArchiveDepth = await probeArchiveDepth(this.mustClient());
+        const archive = await probeArchiveDepthDetailed(this.mustClient());
+        if (archive.supported !== null) this.maxArchiveDepth = archive.maxDepth;
         log.info("connected to endpoint", { chainId: this.chainId, endpoint: this.redact(i), traces: this.traces, archiveDepth: this.maxArchiveDepth });
         if (!this.isInfuraUrl(this.cfg.rpcs[i])) this.scheduleInfuraRetry();
         return;
@@ -734,6 +756,12 @@ export class EvmAdapter implements ChainAdapter {
   }
 
   private async resubscribeLogs(): Promise<void> {
+    const next = this.subscriptionTail.then(() => this.replaceLogSubscriptions(), () => this.replaceLogSubscriptions());
+    this.subscriptionTail = next.catch((err) => { log.error("log subscription replacement failed", { chainId: this.chainId, err }); });
+    return next;
+  }
+
+  private async replaceLogSubscriptions(): Promise<void> {
     // replace only the log subscriptions (keep newHeads)
     this.stopLogSubscriptions();
     const c = this.mustClient();
@@ -880,7 +908,7 @@ export class EvmAdapter implements ChainAdapter {
       let caughtUpThrough = this.lastHead;
       const job = this.cb.getBackfillProgress?.(this.chainId) ?? null;
       const appliedStart = (this.cb.getAppliedBlock?.(this.chainId) ?? this.lastHead) + 1;
-      const resumeStart = reason === "queue-overflow" ? Math.min(this.lastHead + 1, appliedStart) : (job !== null ? job.nextBlock : this.lastHead + 1);
+       const resumeStart = reason === "queue-overflow" ? Math.max(0, appliedStart - 1) : (job !== null ? job.nextBlock : this.lastHead + 1);
       if (head > resumeStart - 1) {
         this.setStatus("backfilling", { from: resumeStart, to: head });
         // Best-effort: a flaky gap backfill must not wedge the chain in "error"
@@ -1167,12 +1195,20 @@ export class EvmAdapter implements ChainAdapter {
                 method: "disperse",
                 txHash: tx.hash,
                 blockNumber: number,
-                logIndex: LOGIDX_DISPERSE + tx.transactionIndex * 1000 + i,
+                 logIndex: disperseFundingLogIndex(tx.transactionIndex, i),
                 timestamp,
               }),
             );
           });
           continue;
+        }
+        if (payout?.kind === "token") {
+          log.debug("skipping token Disperse payout", {
+            chainId: this.chainId,
+            txHash: tx.hash,
+            tokenAddress: payout.tokenAddress,
+            reason: "token_scoped_funding_not_supported",
+          });
         }
       }
       // Native transfers are parked unconditionally — relevance is decided by
@@ -1219,7 +1255,13 @@ export class EvmAdapter implements ChainAdapter {
     if (hits.length > 0) void this.emitEvents(hits);
     if (retained.length === 0) return;
     for (const e of retained) this.indexFunding(e);
-    this.fundingBuffer.push({ block: entries[0]?.blockNumber ?? 0, entries: retained });
+    const byBlock = new Map<number, FundingEvent[]>();
+    for (const entry of retained) {
+      const group = byBlock.get(entry.blockNumber) ?? [];
+      group.push(entry);
+      byBlock.set(entry.blockNumber, group);
+    }
+    for (const [block, group] of [...byBlock.entries()].sort((a, b) => a[0] - b[0])) this.fundingBuffer.push({ block, entries: group });
     while (this.fundingBuffer.length > FUNDING_BUFFER_BLOCKS) {
       const head = this.fundingBuffer[0];
       if (!head) break;
@@ -1289,13 +1331,17 @@ export class EvmAdapter implements ChainAdapter {
   // ---- log handling -------------------------------------------------------------
 
   private toRaw(l: ViemLog): RawLog {
+    if (l.blockNumber == null || l.logIndex == null || l.transactionHash == null) {
+      throw new Error("provider log missing blockNumber, logIndex, or transactionHash");
+    }
     return {
       address: l.address.toLowerCase(),
       topics: l.topics as unknown as RawLog["topics"],
       data: l.data,
       blockNumber: Number(l.blockNumber),
-      logIndex: l.logIndex ?? 0,
-      transactionHash: l.transactionHash ?? "0x",
+      ...(l.transactionIndex != null ? { transactionIndex: l.transactionIndex } : {}),
+      logIndex: l.logIndex,
+      transactionHash: l.transactionHash,
     };
   }
 
@@ -1428,7 +1474,7 @@ export class EvmAdapter implements ChainAdapter {
     const markProgress = () => (this.lastProgressAt = Date.now());
     const emit = async (events: StandardEvent[]) => {
       if (events.length === 0) return;
-      events.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex || a.kind.localeCompare(b.kind));
+      events.sort((a, b) => a.blockNumber - b.blockNumber || (a.transactionIndex ?? Number.MAX_SAFE_INTEGER) - (b.transactionIndex ?? Number.MAX_SAFE_INTEGER) || a.logIndex - b.logIndex || a.kind.localeCompare(b.kind));
       await this.emitEvents(events);
     };
     const progress = async (phase: string, nextBlock: bigint) => {

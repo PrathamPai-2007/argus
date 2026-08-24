@@ -33,6 +33,7 @@ export class DashboardServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private sseClients = new Map<number, SseClient>();
   private nextSseId = 1;
+  private projectionVersion = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private readonly authToken = process.env.ARGUS_DASHBOARD_TOKEN ?? null;
 
@@ -149,6 +150,9 @@ export class DashboardServer {
     if (url.pathname === "/api/status") {
       return this.json(this.engine.status());
     }
+    if (url.pathname === "/api/snapshot") {
+      return this.json(this.snapshot());
+    }
     if (url.pathname === "/api/metrics") {
       return this.json(db.dashboardMetrics());
     }
@@ -172,11 +176,15 @@ export class DashboardServer {
     }
     if (url.pathname === "/api/alerts") {
       const limit = queryLimit(url.searchParams.get("limit"), 100);
+      const cursor = numericCursor(url.searchParams.get("cursor"));
+      if (url.searchParams.has("cursor")) return this.json(db.listAlertsPage(limit, cursor ?? undefined));
       return this.json(db.listAlerts(limit));
     }
     if (url.pathname === "/api/signals") {
       const chain = Number(url.searchParams.get("chain") ?? 0);
       const limit = queryLimit(url.searchParams.get("limit"), 50);
+      const cursor = numericCursor(url.searchParams.get("cursor"));
+      if (url.searchParams.has("cursor")) return this.json(db.listSignalsPage(limit, cursor ?? undefined, chain || undefined));
       return this.json(db.listSignals(chain || undefined, limit));
     }
     if (url.pathname === "/api/performance") {
@@ -184,6 +192,8 @@ export class DashboardServer {
       const token = url.searchParams.get("token")?.toLowerCase() as Address | undefined;
       const activeOnly = url.searchParams.get("active") === "1";
       const limit = queryLimit(url.searchParams.get("limit"), 100);
+      const cursor = numericCursor(url.searchParams.get("cursor"));
+      if (url.searchParams.has("cursor")) return this.json(db.listPerformancePage({ limit, ...(cursor !== null ? { beforeId: cursor } : {}), ...(chain ? { chainId: chain } : {}), ...(token ? { tokenAddress: token } : {}), activeOnly }));
       return this.json(db.listPerformanceSessions({ ...(chain ? { chainId: chain } : {}), ...(token ? { tokenAddress: token } : {}), activeOnly, limit }));
     }
     const tokenMatch = url.pathname.match(/^\/api\/token\/(\d+)\/(0x[0-9a-fA-F]{40})$/);
@@ -193,12 +203,27 @@ export class DashboardServer {
       }
       const chainId = Number(tokenMatch[1]);
       const token = tokenMatch[2]!.toLowerCase() as Address;
+      const tokenRow = db.getToken(chainId, token);
+      const eventData = db.tokenEventSummary(chainId, token);
+      const signals = db.listSignalsForToken(chainId, token, 100);
+      const alerts = db.listAlertsForToken(chainId, token, 50);
+      const pools = db.listPoolsForToken(chainId, token);
+      const graph = this.graphForToken(chainId, token) as { clusters?: unknown[]; funding?: unknown[]; circulatingSupply?: string | null };
+      const graphAvailable = (graph.clusters?.length ?? 0) > 0 || (graph.funding?.length ?? 0) > 0 || graph.circulatingSupply !== null;
       return this.json({
-        token: db.getToken(chainId, token),
-        signals: db.listSignalsForToken(chainId, token, 100),
-        alerts: db.listAlertsForToken(chainId, token, 50),
-        pools: db.listPoolsForToken(chainId, token),
+        token: tokenRow,
+        signals,
+        alerts,
+        pools,
         performance: db.listPerformanceSessions({ chainId, tokenAddress: token, limit: 50 }),
+        recentEvents: eventData.events,
+        recentEventSummary: eventData.summary,
+        availability: {
+          metadata: tokenRow !== null && (tokenRow.symbol !== null || tokenRow.decimals !== null || tokenRow.totalSupply !== null),
+          graph: graphAvailable,
+          history: eventData.summary.count > 0 || signals.length > 0 || alerts.length > 0,
+          events: eventData.summary.count > 0,
+        },
       });
     }
     const tokenGraphMatch = url.pathname.match(/^\/api\/graph\/token\/(\d+)\/(0x[0-9a-fA-F]{40})$/);
@@ -222,7 +247,12 @@ export class DashboardServer {
   }
 
   private broadcast(data: unknown): void {
-    const payload = safeJson(data);
+    this.projectionVersion++;
+    const refresh = data && typeof data === "object" && "type" in data && data.type !== "status"
+      ? { type: "refresh", reason: data.type, projectionVersion: this.projectionVersion }
+      : data;
+    const payload = safeJson(refresh);
+    // SSE retains the rich event contract; WebSocket clients use it only as a resync hint.
     for (const client of this.sseClients.values()) client.write(data);
     if (this.server) {
       this.server.publish("argus-live", payload);
@@ -306,6 +336,29 @@ export class DashboardServer {
     this.broadcast({ type: "status", t: Date.now(), status: this.engine.status() });
   }
 
+  private snapshot(): unknown {
+    const now = Math.floor(Date.now() / 1000);
+    const chains = this.engine.chainsForStatus();
+    const targetChains = chains.length > 0 ? chains : [1];
+    const tokens = targetChains.flatMap((chainId) => db.listWatchedTokens(chainId, now).map((t) => ({
+      ...t,
+      chainId,
+      lastAlert: db.lastAlertForToken(chainId, t.address),
+    })));
+    return {
+      projectionVersion: this.projectionVersion,
+      generatedAt: Date.now(),
+      status: this.engine.status(),
+      metrics: db.dashboardMetrics(now),
+      tokens,
+      alerts: db.listAlerts(100),
+      signals: db.listSignals(undefined, 50),
+      events: db.listRecentEvents(100),
+      performance: db.listPerformanceSessions({ limit: 100 }),
+      candidates: db.listCandidates(),
+    };
+  }
+
   private json(data: unknown, status = 200): Response {
     return new Response(safeJson(data), {
       status,
@@ -339,4 +392,10 @@ function authorized(req: Request, token: string): boolean {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+function numericCursor(value: string | null): number | null {
+  if (value === null || !/^\d+$/.test(value)) return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
 }

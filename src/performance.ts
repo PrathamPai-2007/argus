@@ -36,6 +36,9 @@ export interface PerformanceSession {
   last_poll_at: number | null;
   missing_observations: number;
   close_reason: string | null;
+  entry_source: string;
+  last_observation_source: string | null;
+  last_observation_block: number | null;
 }
 
 export interface PerformanceUpdate {

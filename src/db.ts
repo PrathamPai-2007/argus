@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { Address, AlertPayload, CandidateStatus, EventKind, Signal, StandardEvent, SwapEvent, TokenCandidate, TokenMeta } from "./types.ts";
+import type { Address, AlertPayload, CandidateStatus, EventKind, PerformanceWatchStatus, Severity, Signal, StandardEvent, SwapEvent, TokenCandidate, TokenMeta } from "./types.ts";
 import { log } from "./logger.ts";
 import type { PerformanceOutcome, PerformanceSession } from "./performance.ts";
 
@@ -78,9 +78,62 @@ export function markEventsFinalized(chainId: number, upToBlock: number): number 
   return Number(res.changes);
 }
 
+export function markSignalsFinalized(chainId: number, upToBlock: number): number {
+  const res = getDb().run(
+    "UPDATE signals SET finalized = 1 WHERE chain_id = ? AND finalized = 0 AND retracted = 0 AND block_number <= ?",
+    [chainId, upToBlock],
+  );
+  return Number(res.changes);
+}
+
 export function deleteUnfinalizedFrom(chainId: number, fromBlock: number): number {
   const res = getDb().run("DELETE FROM events WHERE chain_id = ? AND finalized = 0 AND block_number >= ?", [chainId, fromBlock]);
+  getDb().run("DELETE FROM failed_events WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
   return Number(res.changes);
+}
+
+export interface FailedEventRow { event: StandardEvent; graphApplied: boolean; attempts: number; }
+
+export function recordFailedEvent(event: StandardEvent, graphApplied: boolean, error?: unknown): void {
+  getDb().run(
+    `INSERT INTO failed_events (chain_id, block_number, log_index, type, payload_json, graph_applied, attempts, last_error)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+     ON CONFLICT(chain_id, block_number, log_index, type) DO UPDATE SET
+       graph_applied = excluded.graph_applied, attempts = failed_events.attempts + 1,
+       last_error = excluded.last_error, updated_at = unixepoch()`,
+    [event.chainId, event.blockNumber, event.logIndex, event.kind, eventPayload(event), graphApplied ? 1 : 0, error ? String(error) : null],
+  );
+}
+
+export function loadFailedEvents(chainId: number): FailedEventRow[] {
+  const rows = getDb().query("SELECT payload_json, graph_applied, attempts FROM failed_events WHERE chain_id = ? ORDER BY block_number, log_index").all(chainId) as { payload_json: string; graph_applied: number; attempts: number }[];
+  return rows.map((r) => ({ event: reviveEvent(JSON.parse(r.payload_json) as Record<string, unknown>), graphApplied: r.graph_applied === 1, attempts: r.attempts }));
+}
+
+export function clearFailedEvent(event: StandardEvent): void {
+  getDb().run("DELETE FROM failed_events WHERE chain_id = ? AND block_number = ? AND log_index = ? AND type = ?", [event.chainId, event.blockNumber, event.logIndex, event.kind]);
+}
+
+/** Rebuild SQL projections that are derived from finalized event facts. */
+export function rebuildDerivedProjections(chainId: number): void {
+  const d = getDb();
+  const facts = loadEvents(chainId, 0, Number.MAX_SAFE_INTEGER, { finalizedOnly: true });
+  d.transaction(() => {
+    d.run("DELETE FROM funding_edges WHERE chain_id = ?", [chainId]);
+    d.run("DELETE FROM wallets WHERE chain_id = ?", [chainId]);
+    d.run("DELETE FROM pools WHERE chain_id = ? AND factory <> 'dexscreener'", [chainId]);
+    d.run("DELETE FROM cluster_members WHERE chain_id = ?", [chainId]);
+    d.run("DELETE FROM clusters WHERE chain_id = ?", [chainId]);
+    for (const event of facts) {
+      if (event.kind === "funding") {
+        upsertWallet({ address: event.funded, chainId, firstSeenBlock: event.blockNumber, firstSeenAt: event.timestamp, funder: event.funder });
+        upsertWallet({ address: event.funder, chainId, firstSeenBlock: event.blockNumber, firstSeenAt: event.timestamp });
+        insertFundingEdge({ funder: event.funder, funded: event.funded, chainId, amount: event.amount, blockNumber: event.blockNumber, method: event.method, txHash: event.txHash, logIndex: event.logIndex });
+      } else if (event.kind === "pool_created") {
+        insertPool({ chainId, poolAddress: event.poolAddress, tokenAddress: event.token0, quoteToken: event.token1, factory: event.factory, createdBlock: event.blockNumber, createdTs: event.timestamp, token0: event.token0, token1: event.token1 });
+      }
+    }
+  })();
 }
 
 /** Remove durable projections created by a forked block range. */
@@ -92,9 +145,12 @@ export function deleteDerivedFrom(chainId: number, fromBlock: number): void {
       token_address: string;
     }[];
     d.run("DELETE FROM funding_edges WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
+    d.run("DELETE FROM failed_events WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
     d.run("DELETE FROM wallets WHERE chain_id = ? AND first_seen_block >= ?", [chainId, fromBlock]);
-    d.run("DELETE FROM signals WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
+    d.run("UPDATE signals SET retracted = 1 WHERE chain_id = ? AND block_number >= ?", [chainId, fromBlock]);
     d.run("DELETE FROM pools WHERE chain_id = ? AND created_block >= ?", [chainId, fromBlock]);
+    d.run("DELETE FROM cluster_members WHERE chain_id = ?", [chainId]);
+    d.run("DELETE FROM clusters WHERE chain_id = ?", [chainId]);
     for (const pool of pools) {
       d.run("DELETE FROM tokens WHERE chain_id = ? AND source = 'factory' AND address = ? AND NOT EXISTS (SELECT 1 FROM pools WHERE chain_id = ? AND token_address = ?)", [chainId, pool.token_address, chainId, pool.token_address]);
     }
@@ -106,7 +162,7 @@ export function loadEvents(chainId: number, fromBlock: number, toBlock: number, 
   const params: (string | number)[] = [chainId, fromBlock, toBlock];
   if (opts?.finalizedOnly) sql += " AND finalized = 1";
   if (opts?.kinds?.length) sql += ` AND type IN (${opts.kinds.map(() => "?").join(",")})`;
-  sql += " ORDER BY block_number, log_index";
+  sql += " ORDER BY block_number, COALESCE(json_extract(payload_json, '$.transactionIndex'), 2147483647), log_index";
   if (opts?.kinds?.length) params.push(...opts.kinds);
   const rows = getDb().query(sql).all(...params) as { payload_json: string }[];
   return rows.map((r) => reviveEvent(JSON.parse(r.payload_json, (_k, v) => v) as Record<string, unknown>) as StandardEvent);
@@ -116,7 +172,7 @@ export function latestSwapForToken(chainId: number, tokenAddress: Address): Swap
   const row = getDb().query(
     `SELECT payload_json FROM events
      WHERE chain_id = ? AND type = 'swap' AND json_extract(payload_json, '$.tokenAddress') = ?
-     ORDER BY block_number DESC, log_index DESC LIMIT 1`,
+      ORDER BY block_number DESC, COALESCE(json_extract(payload_json, '$.transactionIndex'), -1) DESC, log_index DESC LIMIT 1`,
   ).get(chainId, tokenAddress) as { payload_json: string } | null;
   return row ? reviveEvent(JSON.parse(row.payload_json) as Record<string, unknown>) as SwapEvent : null;
 }
@@ -173,14 +229,16 @@ export function getWallet(address: Address, chainId: number): WalletRow | null {
   return (getDb().query("SELECT * FROM wallets WHERE address = ? AND chain_id = ?").get(address, chainId) as WalletRow | null);
 }
 
-export function insertFundingEdge(e: { funder: Address; funded: Address; chainId: number; amount: bigint; blockNumber: number; method: string }): void {
-  getDb().run("INSERT INTO funding_edges (funder, funded, chain_id, amount, block_number, method) VALUES (?, ?, ?, ?, ?, ?)", [
+export function insertFundingEdge(e: { funder: Address; funded: Address; chainId: number; amount: bigint; blockNumber: number; method: string; txHash?: string; logIndex?: number }): void {
+  getDb().run("INSERT OR IGNORE INTO funding_edges (funder, funded, chain_id, amount, block_number, method, tx_hash, log_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
     e.funder,
     e.funded,
     e.chainId,
     e.amount.toString(),
     e.blockNumber,
     e.method,
+    e.txHash ?? "",
+    e.logIndex ?? -1,
   ]);
 }
 
@@ -209,9 +267,14 @@ export function listFundingEdgesForWallets(chainId: number, addresses: Address[]
   return rows.map((r) => ({ ...r, amount: BigInt(r.amount) }));
 }
 
-/** Remove only forkable work; durable facts and projections survive process restarts. */
+/** Remove forkable facts and invalidate projections derived from them on restart. */
 export function resetSessionData(): void {
-  getDb().run("DELETE FROM events WHERE finalized = 0");
+  const d = getDb();
+  d.transaction(() => {
+    d.run("DELETE FROM events WHERE finalized = 0");
+    d.run("UPDATE signals SET retracted = 1 WHERE finalized = 0 AND retracted = 0");
+    d.run("UPDATE alerts SET retracted = 1 WHERE confirmed = 0 AND retracted = 0");
+  })();
 }
 
 export interface ClusterMaterialized {
@@ -267,8 +330,11 @@ export function upsertToken(t: TokenMeta & { expiresAt?: number | null }): void 
 export interface DashboardMetrics {
   activeWatches: number;
   openAlerts: number;
+  unretractedAlerts: number;
   signalsToday: number;
   events24h: number;
+  signalOutcomes: Record<string, number>;
+  performanceWatches: Record<string, number>;
   performance: { active: number; targetHit: number; stopHit: number; expired: number; retracted: number };
   candidates: {
     total: number;
@@ -290,11 +356,23 @@ export function dashboardMetrics(nowSecs = Math.floor(Date.now() / 1000)): Dashb
   const activeWatches = Number((getDb().query(
     "SELECT COUNT(*) AS n FROM tokens WHERE source <> 'candidate' AND (expires_at IS NULL OR expires_at > ?)",
   ).get(nowSecs) as { n: number }).n);
-  const openAlerts = Number((getDb().query("SELECT COUNT(*) AS n FROM alerts WHERE retracted = 0").get() as { n: number }).n);
+  const unretractedAlerts = Number((getDb().query("SELECT COUNT(*) AS n FROM alerts WHERE retracted = 0").get() as { n: number }).n);
+  const openAlerts = Number((getDb().query(
+    `SELECT COUNT(*) AS n FROM alerts a
+     WHERE a.retracted = 0 AND NOT EXISTS (
+       SELECT 1 FROM alerts newer
+       WHERE newer.chain_id = a.chain_id AND newer.token_address = a.token_address
+         AND newer.retracted = 0 AND newer.id > a.id
+     )`,
+  ).get() as { n: number }).n);
   const signalsToday = Number((getDb().query("SELECT COUNT(*) AS n FROM signals WHERE created_at >= ?").get(nowSecs - 86_400) as { n: number }).n);
   const events24h = Number((getDb().query(
     "SELECT COUNT(*) AS n FROM events WHERE CAST(json_extract(payload_json, '$.timestamp') AS INTEGER) >= ?",
   ).get(nowSecs - 86_400) as { n: number }).n);
+  const signalOutcomes: Record<string, number> = {};
+  for (const row of getDb().query("SELECT outcome, COUNT(*) AS n FROM signal_evaluations GROUP BY outcome").all() as { outcome: string; n: number }[]) signalOutcomes[row.outcome] = Number(row.n);
+  const performanceWatches: Record<string, number> = {};
+  for (const row of getDb().query("SELECT performance_status, COUNT(*) AS n FROM alerts GROUP BY performance_status").all() as { performance_status: string; n: number }[]) performanceWatches[row.performance_status] = Number(row.n);
   const performanceRows = getDb().query("SELECT outcome, COUNT(*) AS n FROM performance_sessions GROUP BY outcome").all() as { outcome: string; n: number }[];
   const performance = { active: 0, targetHit: 0, stopHit: 0, expired: 0, retracted: 0 };
   for (const row of performanceRows) {
@@ -316,7 +394,7 @@ export function dashboardMetrics(nowSecs = Math.floor(Date.now() / 1000)): Dashb
   const total = candidates.length;
   const started = candidates.filter((c) => c.status !== "discovered").length;
   return {
-    activeWatches, openAlerts, signalsToday, events24h, performance,
+    activeWatches, openAlerts, unretractedAlerts, signalsToday, events24h, signalOutcomes, performanceWatches, performance,
     candidates: {
       total,
       discovered: candidates.filter((c) => c.status === "discovered").length,
@@ -518,6 +596,7 @@ export function loadLabels(chainId: number): Map<Address, { label: string; kind:
 // ---- Signals / alerts ---------------------------------------------------------
 
 type SignalRow = {
+  id: number;
   chain_id: number;
   token_address: Address;
   rule_id: string;
@@ -525,6 +604,15 @@ type SignalRow = {
   evidence_json: string;
   block_number: number;
   created_at: number;
+  source_tx_hash: string;
+  source_log_index: number;
+  finalized: number;
+  retracted: number;
+  evaluation_score?: number | null;
+  evaluation_severity?: string | null;
+  evaluation_outcome?: Signal["outcome"] | null;
+  evaluation_reason?: string | null;
+  evaluation_alert_id?: number | null;
 };
 
 function mapSignalRow(r: SignalRow): Signal {
@@ -536,20 +624,59 @@ function mapSignalRow(r: SignalRow): Signal {
     evidence: JSON.parse(r.evidence_json) as Record<string, unknown>,
     blockNumber: r.block_number,
     timestamp: r.created_at,
+    ...(r.source_tx_hash ? { sourceTxHash: r.source_tx_hash, sourceLogIndex: r.source_log_index } : {}),
+    ...(r.finalized === 1 ? { finalized: true } : {}),
+    ...(r.retracted === 1 ? { retracted: true } : {}),
+    ...(r.evaluation_score !== null && r.evaluation_score !== undefined ? { score: r.evaluation_score } : {}),
+    ...(r.evaluation_score !== null && r.evaluation_score !== undefined ? { severity: r.evaluation_severity as Severity | null } : {}),
+    ...(r.evaluation_outcome ? { outcome: r.evaluation_outcome } : {}),
+    ...(r.evaluation_score !== null && r.evaluation_score !== undefined ? { outcomeReason: r.evaluation_reason } : {}),
+    ...(r.evaluation_score !== null && r.evaluation_score !== undefined ? { alertId: r.evaluation_alert_id } : {}),
   };
 }
 
-export function insertSignal(s: Signal): number {
+export function insertSignal(s: Signal, source?: { txHash: string; logIndex: number }): number {
+  const sourceTxHash = source?.txHash ?? s.sourceTxHash ?? "";
+  const sourceLogIndex = source?.logIndex ?? s.sourceLogIndex ?? -1;
   const res = getDb().run(
-    "INSERT INTO signals (chain_id, token_address, rule_id, weight, evidence_json, block_number, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [s.chainId, s.tokenAddress, s.ruleId, s.weight, JSON.stringify(s.evidence), s.blockNumber, s.timestamp],
+    "INSERT OR IGNORE INTO signals (chain_id, token_address, rule_id, weight, evidence_json, block_number, created_at, source_tx_hash, source_log_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    [s.chainId, s.tokenAddress, s.ruleId, s.weight, JSON.stringify(s.evidence), s.blockNumber, s.timestamp, sourceTxHash, sourceLogIndex],
   );
-  return Number(res.lastInsertRowid);
+  return Number(res.changes) > 0 ? Number(res.lastInsertRowid) : 0;
+}
+
+export function recordSignalEvaluation(input: {
+  signalId: number;
+  score: number;
+  severity: Signal["severity"];
+  outcome: NonNullable<Signal["outcome"]>;
+  reason?: string | null;
+  alertId?: number | null;
+}): void {
+  getDb().run(
+    `INSERT INTO signal_evaluations (signal_id, score, severity, outcome, reason, alert_id)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(signal_id) DO UPDATE SET score = excluded.score, severity = excluded.severity,
+       outcome = excluded.outcome, reason = excluded.reason, alert_id = excluded.alert_id,
+       evaluated_at = unixepoch()`,
+    [input.signalId, input.score, input.severity ?? null, input.outcome, input.reason ?? null, input.alertId ?? null],
+  );
+}
+
+export function updateSignalEvaluation(signalId: number, input: {
+  outcome: NonNullable<Signal["outcome"]>;
+  reason?: string | null;
+  alertId?: number | null;
+}): void {
+  getDb().run(
+    "UPDATE signal_evaluations SET outcome = ?, reason = ?, alert_id = ?, evaluated_at = unixepoch() WHERE signal_id = ?",
+    [input.outcome, input.reason ?? null, input.alertId ?? null, signalId],
+  );
 }
 
 export function recentSignals(chainId: number, tokenAddress: Address, sinceSecs: number): Signal[] {
   const rows = getDb()
-    .query("SELECT * FROM signals WHERE chain_id = ? AND token_address = ? AND created_at >= ? ORDER BY created_at")
+    .query("SELECT * FROM signals WHERE chain_id = ? AND token_address = ? AND created_at >= ? AND retracted = 0 ORDER BY created_at")
     .all(chainId, tokenAddress, sinceSecs) as SignalRow[];
   return rows.map(mapSignalRow);
 }
@@ -560,6 +687,10 @@ export function insertAlert(p: AlertPayload, confirmed: boolean, blockNumber: nu
     [p.chainId, p.tokenAddress, p.score, p.severity, JSON.stringify(p), confirmed ? 1 : 0, blockNumber],
   );
   return Number(res.lastInsertRowid);
+}
+
+export function setAlertPerformanceStatus(alertId: number, status: PerformanceWatchStatus, reason: string | null = null): void {
+  getDb().run("UPDATE alerts SET performance_status = ?, performance_reason = ? WHERE id = ?", [status, reason, alertId]);
 }
 
 /** Confirm alerts whose triggering block is now final (block-scoped, PLAN.md §11.1).
@@ -601,10 +732,19 @@ export interface AlertRow {
   retracted: number;
   created_at: number;
   block_number: number | null;
+  performance_status: PerformanceWatchStatus;
+  performance_reason: string | null;
 }
 
 export function listAlerts(limit = 100): AlertRow[] {
   return getDb().query("SELECT * FROM alerts ORDER BY id DESC LIMIT ?").all(limit) as AlertRow[];
+}
+
+export function listAlertsPage(limit = 100, beforeId?: number): { items: AlertRow[]; nextCursor: string | null } {
+  const rows = (beforeId === undefined
+    ? getDb().query("SELECT * FROM alerts ORDER BY id DESC LIMIT ?").all(limit)
+    : getDb().query("SELECT * FROM alerts WHERE id < ? ORDER BY id DESC LIMIT ?").all(beforeId, limit)) as AlertRow[];
+  return { items: rows, nextCursor: rows.length === limit ? String(rows[rows.length - 1]!.id) : null };
 }
 
 export function listAlertsForToken(chainId: number, tokenAddress: Address, limit = 50): AlertRow[] {
@@ -649,12 +789,13 @@ export function createPerformanceSession(input: {
   openedAt: number;
   expiresAt: number;
   entryBlock: number;
+  entrySource?: string;
 }): number {
   const result = getDb().run(
     `INSERT OR IGNORE INTO performance_sessions
       (alert_id, chain_id, token_address, pool_address, quote_token, entry_price, current_price,
-       target_price, stop_price, opened_at, expires_at, outcome, entry_block, last_block, min_price, max_price)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+        target_price, stop_price, opened_at, expires_at, outcome, entry_block, last_block, min_price, max_price, entry_source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
     [
       input.alertId,
       input.chainId,
@@ -671,6 +812,7 @@ export function createPerformanceSession(input: {
       input.entryBlock,
       input.entryPrice.toString(),
       input.entryPrice.toString(),
+      input.entrySource ?? "swap",
     ],
   );
   if (Number(result.changes) > 0) return Number(result.lastInsertRowid);
@@ -700,6 +842,19 @@ export function listPerformanceSessions(opts: { chainId?: number; tokenAddress?:
   return (getDb().query(sql).all(...params) as PerformanceRow[]).map(mapPerformance);
 }
 
+export function listPerformancePage(opts: { limit?: number; beforeId?: number; chainId?: number; tokenAddress?: Address; activeOnly?: boolean } = {}): { items: PerformanceSession[]; nextCursor: string | null } {
+  const clauses: string[] = [];
+  const params: (string | number)[] = [];
+  if (opts.chainId !== undefined) { clauses.push("chain_id = ?"); params.push(opts.chainId); }
+  if (opts.tokenAddress !== undefined) { clauses.push("token_address = ?"); params.push(opts.tokenAddress); }
+  if (opts.activeOnly) clauses.push("outcome = 'active'");
+  if (opts.beforeId !== undefined) { clauses.push("id < ?"); params.push(opts.beforeId); }
+  const limit = opts.limit ?? 100;
+  params.push(limit);
+  const rows = getDb().query(`SELECT * FROM performance_sessions ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`).all(...params) as PerformanceRow[];
+  return { items: rows.map(mapPerformance), nextCursor: rows.length === limit ? String(rows[rows.length - 1]!.id) : null };
+}
+
 export function updatePerformanceSession(input: {
   id: number;
   outcome: PerformanceOutcome;
@@ -712,6 +867,8 @@ export function updatePerformanceSession(input: {
   lastPollAt?: number;
   missingObservations?: number;
   closeReason?: string | null;
+  observationSource?: string;
+  observationBlock?: number;
 }): void {
   getDb().run(
     `UPDATE performance_sessions
@@ -719,10 +876,13 @@ export function updatePerformanceSession(input: {
           closed_at = ?, updated_at = ?,
           last_poll_at = COALESCE(?, last_poll_at),
           missing_observations = COALESCE(?, missing_observations),
-          close_reason = COALESCE(?, close_reason)
-      WHERE id = ?`,
+           close_reason = COALESCE(?, close_reason)
+           ,last_observation_source = COALESCE(?, last_observation_source)
+           ,last_observation_block = COALESCE(?, last_observation_block)
+       WHERE id = ?`,
     [input.outcome, input.currentPrice.toString(), input.minPrice.toString(), input.maxPrice.toString(), input.lastBlock, input.closedAt, input.updatedAt,
-      input.lastPollAt ?? null, input.missingObservations ?? null, input.closeReason ?? null, input.id],
+      input.lastPollAt ?? null, input.missingObservations ?? null, input.closeReason ?? null,
+      input.observationSource ?? null, input.observationBlock ?? null, input.id],
   );
 }
 
@@ -757,17 +917,69 @@ export function retractPerformanceFrom(chainId: number, fromBlock: number): numb
 
 export function listSignals(chainId?: number, limit = 50): Signal[] {
   const rows = (chainId
-    ? getDb().query("SELECT * FROM signals WHERE chain_id = ? ORDER BY id DESC LIMIT ?").all(chainId, limit)
-    : getDb().query("SELECT * FROM signals ORDER BY id DESC LIMIT ?").all(limit)) as SignalRow[];
+    ? getDb().query("SELECT s.*, e.score AS evaluation_score, e.severity AS evaluation_severity, e.outcome AS evaluation_outcome, e.reason AS evaluation_reason, e.alert_id AS evaluation_alert_id FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.chain_id = ? AND s.retracted = 0 ORDER BY s.id DESC LIMIT ?").all(chainId, limit)
+    : getDb().query("SELECT s.*, e.score AS evaluation_score, e.severity AS evaluation_severity, e.outcome AS evaluation_outcome, e.reason AS evaluation_reason, e.alert_id AS evaluation_alert_id FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.retracted = 0 ORDER BY s.id DESC LIMIT ?").all(limit)) as SignalRow[];
   return rows.map(mapSignalRow);
 }
 
+export function listSignalsPage(limit = 50, beforeId?: number, chainId?: number): { items: Signal[]; nextCursor: string | null } {
+  const projection = "s.*, e.score AS evaluation_score, e.severity AS evaluation_severity, e.outcome AS evaluation_outcome, e.reason AS evaluation_reason, e.alert_id AS evaluation_alert_id";
+  const rows = (chainId !== undefined
+    ? beforeId === undefined
+      ? getDb().query(`SELECT ${projection} FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.chain_id = ? AND s.retracted = 0 ORDER BY s.id DESC LIMIT ?`).all(chainId, limit)
+      : getDb().query(`SELECT ${projection} FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.chain_id = ? AND s.retracted = 0 AND s.id < ? ORDER BY s.id DESC LIMIT ?`).all(chainId, beforeId, limit)
+    : beforeId === undefined
+      ? getDb().query(`SELECT ${projection} FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.retracted = 0 ORDER BY s.id DESC LIMIT ?`).all(limit)
+      : getDb().query(`SELECT ${projection} FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.retracted = 0 AND s.id < ? ORDER BY s.id DESC LIMIT ?`).all(beforeId, limit)) as SignalRow[];
+  return { items: rows.map(mapSignalRow), nextCursor: rows.length === limit ? String(rows[rows.length - 1]!.id) : null };
+}
+
 export function listSignalsForToken(chainId: number, tokenAddress: Address, limit = 100): Signal[] {
-  return (getDb().query("SELECT * FROM signals WHERE chain_id = ? AND token_address = ? ORDER BY id DESC LIMIT ?").all(chainId, tokenAddress, limit) as SignalRow[]).map(mapSignalRow);
+  return (getDb().query("SELECT s.*, e.score AS evaluation_score, e.severity AS evaluation_severity, e.outcome AS evaluation_outcome, e.reason AS evaluation_reason, e.alert_id AS evaluation_alert_id FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.chain_id = ? AND s.token_address = ? AND s.retracted = 0 ORDER BY s.id DESC LIMIT ?").all(chainId, tokenAddress, limit) as SignalRow[]).map(mapSignalRow);
 }
 
 export function listRecentEvents(limit = 100): { block_number: number; type: string; tx_hash: string; finalized: number }[] {
   return getDb()
     .query("SELECT block_number, type, tx_hash, finalized FROM events ORDER BY block_number DESC, log_index DESC LIMIT ?")
     .all(limit) as { block_number: number; type: string; tx_hash: string; finalized: number }[];
+}
+
+export interface TokenEventSummary {
+  count: number;
+  finalized: number;
+  latestBlock: number | null;
+  latestTimestamp: number | null;
+  kinds: Record<string, number>;
+}
+
+/** Bounded, persisted event evidence for a token deep-link. */
+export function tokenEventSummary(chainId: number, tokenAddress: Address, limit = 25): {
+  summary: TokenEventSummary;
+  events: { block_number: number; log_index: number; type: string; tx_hash: string; finalized: number; timestamp: number | null }[];
+} {
+  const d = getDb();
+  const rows = d.query(
+    `SELECT block_number, log_index, type, tx_hash, finalized,
+            CAST(json_extract(payload_json, '$.timestamp') AS INTEGER) AS timestamp
+       FROM events
+      WHERE chain_id = ? AND (
+        json_extract(payload_json, '$.tokenAddress') = ? OR
+        json_extract(payload_json, '$.address') = ?
+      )
+      ORDER BY block_number DESC, log_index DESC LIMIT ?`,
+  ).all(chainId, tokenAddress, tokenAddress, limit) as {
+    block_number: number; log_index: number; type: string; tx_hash: string; finalized: number; timestamp: number | null;
+  }[];
+  const kinds: Record<string, number> = {};
+  for (const row of rows) kinds[row.type] = (kinds[row.type] ?? 0) + 1;
+  return {
+    summary: {
+      count: rows.length,
+      finalized: rows.filter((row) => row.finalized === 1).length,
+      latestBlock: rows[0]?.block_number ?? null,
+      latestTimestamp: rows[0]?.timestamp ?? null,
+      kinds,
+    },
+    events: rows,
+  };
 }

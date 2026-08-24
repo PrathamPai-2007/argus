@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { fetchEtherscanLogs } from "../src/ingest/etherscan.ts";
+import { fetchBigQueryLogs } from "../src/ingest/bigquery.ts";
+import { probeArchiveDepthDetailed } from "../src/ingest/probe.ts";
 
 const originalFetch = globalThis.fetch;
 
@@ -74,5 +76,37 @@ describe("historical providers", () => {
         addresses: ["0x" + "aa".repeat(20)], topic0: ("0x" + "11".repeat(32)) as `0x${string}`, fromBlock: 100n, toBlock: 100n,
       }),
     ).rejects.toThrow(/Etherscan logs failed \(0xaa/);
+  });
+
+  test("rejects a provider row missing canonical identity", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ status: "1", message: "OK", result: [{
+      address: "0x" + "aa".repeat(20), topics: ["0x" + "11".repeat(32)], data: "0x", blockNumber: "100",
+      transactionHash: "0x" + "22".repeat(32), logIndex: "0",
+    }] }))) as unknown as typeof fetch;
+    await expect(fetchEtherscanLogs({
+      apiUrl: "https://example.test/api", apiKey: "secret", chainId: 1,
+      addresses: ["0x" + "aa".repeat(20)], topic0: ("0x" + "11".repeat(32)) as `0x${string}`, fromBlock: 100n, toBlock: 100n,
+    })).rejects.toThrow(/missing transactionIndex/);
+  });
+
+  test("rejects unsafe Etherscan query inputs before fetching", async () => {
+    await expect(fetchEtherscanLogs({
+      apiUrl: "https://example.test/api", apiKey: "secret", chainId: 1,
+      addresses: ["0x' OR 1=1 --" as `0x${string}`], topic0: ("0x" + "11".repeat(32)) as `0x${string}`, fromBlock: 1n, toBlock: 2n,
+    })).rejects.toThrow(/address is invalid/);
+  });
+
+  test("rejects unsafe BigQuery identifiers before reading credentials", async () => {
+    await expect(fetchBigQueryLogs({
+      projectId: "project", credentialsPath: "missing.json", dataset: "dataset` WHERE 1=1 --",
+      addresses: ["0x" + "aa".repeat(20)], topic0: ("0x" + "11".repeat(32)), fromBlock: 1n, toBlock: 2n,
+    })).rejects.toThrow(/dataset is invalid/);
+  });
+
+  test("distinguishes archive rejection from transient probe failure", async () => {
+    const archiveRejected = { getBlockNumber: async () => 1000n, getLogs: async () => { throw new Error("archive requests require a personal token"); } };
+    const transient = { getBlockNumber: async () => 1000n, getLogs: async () => { throw new Error("temporary network timeout"); } };
+    expect(await probeArchiveDepthDetailed(archiveRejected as never)).toEqual({ supported: false, maxDepth: 128 });
+    expect(await probeArchiveDepthDetailed(transient as never)).toEqual({ supported: null, maxDepth: 100_000 });
   });
 });

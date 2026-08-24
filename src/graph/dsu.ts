@@ -11,9 +11,11 @@
 export class RollbackDSU {
   private parent = new Map<string, string>();
   private size = new Map<string, number>();
+  private children = new Map<string, Set<string>>();
   private keys = new Set<string>();
   /** Each entry: [childRoot, parentRoot] — before the union, childRoot was its own root. */
   private ops: Array<[string, string, string[]]> = [];
+  private opsBase = 0;
   private _components = 0;
 
   private ensure(x: string): void {
@@ -48,6 +50,7 @@ export class RollbackDSU {
         this.parent.delete(key);
         this.size.delete(key);
         this.keys.delete(key);
+        this.children.delete(key);
         this._components--;
       }
       return false;
@@ -60,6 +63,14 @@ export class RollbackDSU {
     }
     this.parent.set(rb, ra);
     this.size.set(ra, sa + sb);
+    
+    let rChildren = this.children.get(ra);
+    if (!rChildren) {
+      rChildren = new Set();
+      this.children.set(ra, rChildren);
+    }
+    rChildren.add(rb);
+    
     this.ops.push([rb, ra, created]);
     this._components--;
     return true;
@@ -67,25 +78,81 @@ export class RollbackDSU {
 
   /** Current operation-stack depth — a restore point for rollback(). */
   mark(): number {
-    return this.ops.length;
+    return this.opsBase + this.ops.length;
   }
 
   /** Undo all unions applied since `m`. */
   rollback(m: number): void {
-    while (this.ops.length > m) {
+    while (this.opsBase + this.ops.length > m) {
       const op = this.ops.pop();
       if (!op) break;
       const [childRoot, parentRoot, created] = op;
       const ps = this.size.get(parentRoot) as number;
       const cs = this.size.get(childRoot) as number;
       this.parent.set(childRoot, childRoot);
+      this.children.get(parentRoot)?.delete(childRoot);
       this.size.set(parentRoot, ps - cs);
       this._components++;
       for (const key of created) {
         this.parent.delete(key);
         this.size.delete(key);
         this.keys.delete(key);
+        this.children.delete(key);
         this._components--;
+      }
+    }
+  }
+
+  /** Permanently discard undo history prior to mark `m`. */
+  finalize(m: number): void {
+    const keep = this.opsBase + this.ops.length - m;
+    if (keep < this.ops.length && keep >= 0) {
+      const drop = this.ops.length - keep;
+      this.ops = this.ops.slice(drop);
+      this.opsBase += drop;
+    }
+  }
+
+  /** Garbage collect unreferenced leaf wallets to stop unbounded memory growth. */
+  prune(activeKeys: Set<string>): void {
+    const lockedKeys = new Set<string>();
+    for (const op of this.ops) {
+      lockedKeys.add(op[0]);
+      lockedKeys.add(op[1]);
+      for (const c of op[2]) lockedKeys.add(c);
+    }
+    
+    let pruned = true;
+    while (pruned) {
+      pruned = false;
+      for (const k of this.keys) {
+        if (!activeKeys.has(k) && !lockedKeys.has(k)) {
+          const ch = this.children.get(k);
+          if (!ch || ch.size === 0) {
+            const p = this.parent.get(k);
+            if (p && p !== k) {
+              this.children.get(p)?.delete(k);
+              
+              let curr = k;
+              while (true) {
+                const parentNode = this.parent.get(curr);
+                if (parentNode && parentNode !== curr) {
+                  this.size.set(parentNode, (this.size.get(parentNode) ?? 1) - 1);
+                  curr = parentNode;
+                } else {
+                  break;
+                }
+              }
+            } else {
+              this._components--;
+            }
+            this.parent.delete(k);
+            this.size.delete(k);
+            this.children.delete(k);
+            this.keys.delete(k);
+            pruned = true;
+          }
+        }
       }
     }
   }
@@ -98,24 +165,27 @@ export class RollbackDSU {
     return this.size.get(this.find(x)) as number;
   }
 
-  /** All members of x's set. O(n·depth) — call at alert time, not per event. */
+  /** All members of x's set. O(cluster size) using children DFS. */
   members(x: string): string[] {
     const root = this.find(x);
     const out: string[] = [];
-    for (const k of this.keys) if (this.find(k) === root) out.push(k);
+    const stack = [root];
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      out.push(cur);
+      const ch = this.children.get(cur);
+      if (ch) {
+        for (const child of ch) stack.push(child);
+      }
+    }
     return out;
   }
 
-  /** Members of each requested root, grouped in ONE O(n·depth) pass (not per-root). */
+  /** Members of each requested root, grouped in ONE pass. */
   membersFor(roots: ReadonlySet<string>): Map<string, string[]> {
     const out = new Map<string, string[]>();
-    for (const k of this.keys) {
-      const r = this.find(k);
-      if (roots.has(r)) {
-        const arr = out.get(r);
-        if (arr) arr.push(k);
-        else out.set(r, [k]);
-      }
+    for (const r of roots) {
+      out.set(r, this.members(r));
     }
     return out;
   }
@@ -134,15 +204,32 @@ export class RollbackDSU {
   }
 
   /** Export raw state for snapshots. */
-  toJSON(): { parent: Record<string, string>; size: Record<string, number>; ops: [string, string, string[]][] } {
-    return { parent: Object.fromEntries(this.parent), size: Object.fromEntries(this.size), ops: [...this.ops] };
+  toJSON(): { parent: Record<string, string>; size: Record<string, number>; children: Record<string, string[]>; opsBase: number; ops: [string, string, string[]][] } {
+    const serializedChildren: Record<string, string[]> = {};
+    for (const [k, v] of this.children) serializedChildren[k] = [...v];
+    return { parent: Object.fromEntries(this.parent), size: Object.fromEntries(this.size), children: serializedChildren, opsBase: this.opsBase, ops: [...this.ops] };
   }
 
-  static fromJSON(j: { parent: Record<string, string>; size: Record<string, number>; ops: [string, string, string[]][] }): RollbackDSU {
+  static fromJSON(j: { parent: Record<string, string>; size: Record<string, number>; children?: Record<string, string[]>; opsBase?: number; ops: [string, string, string[]][] }): RollbackDSU {
     const d = new RollbackDSU();
     d.parent = new Map(Object.entries(j.parent));
     d.size = new Map(Object.entries(j.size));
     d.keys = new Set(d.parent.keys());
+    if (j.children) {
+      for (const [k, v] of Object.entries(j.children)) {
+        d.children.set(k, new Set(v));
+      }
+    } else {
+      // Reconstruct children from parent mapping for legacy snapshots
+      for (const [k, p] of d.parent) {
+        if (k !== p) {
+          let ch = d.children.get(p);
+          if (!ch) { ch = new Set(); d.children.set(p, ch); }
+          ch.add(k);
+        }
+      }
+    }
+    d.opsBase = j.opsBase ?? 0;
     d.ops = j.ops.map(([a, b, created]) => [a, b, created ?? []] as [string, string, string[]]);
     let comps = 0;
     for (const [k, v] of d.parent) if (k === v) comps++;

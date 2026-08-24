@@ -17,9 +17,18 @@ export class AlertManager {
     private sinks: AlertSink[],
   ) {}
 
+  updateConfig(alertsCfg: AlertsConfig, scoringCfg: ScoringConfig): void {
+    this.alertsCfg = alertsCfg;
+    this.scoringCfg = scoringCfg;
+  }
+
   /** Returns the new alert id, or null if suppressed. */
   async maybeAlert(payload: AlertPayload, confirmed: boolean): Promise<number | null> {
-    if (payload.score < this.scoringCfg.info) return null;
+    return (await this.maybeAlertDetailed(payload, confirmed)).id;
+  }
+
+  async maybeAlertDetailed(payload: AlertPayload, confirmed: boolean): Promise<{ id: number | null; reason: string | null }> {
+    if (payload.score < this.scoringCfg.info) return { id: null, reason: "below_info_threshold" };
     const now = Math.floor(Date.now() / 1000);
 
     const last = lastAlertForToken(payload.chainId, payload.tokenAddress);
@@ -33,22 +42,23 @@ export class AlertManager {
       const newCritical = payload.severity === "critical" && lastPayloadSev !== "critical";
       
       if (inCooldown) {
-        if (!newCritical) {
+        const escalated = payload.score >= last.score + this.alertsCfg.escalationDelta;
+        if (!newCritical && !escalated) {
           log.debug("alert suppressed by cooldown", { token: payload.tokenAddress, score: payload.score, lastScore: last.score, timeSinceLast });
-          return null;
+          return { id: null, reason: "cooldown" };
         }
         log.info("alert escalation inside cooldown", { token: payload.tokenAddress, from: last.score, to: payload.score });
       } else {
         if (payload.score <= last.score && payload.severity === lastPayloadSev) {
           log.debug("alert suppressed (score didn't increase)", { token: payload.tokenAddress, score: payload.score });
-          return null;
+           return { id: null, reason: "score_not_increased" };
         }
       }
     }
 
     if (payload.severity !== "critical" && alertsInLastMinute() >= this.alertsCfg.maxAlertsPerMinute) {
       log.warn("alert suppressed by global rate limit", { token: payload.tokenAddress, score: payload.score });
-      return null;
+      return { id: null, reason: "global_rate_limit" };
     }
 
     const id = insertAlert(payload, confirmed, payload.signals.length > 0 ? Math.max(...payload.signals.map((s) => s.blockNumber)) : null);
@@ -60,7 +70,7 @@ export class AlertManager {
         log.error("alert sink failed", { sink: sink.name, err });
       }
     }
-    return id;
+    return { id, reason: null };
   }
 
   /** Retract unconfirmed alerts at or after the reorg boundary. */

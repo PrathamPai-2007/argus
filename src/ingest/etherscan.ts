@@ -18,7 +18,20 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const INITIAL_RANGE_BLOCKS = 256n;
 
 function asNumber(value: string): number {
-  return value.startsWith("0x") ? Number.parseInt(value, 16) : Number(value);
+  const n = value.startsWith("0x") ? Number.parseInt(value, 16) : Number(value);
+  if (!Number.isSafeInteger(n) || n < 0) throw new Error(`Etherscan log has invalid numeric field: ${value}`);
+  return n;
+}
+
+function required(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Etherscan log missing ${field}`);
+  return value;
+}
+
+function validateQuery(args: { addresses: Address[]; topic0: string; fromBlock: bigint; toBlock: bigint }): void {
+  if (args.fromBlock < 0n || args.toBlock < args.fromBlock) throw new Error("Etherscan log range is invalid");
+  if (args.addresses.length === 0 || args.addresses.some((a) => !/^0x[0-9a-f]{40}$/i.test(a))) throw new Error("Etherscan log address is invalid");
+  if (!/^0x[0-9a-f]{64}$/i.test(args.topic0)) throw new Error("Etherscan topic0 is invalid");
 }
 
 export async function fetchEtherscanLogs(args: {
@@ -33,6 +46,7 @@ export async function fetchEtherscanLogs(args: {
   signal?: AbortSignal;
   onRequest?: () => void;
 }): Promise<ViemLog[]> {
+  validateQuery(args);
   const out: ViemLog[] = [];
   const delay = Math.ceil(1000 / Math.max(1, args.requestsPerSecond ?? 3));
   let requestCount = 0;
@@ -83,14 +97,18 @@ export async function fetchEtherscanLogs(args: {
         throw new Error(`Etherscan logs failed (${address} ${fromBlock}..${toBlock}): ${body.message ?? "invalid response"}${detail}`);
       }
       for (const row of body.result) {
+        const blockNumber = asNumber(required(row.blockNumber, "blockNumber"));
+        const transactionHash = required(row.transactionHash, "transactionHash");
+        const transactionIndex = asNumber(required(row.transactionIndex, "transactionIndex"));
+        const logIndex = asNumber(required(row.logIndex, "logIndex"));
         rangeLogs.push({
           address: row.address as `0x${string}`,
           topics: row.topics as `0x${string}`[],
           data: row.data as `0x${string}`,
-          blockNumber: BigInt(asNumber(row.blockNumber)),
-          transactionHash: row.transactionHash as `0x${string}`,
-          transactionIndex: asNumber(row.transactionIndex),
-          logIndex: asNumber(row.logIndex),
+          blockNumber: BigInt(blockNumber),
+          transactionHash: transactionHash as `0x${string}`,
+          transactionIndex,
+          logIndex,
           ...(row.timeStamp ? { blockTimestamp: asNumber(row.timeStamp) } : {}),
         } as unknown as ViemLog);
       }
@@ -102,5 +120,5 @@ export async function fetchEtherscanLogs(args: {
   for (const address of args.addresses) {
     out.push(...await fetchRange(address, args.fromBlock, args.toBlock));
   }
-  return out;
+  return out.sort((a, b) => Number((a.blockNumber ?? 0n) - (b.blockNumber ?? 0n)) || (a.transactionIndex ?? 0) - (b.transactionIndex ?? 0) || (a.logIndex ?? 0) - (b.logIndex ?? 0));
 }

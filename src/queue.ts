@@ -14,7 +14,7 @@ export class EventQueue<T> {
   private warnEvery = 0;
   dropped = 0;
 
-  constructor(readonly capacity = 50_000, weight: (item: T) => number = () => 1) {
+  constructor(readonly capacity = 50_000, weight: (item: T) => number = () => 1, private readonly onDrop?: (item: T) => void) {
     if (capacity < 16) throw new Error("queue capacity too small");
     this.buf = new Array<T | undefined>(capacity);
     this.weight = weight;
@@ -28,6 +28,7 @@ export class EventQueue<T> {
     const itemWeight = Math.max(1, this.weight(item));
     if (itemWeight > this.capacity) {
       this.dropped += itemWeight;
+      this.onDrop?.(item);
       return;
     }
     while (this.size + itemWeight > this.capacity) {
@@ -37,6 +38,7 @@ export class EventQueue<T> {
       this.head = (this.head + 1) % this.capacity;
       this.size -= this.weight(dropped);
       this.dropped += this.weight(dropped);
+      this.onDrop?.(dropped);
       if (this.dropped - this.warnEvery >= 1000) {
         this.warnEvery = this.dropped;
         log.warn("event queue overflow — dropping oldest events", { dropped: this.dropped, capacity: this.capacity });

@@ -165,7 +165,7 @@ export class GraphEngine {
   private clusterBalances = new Map<Address, Map<Address, bigint>>(); 
   private clusterTokens = new Map<Address, Set<Address>>(); 
 
-  private history: Array<{ block: number; undo: UndoFn }> = [];
+  private history: Array<{ block: number; dsuMark: number; undo: UndoFn }> = [];
 
   constructor(private tuning: GraphTuning = DEFAULT_GRAPH_TUNING) {}
 
@@ -208,7 +208,7 @@ export class GraphEngine {
     }
   }
 
-  prune(activeTokens: Set<Address>): void {
+  prune(activeTokens: Set<Address>, activePools?: Set<Address>): void {
     const activeWallets = new Set<Address>();
     
     for (const [token, ledger] of this.balances) {
@@ -225,6 +225,18 @@ export class GraphEngine {
       }
     }
 
+    if (activePools) {
+      for (const pool of this.pools) {
+        if (!activePools.has(pool)) {
+          this.pools.delete(pool);
+          this.poolCreated.delete(pool);
+          this.lpMinted.delete(pool);
+          this.burned.delete(pool);
+        }
+      }
+    }
+
+    this.swapVolume = this.swapVolume.filter((s) => activeTokens.has(s.token));
     this.buys = this.buys.filter((b) => activeTokens.has(b.token));
     this.buysByToken.clear();
     this.tokensBoughtByWallet.clear();
@@ -254,6 +266,20 @@ export class GraphEngine {
         this.fundingDegree.delete(addr);
       }
     }
+
+    for (const [addr, list] of this.exchangeFundings) {
+      const filtered = list.filter((f) => activeWallets.has(f.funded));
+      if (filtered.length === 0) this.exchangeFundings.delete(addr);
+      else this.exchangeFundings.set(addr, filtered);
+    }
+
+    for (const [key, list] of this.fundingAmountIndex) {
+      const filtered = list.filter((f) => activeWallets.has(f.funded) || activeWallets.has(f.funder));
+      if (filtered.length === 0) this.fundingAmountIndex.delete(key);
+      else this.fundingAmountIndex.set(key, filtered);
+    }
+
+    this.dsu.prune(activeWallets);
   }
 
   // ---- label / pool / metadata administration ---------------------------------
@@ -333,7 +359,7 @@ export class GraphEngine {
   }
 
   private pushUndo(block: number, undo: UndoFn): void {
-    this.history.push({ block, undo });
+    this.history.push({ block, dsuMark: this.dsu.mark(), undo });
   }
 
   private ensureWallet(addr: Address, block: number, ts: number, funder: Address | null, undos: UndoFn[]): WalletRec {
@@ -604,7 +630,13 @@ export class GraphEngine {
   /** Blocks ≤ boundary are final: their undo history can be discarded. */
   finalize(boundary: number, nowTs?: number): number {
     const before = this.history.length;
+    let maxDsuMark = -1;
+    for (const h of this.history) {
+      if (h.block <= boundary && h.dsuMark > maxDsuMark) maxDsuMark = h.dsuMark;
+    }
+    
     this.history = this.history.filter((h) => h.block > boundary);
+    if (maxDsuMark >= 0) this.dsu.finalize(maxDsuMark);
 
     // prune stale rolling windows (buys/sends/indices older than 24h are useless to rules)
     let maxTs = nowTs ?? 0;

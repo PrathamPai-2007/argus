@@ -5,6 +5,7 @@ export type Address = string; // lowercase 0x-prefixed
 export interface BaseEvent {
   chainId: number;
   blockNumber: number;
+  transactionIndex?: number;
   logIndex: number;
   txHash: string;
   timestamp: number; // unix seconds
@@ -54,6 +55,7 @@ export type EventKind = StandardEvent["kind"];
 export type RuleId = "R1" | "R2" | "R3" | "R4" | "R5" | "R6" | "R7" | "R8";
 
 export interface Signal {
+  id?: number;
   chainId: number;
   tokenAddress: Address;
   ruleId: RuleId;
@@ -61,6 +63,15 @@ export interface Signal {
   evidence: Record<string, unknown>;
   blockNumber: number;
   timestamp: number;
+  sourceTxHash?: string | null;
+  sourceLogIndex?: number | null;
+  finalized?: boolean;
+  retracted?: boolean;
+  score?: number;
+  severity?: Severity | null;
+  outcome?: "below_threshold" | "alert_created" | "alert_suppressed";
+  outcomeReason?: string | null;
+  alertId?: number | null;
 }
 
 export type Severity = "info" | "alert" | "critical";
@@ -82,6 +93,16 @@ export interface AlertRecord extends AlertPayload {
   retracted: boolean;
   createdAt: number;
 }
+
+export type PerformanceWatchStatus =
+  | "pending"
+  | "evaluating"
+  | "opened"
+  | "skipped_stale_swap"
+  | "skipped_no_pool"
+  | "skipped_invalid_price"
+  | "skipped_liquidity_unavailable"
+  | "provider_error";
 
 // ---- Token metadata ---------------------------------------------------------
 

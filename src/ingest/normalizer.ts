@@ -9,6 +9,7 @@ export interface RawLog {
   topics: Hex[];
   data: Hex;
   blockNumber: number;
+  transactionIndex?: number;
   logIndex: number;
   transactionHash: Hex;
 }
@@ -21,9 +22,21 @@ function topicToAddress(topic: Hex): Address {
   return ("0x" + topic.slice(26)).toLowerCase();
 }
 
+function validHex(value: unknown, bytes?: number): value is Hex {
+  return typeof value === "string" && /^0x[0-9a-f]*$/i.test(value) && value.length % 2 === 0 && (bytes === undefined || value.length === 2 + bytes * 2);
+}
+
+function validRawLog(log: RawLog, dataBytes: number, topicCount: number): boolean {
+  return validHex(log.address, 20) && validHex(log.transactionHash, 32) &&
+    Number.isSafeInteger(log.blockNumber) && log.blockNumber >= 0 &&
+    Number.isSafeInteger(log.logIndex) && log.logIndex >= 0 &&
+    (log.transactionIndex === undefined || (Number.isSafeInteger(log.transactionIndex) && log.transactionIndex >= 0)) &&
+    Array.isArray(log.topics) && log.topics.length === topicCount && log.topics.every((topic) => validHex(topic, 32)) && validHex(log.data, dataBytes);
+}
+
 /** ERC-20 Transfer log → StandardTransferEvent. Returns null for non-Transfer or ERC-721 (4 topics). */
 export function normalizeTransfer(log: RawLog, chainId: number, timestamp: number, tokenAddress?: Address): StandardTransferEvent | null {
-  if (log.topics.length !== 3 || log.topics[0] !== ERC20_TRANSFER_TOPIC) return null;
+  if (!validRawLog(log, 32, 3) || log.topics[0]?.toLowerCase() !== ERC20_TRANSFER_TOPIC) return null;
   return {
     kind: "transfer",
     chainId,
@@ -33,6 +46,7 @@ export function normalizeTransfer(log: RawLog, chainId: number, timestamp: numbe
     amount: BigInt(log.data),
     txHash: log.transactionHash,
     blockNumber: log.blockNumber,
+    ...(log.transactionIndex === undefined ? {} : { transactionIndex: log.transactionIndex }),
     logIndex: log.logIndex,
     timestamp,
   };
@@ -40,7 +54,7 @@ export function normalizeTransfer(log: RawLog, chainId: number, timestamp: numbe
 
 /** Uniswap V2-style factory PairCreated log → PoolCreatedEvent. */
 export function normalizePairCreated(log: RawLog, chainId: number, factoryName: string, timestamp: number): PoolCreatedEvent | null {
-  if (log.topics.length !== 3 || log.topics[0] !== UNIV2_PAIR_CREATED_TOPIC) return null;
+  if (!validRawLog(log, 64, 3) || log.topics[0]?.toLowerCase() !== UNIV2_PAIR_CREATED_TOPIC) return null;
   // data = abi.encode(address pair, uint256)
   const pair = ("0x" + (log.data as string).slice(26, 66)).toLowerCase();
   return {
@@ -52,6 +66,7 @@ export function normalizePairCreated(log: RawLog, chainId: number, factoryName: 
     token1: topicToAddress(log.topics[2] as Hex),
     txHash: log.transactionHash,
     blockNumber: log.blockNumber,
+    ...(log.transactionIndex === undefined ? {} : { transactionIndex: log.transactionIndex }),
     logIndex: log.logIndex,
     timestamp,
   };
@@ -70,7 +85,7 @@ export function normalizeSwap(
   watchedIsToken0: boolean,
   timestamp: number,
 ): SwapEvent | null {
-  if (log.topics.length !== 3 || log.topics[0] !== UNIV2_SWAP_TOPIC) return null;
+  if (!validRawLog(log, 128, 3) || log.topics[0]?.toLowerCase() !== UNIV2_SWAP_TOPIC) return null;
   const data = log.data as string;
   const amount0In = BigInt("0x" + data.slice(2, 66));
   const amount1In = BigInt("0x" + data.slice(66, 130));
@@ -95,6 +110,7 @@ export function normalizeSwap(
       quoteAmount: quoteIn,
       txHash: log.transactionHash,
       blockNumber: log.blockNumber,
+      ...(log.transactionIndex === undefined ? {} : { transactionIndex: log.transactionIndex }),
       logIndex: log.logIndex,
       timestamp,
     };
@@ -111,6 +127,7 @@ export function normalizeSwap(
       quoteAmount: quoteOut,
       txHash: log.transactionHash,
       blockNumber: log.blockNumber,
+      ...(log.transactionIndex === undefined ? {} : { transactionIndex: log.transactionIndex }),
       logIndex: log.logIndex,
       timestamp,
     };
@@ -151,6 +168,7 @@ export interface DispersePayout {
   recipients: Address[];
   values: bigint[];
   kind: "ether" | "token";
+  tokenAddress?: Address;
 }
 
 /** Decode disperseEther/disperseToken calldata. Returns null if not a disperse call. */
@@ -163,8 +181,8 @@ export function decodeDisperseCalldata(input: Hex): DispersePayout | null {
       const [recipients, values] = decoded.args as [Address[], bigint[]];
       return { recipients: recipients.map((r) => r.toLowerCase()), values: [...values], kind: "ether" };
     }
-    const [, recipients, values] = decoded.args as [Address, Address[], bigint[]];
-    return { recipients: recipients.map((r) => r.toLowerCase()), values: [...values], kind: "token" };
+    const [token, recipients, values] = decoded.args as [Address, Address[], bigint[]];
+    return { recipients: recipients.map((r) => r.toLowerCase()), values: [...values], kind: "token", tokenAddress: token.toLowerCase() };
   } catch {
     return null;
   }

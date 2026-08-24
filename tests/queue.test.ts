@@ -30,4 +30,12 @@ describe("EventQueue", () => {
     expect(q.dropped).toBe(15);
     expect(q.drain()).toEqual([{ id: 2, events: [16, 17] }]);
   });
+
+  test("reports the chain-bearing item that overflow dropped", () => {
+    const dropped: number[] = [];
+    const q = new EventQueue<{ chainId: number }>(16, () => 1, (item) => dropped.push(item.chainId));
+    q.push({ chainId: 1 });
+    for (let i = 0; i < 16; i++) q.push({ chainId: 2 });
+    expect(dropped).toEqual([1]);
+  });
 });

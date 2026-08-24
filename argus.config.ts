@@ -34,11 +34,11 @@ export default {
   // Candidates are evaluated with targeted history before they become live watches.
   candidateDiscovery: {
     enabled: true,
-    maxCandidatesPerCycle: 25,
-    evaluationMinutes: 30,
+    maxCandidatesPerCycle: 10,
+    evaluationMinutes: 15,
     candidateTtlHours: 24,
-    promotionScore: 35,
-    minimumLiquidityUsd: 10_000,
+    promotionScore: 25,
+    minimumLiquidityUsd: 5_000,
     minimumIndependentBuyers: 2,
   },
 
@@ -46,19 +46,19 @@ export default {
   volumeRanking: { pollMinutes: 5, topN: 10, backfillHours: 1 },
 
   rules: {
-    R1: { enabled: true, supplyPct: 15, windowHours: 2, walletAgeDays: 7, weight: 35 },
-    R2: { enabled: true, volumeSpikePct: 300, windowMinutes: 15, weight: 25 },
-    R3: { enabled: true, minRecipients: 10, windowMinutes: 15, weight: 30 },
-    R4: { enabled: true, warnPct: 10, critPct: 20, critWeight: 45, weight: 30 },
-    R5: { enabled: true, minBuyers: 5, walletAgeDays: 7, weight: 25 },
-    R6: { enabled: true, maxHops: 2, minClusterPct: 1, weight: 50 },
-    R7: { enabled: true, minLockedPct: 30, minPoolAgeHours: 48, weight: 20 },
-    R8: { enabled: true, minWallets: 3, windowMinutes: 60, weight: 20 },
+    R1: { enabled: true, supplyPct: 8, windowHours: 4, walletAgeDays: 14, weight: 35 },
+    R2: { enabled: true, volumeSpikePct: 150, windowMinutes: 30, weight: 25 },
+    R3: { enabled: true, minRecipients: 5, windowMinutes: 30, weight: 30 },
+    R4: { enabled: true, warnPct: 6, critPct: 12, critWeight: 45, weight: 30 },
+    R5: { enabled: true, minBuyers: 3, walletAgeDays: 14, weight: 25 },
+    R6: { enabled: true, maxHops: 3, minClusterPct: 0.5, weight: 50 },
+    R7: { enabled: true, minLockedPct: 50, minPoolAgeHours: 24, weight: 20 },
+    R8: { enabled: true, minWallets: 2, windowMinutes: 120, weight: 20 },
   },
 
-  scoring: { info: 40, alert: 60, critical: 80, signalWindowHours: 6 },
+  scoring: { info: 25, alert: 50, critical: 75, signalWindowHours: 6 },
 
-  alerts: { telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID), cooldownMinutes: 30, escalationDelta: 20, maxAlertsPerMinute: 10 },
+  alerts: { telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID), cooldownMinutes: 15, escalationDelta: 10, maxAlertsPerMinute: 20 },
 
   dashboard: { port: 3737 },
 

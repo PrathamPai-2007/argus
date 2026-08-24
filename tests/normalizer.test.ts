@@ -38,7 +38,15 @@ describe("normalizeTransfer", () => {
     expect(evt?.amount).toBe(1000n);
     expect(evt?.blockNumber).toBe(19_000_000);
     expect(evt?.logIndex).toBe(7);
+    expect(evt?.transactionIndex).toBeUndefined();
     expect(evt?.timestamp).toBe(1_700_000_000);
+  });
+
+  test("preserves transaction index and rejects malformed payloads", () => {
+    const log = transferLog({ transactionIndex: 3 });
+    expect(normalizeTransfer(log, 1, 0)?.transactionIndex).toBe(3);
+    expect(normalizeTransfer(transferLog({ data: "0x12" }), 1, 0)).toBeNull();
+    expect(normalizeTransfer(transferLog({ transactionHash: "0x" }), 1, 0)).toBeNull();
   });
 
   test("rejects wrong topic", () => {
@@ -171,6 +179,7 @@ describe("decodeDisperseCalldata", () => {
     const out = decodeDisperseCalldata(data);
     expect(out?.kind).toBe("token");
     expect(out?.recipients).toEqual([A]);
+    expect(out?.tokenAddress).toBe(TOKEN);
   });
 
   test("returns null for unrelated calldata", () => {

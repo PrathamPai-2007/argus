@@ -49,9 +49,12 @@ export async function fetchBigQueryLogs(args: {
   toBlock: bigint;
   maxBytesBilled?: number;
 }): Promise<ViemLog[]> {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$/.test(args.dataset)) throw new Error("BigQuery dataset is invalid");
+  if (args.addresses.length === 0 || args.addresses.some((a) => !/^0x[0-9a-f]{40}$/i.test(a))) throw new Error("BigQuery log address is invalid");
+  if (!/^0x[0-9a-f]{64}$/i.test(args.topic0) || args.fromBlock < 0n || args.toBlock < args.fromBlock) throw new Error("BigQuery log query is invalid");
   const token = await accessToken(args.credentialsPath);
   const addresses = args.addresses.map((a) => `'${a.toLowerCase()}'`).join(",");
-  const query = `SELECT address, data, topics, block_number, block_timestamp, transaction_hash, transaction_index, log_index FROM \`${args.dataset}.logs\` WHERE LOWER(address) IN (${addresses}) AND block_number BETWEEN ${args.fromBlock} AND ${args.toBlock} AND topics[SAFE_OFFSET(0)] = '${args.topic0}' ORDER BY block_number, log_index`;
+  const query = `SELECT address, data, topics, block_number, block_timestamp, transaction_hash, transaction_index, log_index FROM \`${args.dataset}.logs\` WHERE LOWER(address) IN (${addresses}) AND block_number BETWEEN ${args.fromBlock} AND ${args.toBlock} AND topics[SAFE_OFFSET(0)] = '${args.topic0}' ORDER BY block_number, transaction_index, log_index`;
   const response = await fetch(`https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(args.projectId)}/queries`, {
     method: "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
@@ -101,6 +104,7 @@ export async function fetchBigQueryLogs(args: {
     const topics = values[2] as Array<string | { v: string }>;
     const timestampValue = values[4] as string | { v?: string };
     const timestamp = Date.parse(typeof timestampValue === "string" ? timestampValue : String(timestampValue?.v ?? "")) / 1000;
+    if (values[3] === null || values[5] === null || values[6] === null || values[7] === null) throw new Error("BigQuery log missing block/transaction/log identity");
     return {
       address: String(values[0]) as `0x${string}`,
       data: String(values[1]) as `0x${string}`,
@@ -111,5 +115,5 @@ export async function fetchBigQueryLogs(args: {
       logIndex: Number(values[7]),
       ...(Number.isFinite(timestamp) ? { blockTimestamp: timestamp } : {}),
     } as unknown as ViemLog;
-  });
+  }).sort((a, b) => Number((a.blockNumber ?? 0n) - (b.blockNumber ?? 0n)) || (a.transactionIndex ?? 0) - (b.transactionIndex ?? 0) || (a.logIndex ?? 0) - (b.logIndex ?? 0));
 }

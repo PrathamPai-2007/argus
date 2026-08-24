@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
-import { closeDb, dashboardMetrics, getCandidate, getToken, insertEvents, insertSignal, listCandidates, listSignals, listSignalsForToken, listWatchedTokens, loadEvents, openDb, promoteCandidate, recentSignals, updateCandidateScore, upsertCandidate, upsertToken } from "../src/db.ts";
+import { closeDb, dashboardMetrics, getCandidate, getToken, insertEvents, insertSignal, listCandidates, listSignals, listSignalsForToken, listWatchedTokens, loadEvents, openDb, promoteCandidate, recentSignals, recordSignalEvaluation, updateCandidateScore, upsertCandidate, upsertToken } from "../src/db.ts";
 import type { FundingEvent, Signal, StandardTransferEvent, SwapEvent } from "../src/types.ts";
 
 // Regression: payload_json round-trips bigints to strings; loadEvents must revive them
@@ -50,6 +50,16 @@ describe("db.loadEvents", () => {
     expect(insertEvents([event], false)).toHaveLength(0);
   });
 
+  test("loads same-block events in transaction then log order", () => {
+    const make = (transactionIndex: number, logIndex: number): StandardTransferEvent => ({
+      kind: "transfer", chainId: 1, blockNumber: 10, transactionIndex, logIndex,
+      txHash: `0x${String(transactionIndex).padStart(64, "0")}`, tokenAddress: "0x" + "aa".repeat(20),
+      sender: "0x" + "bb".repeat(20), receiver: "0x" + "cc".repeat(20), amount: 1n, timestamp: 1,
+    });
+    insertEvents([make(2, 0), make(1, 9), make(1, 2)], true);
+    expect(loadEvents(1, 10, 10).map((event) => [event.transactionIndex, event.logIndex])).toEqual([[1, 2], [1, 9], [2, 0]]);
+  });
+
   test("upsertToken updates expires_at on conflict and preserves it when omitted", () => {
     const addr = "0x" + "ab".repeat(20);
     upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt: 1000 });
@@ -78,6 +88,35 @@ describe("db.loadEvents", () => {
     expect(recentSignals(1, signal.tokenAddress, 1_600_000_000)).toEqual([signal]);
     expect(listSignals(1)).toEqual([signal]);
     expect(listSignalsForToken(1, signal.tokenAddress)).toEqual([signal]);
+  });
+
+  test("exposes durable signal evaluation outcomes", () => {
+    const signal: Signal = {
+      chainId: 1, tokenAddress: "0x" + "aa".repeat(20), ruleId: "R2", weight: 25,
+      evidence: { spikePct: 150 }, blockNumber: 10, timestamp: 1_700_000_000,
+    };
+    const id = insertSignal(signal);
+    recordSignalEvaluation({ signalId: id, score: 25, severity: null, outcome: "below_threshold", reason: "below_info_threshold" });
+    expect(listSignals(1)[0]).toMatchObject({ score: 25, severity: null, outcome: "below_threshold", outcomeReason: "below_info_threshold" });
+    expect(dashboardMetrics().signalOutcomes).toEqual({ below_threshold: 1 });
+  });
+
+  test("deduplicates a signal from the same source event", () => {
+    const signal: Signal = {
+      chainId: 1, tokenAddress: "0x" + "aa".repeat(20), ruleId: "R1", weight: 35,
+      evidence: {}, blockNumber: 10, timestamp: 1_700_000_000,
+    };
+    const source = { txHash: "0x" + "11".repeat(32), logIndex: 4 };
+    expect(insertSignal(signal, source)).toBeGreaterThan(0);
+    expect(insertSignal(signal, source)).toBe(0);
+    expect(listSignals(1)).toHaveLength(1);
+    expect(listSignals(1)[0]?.sourceTxHash).toBe(source.txHash);
+  });
+
+  test("uses signal provenance when no separate source argument is supplied", () => {
+    const signal: Signal = { chainId: 1, tokenAddress: "0x" + "aa".repeat(20), ruleId: "R2", weight: 20, evidence: {}, blockNumber: 11, timestamp: 1_700_000_001, sourceTxHash: "0x" + "22".repeat(32), sourceLogIndex: 3 };
+    expect(insertSignal(signal)).toBeGreaterThan(0);
+    expect(listSignals(1)[0]?.sourceLogIndex).toBe(3);
   });
 
   test("keeps candidates out of active watches until promotion", () => {
