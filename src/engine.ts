@@ -668,11 +668,19 @@ export class ArgusEngine {
     }
   }
 
+  /** Decimals verified by token metadata or a hardcoded known address; null when unknown. */
+  private verifiedDecimals(chainId: number, address: Address): number | null {
+    const meta = db.getToken(chainId, address);
+    if (meta?.decimals != null && meta.decimals > 0) return meta.decimals;
+    const known = decimalsForAddress(address, -1);
+    return known >= 0 ? known : null;
+  }
+
   private async openPerformanceSession(alertId: number, chainId: number, tokenAddress: Address, sourceEvent?: StandardEvent): Promise<void> {
     db.setAlertPerformanceStatus(alertId, "evaluating");
     const now = Math.floor(Date.now() / 1000);
     let swap = sourceEvent?.kind === "swap" ? sourceEvent : db.latestSwapForToken(chainId, tokenAddress);
-    
+
     const isStale = swap ? (now - swap.timestamp > 300) : true;
     if (isStale) {
       db.setAlertPerformanceStatus(alertId, "skipped_stale_swap", "swap_older_than_5_minutes");
@@ -681,30 +689,44 @@ export class ArgusEngine {
 
     const swapPool = swap ? db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
       .get(chainId, swap.poolAddress, tokenAddress) as { quote_token: Address | null } | undefined : undefined;
-    const tokenDecimals = db.getToken(chainId, tokenAddress)?.decimals ?? 18;
-    const quoteDecimals = swapPool?.quote_token
-      ? db.getToken(chainId, swapPool.quote_token)?.decimals ?? decimalsForAddress(swapPool.quote_token)
-      : 18;
-    let entryPrice = swap ? priceFromSwap(swap, tokenDecimals, quoteDecimals) : null;
-    let poolAddress = swap?.poolAddress;
-    let quoteToken: Address | null = null;
+    const tokenDecimals = this.verifiedDecimals(chainId, tokenAddress);
+    const quoteTokenFromPool = swapPool?.quote_token ?? null;
+    const quoteDecimals = quoteTokenFromPool ? this.verifiedDecimals(chainId, quoteTokenFromPool) : null;
+
+    if (tokenDecimals === null || (quoteTokenFromPool !== null && quoteDecimals === null)) {
+      // Without verified decimals every derived price would be off by orders of
+      // magnitude; refusing beats guessing 18 and reporting false TP/SL.
+      db.setAlertPerformanceStatus(alertId, "skipped_unknown_decimals", "token_or_quote_decimals_unverified");
+      return;
+    }
+
+    // Entry pricing is on-chain first: a fresh swap with verified decimals on
+    // both sides. Unverified decimals must never silently default to 18.
+    let entryPrice = quoteDecimals !== null
+      ? priceFromSwap(swap!, tokenDecimals, quoteDecimals)
+      : null;
+    let poolAddress: Address | undefined = swap?.poolAddress;
+    let quoteToken: Address | null = quoteTokenFromPool;
     const openedAt = sourceEvent?.timestamp ?? (swap?.timestamp ?? now);
     const entryBlock = sourceEvent?.blockNumber ?? (swap?.blockNumber ?? 0);
 
-    const observation = await fetchTokenPriceForPool(chainId, tokenAddress, poolAddress);
-    if (observation.kind === "liquidity_lost") {
-      db.setAlertPerformanceStatus(alertId, "skipped_liquidity_unavailable", "pool_has_no_liquidity");
-      return;
-    }
-    if (observation.kind === "pool_missing") {
-      db.setAlertPerformanceStatus(alertId, "skipped_no_pool", "reference_pool_not_found");
-      return;
-    }
-    if (observation.kind === "provider_error") {
-      db.setAlertPerformanceStatus(alertId, "provider_error", "price_provider_unavailable");
-      return;
-    }
-    if (observation.kind === "price") {
+    if (entryPrice === null) {
+      // No trustworthy on-chain price: fall back to DexScreener only to locate
+      // a priced pool. Its quote-relative price is accepted only because no
+      // swap-derived entry exists to conflict with.
+      const observation = await fetchTokenPriceForPool(chainId, tokenAddress, poolAddress ?? undefined);
+      if (observation.kind === "liquidity_lost") {
+        db.setAlertPerformanceStatus(alertId, "skipped_liquidity_unavailable", "pool_has_no_liquidity");
+        return;
+      }
+      if (observation.kind === "pool_missing") {
+        db.setAlertPerformanceStatus(alertId, "skipped_no_pool", "reference_pool_not_found");
+        return;
+      }
+      if (observation.kind === "provider_error") {
+        db.setAlertPerformanceStatus(alertId, "provider_error", "price_provider_unavailable");
+        return;
+      }
       entryPrice = observation.value.price;
       poolAddress = observation.value.poolAddress;
       quoteToken = observation.value.quoteToken;
@@ -748,10 +770,10 @@ export class ArgusEngine {
   private updatePerformance(swap: StandardEvent & { kind: "swap" }): void {
     const pool = db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
       .get(swap.chainId, swap.poolAddress, swap.tokenAddress) as { quote_token: Address | null } | undefined;
-    const tokenDecimals = db.getToken(swap.chainId, swap.tokenAddress)?.decimals ?? 18;
-    const quoteDecimals = pool?.quote_token
-      ? db.getToken(swap.chainId, pool.quote_token)?.decimals ?? decimalsForAddress(pool.quote_token)
-      : 18;
+    const tokenDecimals = this.verifiedDecimals(swap.chainId, swap.tokenAddress);
+    const quoteDecimals = pool?.quote_token ? this.verifiedDecimals(swap.chainId, pool.quote_token) : null;
+    // Unverified decimals would corrupt every derived price; skip instead of guessing 18.
+    if (tokenDecimals === null || quoteDecimals === null) return;
     const price = priceFromSwap(swap, tokenDecimals, quoteDecimals);
     if (price === null) return;
      const sessions = db.listPerformanceSessions({ chainId: swap.chainId, tokenAddress: swap.tokenAddress, activeOnly: true });
@@ -819,10 +841,12 @@ export class ArgusEngine {
                 const tokenAmount = isToken0 ? res.reserve0 : res.reserve1;
                 const quoteAmount = isToken0 ? res.reserve1 : res.reserve0;
                 
-                const tokenDecimals = db.getToken(session.chain_id, session.token_address)?.decimals ?? 18;
-                const quoteDecimals = db.getToken(session.chain_id, session.quote_token)?.decimals ?? decimalsForAddress(session.quote_token);
+                const tokenDecimals = this.verifiedDecimals(session.chain_id, session.token_address);
+                const quoteDecimals = this.verifiedDecimals(session.chain_id, session.quote_token!);
                 
-                const price = priceFromSwap({ tokenAmount, quoteAmount }, tokenDecimals, quoteDecimals);
+                const price = tokenDecimals !== null && quoteDecimals !== null
+                  ? priceFromSwap({ tokenAmount, quoteAmount }, tokenDecimals, quoteDecimals)
+                  : null;
                 if (price !== null) {
                   observation = { kind: "price", value: { price, poolAddress: session.pool_address, quoteToken: session.quote_token, liquidityUsd: null, volumeUsd: null } };
                 }
@@ -839,21 +863,22 @@ export class ArgusEngine {
 
         if (observation.kind === "provider_error") return;
         if (observation.kind === "pool_missing" || observation.kind === "liquidity_lost") {
+          // A single bad reading is not a rug: require consecutive failures
+          // before closing, and never fabricate a zero price on closure.
           const missing = session.missing_observations + 1;
-          if (observation.kind === "liquidity_lost" || missing >= 3) {
-            const currentPrice = 0n;
+          if (missing >= 3) {
             db.updatePerformanceSession({
               id: session.id,
               outcome: "stop_hit",
-              currentPrice,
-              minPrice: 0n,
+              currentPrice: session.current_price,
+              minPrice: session.min_price,
               maxPrice: session.max_price,
               lastBlock: session.last_block,
               updatedAt: now,
               closedAt: now,
               lastPollAt: now,
               missingObservations: missing,
-              closeReason: "liquidity_lost",
+              closeReason: observation.kind === "liquidity_lost" ? "liquidity_lost" : "pool_unreachable",
               observationSource: "pool_reserves",
               observationBlock: session.last_block,
             });
@@ -1064,7 +1089,12 @@ export class ArgusEngine {
     this.pruneSignificance();
     
     for (const chainId of this.chains.keys()) {
+      // Preserve graph memory beyond the watchlist: tokens active in the last
+      // day and tokens with open performance sessions still feed rules and
+      // TP/SL watches. Pruning them mid-session amnesiacs the cluster graph.
       const activeTokens = new Set(db.listWatchedTokens(chainId, now).map(t => t.address));
+      for (const addr of db.listRecentEventTokens(chainId, now - 24 * 3_600)) activeTokens.add(addr);
+      for (const session of db.listPerformanceSessions({ chainId, activeOnly: true })) activeTokens.add(session.token_address);
       const activePools = new Set<string>();
       for (const token of activeTokens) {
         for (const pool of db.listPoolsForToken(chainId, token)) {
@@ -1074,10 +1104,10 @@ export class ArgusEngine {
       this.graphFor(chainId).prune(activeTokens, activePools);
       const adapter = this.chains.get(chainId)?.adapter as EvmAdapter | undefined;
       if (adapter) adapter.prunePools(activePools);
+      log.info("retention sweep", { chainId, activeTokens: activeTokens.size, prunedEvents: pruned });
     }
     
     this.syncAllClusters();
-    if (pruned > 0) log.info("retention sweep", { prunedEvents: pruned });
   }
 
   private pruneSignificance(): void {

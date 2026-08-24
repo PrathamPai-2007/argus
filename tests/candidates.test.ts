@@ -26,10 +26,11 @@ describe("candidate scoring", () => {
     expect(result.eligible).toBe(false);
   });
 
-  test("treats unknown pool age as neutral evidence", () => {
+  test("unknown pool age contributes nothing instead of fake-neutral points", () => {
     const known = scoreCandidate({ ...base, poolAgeHours: 48 });
     const unknown = scoreCandidate({ ...base, poolAgeHours: null });
-    expect(unknown.score).toBe(known.score - 5);
+    expect(unknown.score).toBe(known.score - 10);
     expect((unknown.evidence as any).missingInputs).toContain("poolAgeHours");
+    expect((unknown.evidence as any).components.age).toBe(0);
   });
 });

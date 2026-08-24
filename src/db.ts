@@ -177,6 +177,16 @@ export function latestSwapForToken(chainId: number, tokenAddress: Address): Swap
   return row ? reviveEvent(JSON.parse(row.payload_json) as Record<string, unknown>) as SwapEvent : null;
 }
 
+/** Distinct tokens with swap/transfer activity since `sinceSecs` (unix seconds). */
+export function listRecentEventTokens(chainId: number, sinceSecs: number): Address[] {
+  const rows = getDb().query(
+    `SELECT DISTINCT json_extract(payload_json, '$.tokenAddress') AS token FROM events
+     WHERE chain_id = ? AND type IN ('swap', 'transfer')
+       AND CAST(json_extract(payload_json, '$.timestamp') AS INTEGER) >= ?`,
+  ).all(chainId, sinceSecs) as { token: string | null }[];
+  return rows.map((r) => r.token).filter((t): t is Address => typeof t === "string" && /^0x[0-9a-fA-F]{40}$/.test(t));
+}
+
 // payload_json round-trips bigints to decimal strings; revive the amount fields so
 // graph.applyEvent/replay get real BigInts (was: "Invalid mix of BigInt and other type").
 const BIGINT_FIELDS: Partial<Record<EventKind, string[]>> = {

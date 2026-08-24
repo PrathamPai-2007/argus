@@ -31,8 +31,8 @@ export function scoreCandidate(metrics: CandidateMetrics): CandidateScore {
   const earlyBuyers = clamp(metrics.earlyBuyerCount * 12.5);
   const retained = metrics.earlyBuyerCount === 0 ? 0 : clamp((metrics.retainedBuyerCount / metrics.earlyBuyerCount) * 100);
   const independent = clamp(metrics.independentBuyerCount * 20);
-  // Unknown age is neutral evidence, not evidence of a new or unsafe pool.
-  const age = metrics.poolAgeHours === null ? 50 : metrics.poolAgeHours <= 48 ? 100 : clamp(100 - (metrics.poolAgeHours - 48) * 2);
+  // Unknown age contributes nothing: guessing "neutral" inflates hollow scores.
+  const age = metrics.poolAgeHours === null ? 0 : metrics.poolAgeHours <= 48 ? 100 : clamp(100 - (metrics.poolAgeHours - 48) * 2);
   const exchangePenalty = clamp(metrics.exchangeBuyerCount * 15);
   const funderPenalty = clamp(metrics.commonFunderRatio * 100);
   const score = Math.round(clamp(

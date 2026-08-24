@@ -121,8 +121,15 @@ tests/                 bun:test; adapter/dashboard/config/security regressions; 
   targeted enrichment scores liquidity, early buyer retention, funding independence, and
   exchange/common-funder risk before promotion. Volume is capped and cannot bypass buyer gates.
 - Real-time performance & graph integrity: Fast concurrent on-chain RPC polling for pool reserves eliminates DexScreener HTTP limits. Hub-degree limits (in-degree/out-degree > 25) prevent routers/infra from collapsing disjoint wallets into mega-clusters. Synthetic rule evaluations strictly filter out candidates and expired watches to preserve Inv 11.
+- Honest pricing: entry prices come from fresh swaps with verified ERC-20 decimals; unverified
+  decimals skip the watch (`skipped_unknown_decimals`) instead of defaulting to 18. DexScreener
+  fallback prices are only derived from denomination-consistent quotes (WETH → `priceNative`,
+  stablecoins → `priceUsd`); unknown quote denominations and non-base orientations are refused,
+  never inverted or mixed. Performance watches close as lost only after 3 consecutive failed
+  observations, and closure never fabricates a zero price. Unknown candidate pool age scores 0,
+  not a fake-neutral 50.
 - RPC multicall & batching: Explicit `multicall` for ERC-20 metadata (`totalSupply`, `decimals`, `symbol`) and global JSON-RPC HTTP transport batching reduce RPC round-trips by up to 75%.
-- Memory retention & graph garbage collection: `GraphEngine.prune(activeTokens)` runs during the hourly `retentionSweep`, safely evicting un-watched token ledgers, stale rolling send/buy buffers, and inactive wallets to prevent unbounded memory growth.
+- Memory retention & graph garbage collection: `GraphEngine.prune(activeTokens)` runs during the hourly `retentionSweep`, evicting stale token ledgers, rolling send/buy buffers, and inactive wallets — but tokens active in the last 24h and tokens with open performance sessions are preserved, so sweeps cannot amnesiac the cluster graph mid-session.
 - O(1) cluster balance tracking: `GraphEngine` incrementally maintains `clusterBalances` and `clusterTokens` on every transfer and DSU merge. `clusterBreakdown` is pre-computed in O(clusters) rather than O(holders * depth), while full member arrays are resolved lazily only when an alert fires.
 - Reliability hardening: provider identity and log-shape validation, canonical transaction ordering,
   serialized ingestion handoffs, queue-drop attribution, durable failed-event recovery, and finalized

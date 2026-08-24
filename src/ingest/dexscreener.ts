@@ -61,6 +61,29 @@ async function fetchPairs(chainId: number, stablecoin: Address): Promise<DexPair
   return asPairs(await response.json());
 }
 
+/**
+ * Quote tokens whose denomination we can honestly convert into a pool-relative
+ * price: `priceNative` is quoted in the chain's native wrapper (WETH), and
+ * stablecoin prices equal their USD price. Anything else cannot be priced
+ * without guessing, so we refuse instead of returning a wrong number.
+ */
+const KNOWN_QUOTE_KIND: Record<string, "native" | "stable"> = {
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "native",
+  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": "stable",
+  "0xdac17f958d2ee523a2206206994597c13d831ec7": "stable",
+  "0x6b175474e89094c44da98b954eedeac495271d0f": "stable",
+};
+
+function scalePriceTo18(value: number): bigint | null {
+  if (!Number.isFinite(value) || value <= 0) return null;
+  // toFixed switches to exponential notation ("2e+21") for huge values,
+  // which BigInt cannot parse; refuse instead of throwing.
+  const [intPart = "0", fracPart = ""] = value.toFixed(18).split(".");
+  if (!/^\d+$/.test(intPart || "")) return null;
+  const scaled = BigInt((intPart || "0") + fracPart.slice(0, 18).padEnd(18, "0"));
+  return scaled > 0n ? scaled : null;
+}
+
 export interface TokenPrice {
   price: bigint;
   poolAddress: Address;
@@ -106,38 +129,37 @@ export function fetchTokenPriceForPool(chainId: number, token: Address, poolAddr
       const pairs = asPairs(await response.json());
       if (pairs.length === 0) return { kind: "pool_missing" };
 
+      const tokenAddr = token.toLowerCase();
       const wantedPool = poolAddress?.toLowerCase();
-      const best = wantedPool
-        ? pairs.find((pair) => pair.pairAddress?.toLowerCase() === wantedPool)
-        : pairs.sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0))[0];
+      // Pool-relative price is only well-defined when the watched token is the
+      // pair's base side; never invert a cross-denominated price to force a fit.
+      const ordered = wantedPool
+        ? pairs.filter((pair) => pair.pairAddress?.toLowerCase() === wantedPool)
+        : pairs.sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0));
+      const best = ordered.find((pair) => {
+        if (pair.baseToken?.address?.toLowerCase() !== tokenAddr) return false;
+        return KNOWN_QUOTE_KIND[pair.quoteToken?.address?.toLowerCase() ?? ""] !== undefined;
+      });
       if (!best) return { kind: "pool_missing" };
 
-      const baseAddr = best.baseToken?.address?.toLowerCase() as Address | undefined;
-      const quoteAddr = best.quoteToken?.address?.toLowerCase() as Address | undefined;
-      const poolAddr = best.pairAddress?.toLowerCase() as Address | undefined;
-      const priceUsdStr = best.priceUsd;
-      const priceNativeStr = best.priceNative;
-      if (!baseAddr || !quoteAddr || !poolAddr) return { kind: "pool_missing" };
-
-      const isBase = baseAddr === token.toLowerCase();
-      const priceUsd = typeof priceUsdStr === "string" ? parseFloat(priceUsdStr) : null;
-      const priceNative = typeof priceNativeStr === "string" ? parseFloat(priceNativeStr) : null;
-      const basePrice = priceNative ?? priceUsd;
-      const effPrice = isBase ? basePrice : (basePrice !== null && basePrice > 0 ? 1 / basePrice : null);
-      if (effPrice === null || !isFinite(effPrice) || effPrice < 0) return { kind: "pool_missing" };
-      if (effPrice === 0 || (best.liquidity?.usd !== null && best.liquidity?.usd !== undefined && best.liquidity.usd <= 0)) {
+      const quoteAddr = best.quoteToken?.address?.toLowerCase() as Address;
+      const poolAddr = best.pairAddress?.toLowerCase() as Address;
+      const priceUsd = typeof best.priceUsd === "string" ? parseFloat(best.priceUsd) : null;
+      const priceNative = typeof best.priceNative === "string" ? parseFloat(best.priceNative) : null;
+      const kind = KNOWN_QUOTE_KIND[quoteAddr];
+      const rawPrice = kind === "native" ? priceNative : priceUsd;
+      if (!poolAddr || rawPrice === null || !isFinite(rawPrice) || rawPrice <= 0) return { kind: "pool_missing" };
+      if (best.liquidity?.usd !== null && best.liquidity?.usd !== undefined && best.liquidity.usd <= 0) {
         return { kind: "liquidity_lost" };
       }
 
-      const str = effPrice.toFixed(18);
-      const parts = str.split(".");
-      const scaledPrice = parts.length === 2 ? BigInt((parts[0] ?? "0") + (parts[1] ?? "").slice(0, 18).padEnd(18, "0")) : null;
+      const scaledPrice = scalePriceTo18(rawPrice);
       if (scaledPrice === null) return { kind: "pool_missing" };
       return { kind: "price", value: {
         price: scaledPrice,
         poolAddress: poolAddr,
-        quoteToken: isBase ? quoteAddr : baseAddr,
-        symbol: isBase ? best.baseToken?.symbol : best.quoteToken?.symbol,
+        quoteToken: quoteAddr,
+        symbol: best.baseToken?.symbol,
         liquidityUsd: typeof best.liquidity?.usd === "number" ? best.liquidity.usd : null,
         volumeUsd: typeof best.volume?.h24 === "number" ? best.volume.h24 : null,
       } };

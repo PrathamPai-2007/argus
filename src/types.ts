@@ -102,6 +102,7 @@ export type PerformanceWatchStatus =
   | "skipped_no_pool"
   | "skipped_invalid_price"
   | "skipped_liquidity_unavailable"
+  | "skipped_unknown_decimals"
   | "provider_error";
 
 // ---- Token metadata ---------------------------------------------------------
