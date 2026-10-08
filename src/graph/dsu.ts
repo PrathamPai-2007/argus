@@ -202,38 +202,4 @@ export class RollbackDSU {
     for (const [r, members] of byRoot) if (members.length <= 1) byRoot.delete(r);
     return byRoot;
   }
-
-  /** Export raw state for snapshots. */
-  toJSON(): { parent: Record<string, string>; size: Record<string, number>; children: Record<string, string[]>; opsBase: number; ops: [string, string, string[]][] } {
-    const serializedChildren: Record<string, string[]> = {};
-    for (const [k, v] of this.children) serializedChildren[k] = [...v];
-    return { parent: Object.fromEntries(this.parent), size: Object.fromEntries(this.size), children: serializedChildren, opsBase: this.opsBase, ops: [...this.ops] };
-  }
-
-  static fromJSON(j: { parent: Record<string, string>; size: Record<string, number>; children?: Record<string, string[]>; opsBase?: number; ops: [string, string, string[]][] }): RollbackDSU {
-    const d = new RollbackDSU();
-    d.parent = new Map(Object.entries(j.parent));
-    d.size = new Map(Object.entries(j.size));
-    d.keys = new Set(d.parent.keys());
-    if (j.children) {
-      for (const [k, v] of Object.entries(j.children)) {
-        d.children.set(k, new Set(v));
-      }
-    } else {
-      // Reconstruct children from parent mapping for legacy snapshots
-      for (const [k, p] of d.parent) {
-        if (k !== p) {
-          let ch = d.children.get(p);
-          if (!ch) { ch = new Set(); d.children.set(p, ch); }
-          ch.add(k);
-        }
-      }
-    }
-    d.opsBase = j.opsBase ?? 0;
-    d.ops = j.ops.map(([a, b, created]) => [a, b, created ?? []] as [string, string, string[]]);
-    let comps = 0;
-    for (const [k, v] of d.parent) if (k === v) comps++;
-    d._components = comps;
-    return d;
-  }
 }

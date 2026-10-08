@@ -607,11 +607,6 @@ export class GraphEngine {
     return { createdBlock: created.block, createdTs: created.ts, lpMinted: this.lpMinted.get(pool) ?? 0n, lpBurned: this.burned.get(pool) ?? 0n };
   }
 
-  /** @internal for rewind coverage — used by rewindTo/finalize via history; snapshot reads it directly. */
-  getPoolInfo(): Map<Address, { block: number; ts: number }> {
-    return this.poolCreated;
-  }
-
   // ---- reorg / finality (PLAN.md §11.1) ---------------------------------------------
 
   /** Undo all state transitions at blocks >= fromBlock. */
@@ -813,67 +808,5 @@ export class GraphEngine {
       stats.push(stat);
     }
     return stats.sort((a, b) => b.pctOfSupply - a.pctOfSupply);
-  }
-
-  // ---- snapshots (PLAN.md §11.3) -------------------------------------------------
-
-  toJSON(): string {
-    const replacer = (_k: string, v: unknown) => (typeof v === "bigint" ? `${v}n` : v);
-    return JSON.stringify(
-      {
-        wallets: [...this.wallets.entries()],
-        dsu: this.dsu.toJSON(),
-        balances: [...this.balances.entries()].map(([t, m]) => [t, [...m.entries()]]),
-        burned: [...this.burned.entries()],
-        totalSupply: [...this.totalSupply.entries()],
-        deployers: [...this.deployers.entries()],
-        pools: [...this.pools],
-        poolCreated: [...this.poolCreated.entries()],
-        lpMinted: [...this.lpMinted.entries()],
-        swapVolume: this.swapVolume,
-        buys: this.buys,
-        sends: [...this.sends.entries()],
-        exchangeFundings: [...this.exchangeFundings.entries()],
-        fundingAmountIndex: [...this.fundingAmountIndex.entries()],
-        fanoutSenders: [...this.fanoutSenders.entries()],
-        identicalAmountUnioned: [...this.identicalAmountUnioned.entries()],
-        clusterBalances: [...this.clusterBalances.entries()].map(([t, m]) => [t, [...m.entries()]]),
-        clusterTokens: [...this.clusterTokens.entries()].map(([r, s]) => [r, [...s]]),
-      },
-      replacer,
-    );
-  }
-
-  static fromJSON(json: string, tuning: GraphTuning = DEFAULT_GRAPH_TUNING): GraphEngine {
-    const reviver = (_k: string, v: unknown) => (typeof v === "string" && /^-?\d+n$/.test(v) ? BigInt(v.slice(0, -1)) : v);
-    const j = JSON.parse(json, reviver) as Record<string, unknown>;
-    const g = new GraphEngine(tuning);
-    for (const [k, v] of (j["wallets"] as [Address, WalletRec][] ?? [])) g.wallets.set(k, v);
-    (g as { dsu: RollbackDSU }).dsu = RollbackDSU.fromJSON(j["dsu"] as never);
-    for (const [t, entries] of (j["balances"] as [Address, [Address, bigint][]][] ?? [])) g.balances.set(t, new Map(entries));
-    g.burned = new Map((j["burned"] as [Address, bigint][]) ?? []);
-    g.totalSupply = new Map((j["totalSupply"] as [Address, bigint][]) ?? []);
-    g.deployers = new Map((j["deployers"] as [Address, Address][]) ?? []);
-    g.pools = new Set((j["pools"] as Address[]) ?? []);
-    g.poolCreated = new Map((j["poolCreated"] as [Address, { block: number; ts: number }][]) ?? []);
-    g.lpMinted = new Map((j["lpMinted"] as [Address, bigint][]) ?? []);
-    g.swapVolume = (j["swapVolume"] as SwapVolumeEntry[]) ?? [];
-    g.buys = (j["buys"] as BuyEntry[]) ?? [];
-    for (const b of g.buys) {
-      let tBuys = g.buysByToken.get(b.token);
-      if (!tBuys) { tBuys = []; g.buysByToken.set(b.token, tBuys); }
-      tBuys.push(b);
-      let wTokens = g.tokensBoughtByWallet.get(b.addr);
-      if (!wTokens) { wTokens = new Map(); g.tokensBoughtByWallet.set(b.addr, wTokens); }
-      wTokens.set(b.token, (wTokens.get(b.token) ?? 0) + 1);
-    }
-    g.sends = new Map((j["sends"] as [Address, SendEntry[]][]) ?? []);
-    g.exchangeFundings = new Map((j["exchangeFundings"] as [Address, ExchangeFundingEntry[]][]) ?? []);
-    g.fundingAmountIndex = new Map((j["fundingAmountIndex"] as [string, { funded: Address; funder: Address; ts: number; block: number }[]][]) ?? []);
-    g.fanoutSenders = new Map((j["fanoutSenders"] as [string, number][] | string[] ?? []).map((v) => Array.isArray(v) ? v : [v, 0]));
-    g.identicalAmountUnioned = new Map((j["identicalAmountUnioned"] as [string, number][] | string[] ?? []).map((v) => Array.isArray(v) ? v : [v, 0]));
-    for (const [t, entries] of (j["clusterBalances"] as [Address, [Address, bigint][]][] ?? [])) g.clusterBalances.set(t, new Map(entries));
-    for (const [r, entries] of (j["clusterTokens"] as [Address, Address[]][] ?? [])) g.clusterTokens.set(r, new Set(entries));
-    return g;
   }
 }

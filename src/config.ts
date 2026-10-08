@@ -103,30 +103,6 @@ export interface ArgusConfig {
   dbPath: string;
 }
 
-// ---- .env loading (no dependency) -----------------------------------------
-
-function loadDotEnv(): void {
-  // ponytail: hand-rolled .env parser — stdlib process.loadEnvFile() exists since Node 20.12
-  // but manual parse keeps Bun <1.2 compat and preserves quoted-value + no-overwrite semantics; switch when min Node bumps.
-  const path = join(process.cwd(), ".env");
-  if (!existsSync(path)) return;
-  // prefer native when available (one line), fall back to manual parse
-  const native = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
-  if (native) { try { native(path); return; } catch { /* fall through to manual */ } }
-  for (const raw of readFileSync(path, "utf8").split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq).trim();
-    let value = line.slice(eq + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (!(key in process.env)) process.env[key] = value;
-  }
-}
-
 // ---- Validation (hand-rolled, per PLAN §2) ---------------------------------
 
 export class ConfigError extends Error {}
@@ -393,7 +369,6 @@ function isPrivateHost(hostname: string): boolean {
 let cached: ArgusConfig | null = null;
 
 export async function loadConfig(path = join(process.cwd(), "argus.config.ts")): Promise<ArgusConfig> {
-  loadDotEnv();
   if (!existsSync(path)) fail(`config file not found at ${path}`);
   const mod = (await import(pathToFileURL(path).href + `?t=${Date.now()}`)) as { default: unknown };
   cached = validateConfig(mod.default);

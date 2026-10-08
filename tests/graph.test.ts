@@ -151,19 +151,6 @@ describe("GraphEngine", () => {
     expect(g.deployerOf(TOKEN)).toBe(addr("dep"));
   });
 
-  test("snapshot roundtrip preserves balances and clusters", () => {
-    const g = new GraphEngine();
-    g.setTotalSupply(TOKEN, 1_000_000n);
-    g.applyEvent(funding(FUNDER, addr("s1"), 10n));
-    g.applyEvent(funding(FUNDER, addr("s2"), 10n));
-    g.applyEvent(transfer(ZERO_ADDRESS, addr("s1"), 300_000n));
-    const json = g.toJSON();
-    const restored = GraphEngine.fromJSON(json);
-    expect(restored.balanceOf(TOKEN, addr("s1"))).toBe(300_000n);
-    expect(new Set(restored.clusterOf(addr("s1")))).toEqual(new Set([addr("s1"), addr("s2"), FUNDER]));
-    expect(restored.circulatingSupply(TOKEN)).toBe(1_000_000n);
-  });
-
   test("funderChain walks up to maxHops", () => {
     const g = new GraphEngine();
     const grand = addr("grand");
@@ -184,7 +171,7 @@ describe("GraphEngine pools (Phase 6)", () => {
     expect(g.isPool(POOL)).toBe(false);
     g.registerPool(POOL, 42, 1_700_000_000);
     expect(g.isPool(POOL)).toBe(true);
-    expect(g.getPoolInfo().get(POOL)).toEqual({ block: 42, ts: 1_700_000_000 });
+    expect(g.lpStatus(POOL)?.createdTs).toBe(1_700_000_000);
   });
 
   test("isPool matches regardless of address case", () => {
@@ -221,22 +208,6 @@ describe("GraphEngine pools (Phase 6)", () => {
     expect(st2?.lpBurned).toBe(400n);
   });
 
-  test("snapshot roundtrip preserves pool, lp, and swap state", () => {
-    const g = new GraphEngine();
-    const createdTs = 1_700_000_000;
-    g.registerPool(POOL, 9, createdTs);
-    g.applyEvent(transfer(ZERO_ADDRESS, addr("lp1"), 1000n, { block: 10, ts: createdTs + 60, token: POOL }));
-    g.applyEvent(transfer(addr("lp1"), DEAD, 300n, { block: 11, ts: createdTs + 120, token: POOL }));
-    g.applyEvent({
-      kind: "swap", chainId: 1, poolAddress: POOL, tokenAddress: TOKEN, buyer: addr("b1"), direction: "buy",
-      tokenAmount: 50n, quoteAmount: 100n, txHash: "0x" + "00".repeat(32), blockNumber: 12, logIndex: 1, timestamp: createdTs + 200,
-    });
-    const restored = GraphEngine.fromJSON(g.toJSON());
-    expect(restored.isPool(POOL)).toBe(true);
-    expect(restored.lpStatus(POOL)?.lpBurned).toBe(300n);
-    expect(restored.swapVolumeBetween(TOKEN, createdTs, createdTs + 1000)).toEqual({ buy: 50n, sell: 0n });
-  });
-
   test("rewindTo undoes pool registration and swaps", () => {
     const g = new GraphEngine();
     const b0 = block + 1;
@@ -250,38 +221,7 @@ describe("GraphEngine pools (Phase 6)", () => {
     // rewind past the pool creation too
     g.rewindTo(b0);
     expect(g.isPool(POOL)).toBe(false);
-    expect(g.getPoolInfo().has(POOL)).toBe(false);
-  });
-
-  test("negative balances survive snapshot roundtrip", () => {
-    const g = new GraphEngine();
-    g.setTotalSupply(TOKEN, 1_000n);
-    g.applyEvent(transfer(ZERO_ADDRESS, addr("neg"), 100n, { block: 1, ts: ts + 1 }));
-    g.applyEvent(transfer(addr("neg"), addr("other"), 200n, { block: 2, ts: ts + 2 })); // goes to -100n
-    expect(g.balanceOf(TOKEN, addr("neg"))).toBe(-100n);
-    const restored = GraphEngine.fromJSON(g.toJSON());
-    expect(restored.balanceOf(TOKEN, addr("neg"))).toBe(-100n);
-  });
-
-  test("fromJSON tolerates legacy snapshots missing Phase 6 fields", () => {
-    const g = new GraphEngine();
-    g.registerPool(POOL, 1, 0);
-    const j = JSON.parse(g.toJSON()) as Record<string, unknown>;
-    delete j["pools"];
-    delete j["poolCreated"];
-    delete j["lpMinted"];
-    delete j["swapVolume"];
-    const restored = GraphEngine.fromJSON(JSON.stringify(j));
-    // pool + swap application must not crash on a legacy-shaped graph
-    expect(() =>
-      restored.applyEvent({
-        kind: "swap", chainId: 1, poolAddress: POOL, tokenAddress: TOKEN, buyer: addr("b1"), direction: "buy",
-        tokenAmount: 50n, quoteAmount: 100n, txHash: "0x" + "00".repeat(32), blockNumber: 3, logIndex: 1, timestamp: ts + 5,
-      }),
-    ).not.toThrow();
-    expect(restored.swapVolumeBetween(TOKEN, 0, ts + 999)).toEqual({ buy: 50n, sell: 0n });
-    expect(() => restored.applyEvent({ kind: "pool_created", chainId: 1, poolAddress: POOL, token0: TOKEN, token1: addr("q"), factory: "uniswap-v2", txHash: "0x" + "00".repeat(32), blockNumber: 4, logIndex: 0, timestamp: ts + 6 })).not.toThrow();
-    expect(restored.isPool(POOL)).toBe(true);
+    expect(g.lpStatus(POOL)).toBeNull();
   });
 
   test("finalize prunes stale rolling window events older than 24h for finalized blocks", () => {

@@ -84,14 +84,4 @@ describe("RollbackDSU", () => {
     expect(new Set(d.membersFor(new Set([d.find("a")])).get(d.find("a"))!)).toEqual(new Set(["a", "b"]));
   });
 
-  test("snapshot roundtrip preserves structure", () => {
-    const d = new RollbackDSU();
-    d.union("a", "b");
-    d.union("b", "c");
-    const restored = RollbackDSU.fromJSON(d.toJSON());
-    expect(restored.memberCount("a")).toBe(3);
-    expect(new Set(restored.members("c"))).toEqual(new Set(["a", "b", "c"]));
-    restored.rollback(1); // undo union(b,c)
-    expect(restored.memberCount("a")).toBe(2);
-  });
 });
