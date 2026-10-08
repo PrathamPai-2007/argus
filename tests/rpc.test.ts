@@ -21,7 +21,7 @@ const ok = (body: Body, result: (m: string) => unknown) =>
 describe("RpcPool", () => {
   test("infers provider limits from the host", () => {
     expect(limitsFor("https://base.drpc.org").maxBatch).toBe(3);
-    expect(limitsFor("https://ethereum-rpc.publicnode.com").maxBatch).toBe(500);
+    expect(limitsFor("https://ethereum-rpc.publicnode.com").maxBatch).toBe(100);
   });
 
   test("splits batches by the endpoint's max batch size and preserves order", async () => {
@@ -69,4 +69,13 @@ test("settle() nulls out reverted calls without failing the batch", async () => 
   const pool = new RpcPool(["https://a.test"]);
   expect(await pool.settle([{ method: "eth_call", params: [] }, { method: "eth_call", params: [] }, { method: "eth_call", params: [] }])).toEqual(["0x01", null, "0x01"]);
   await expect(pool.batch([{ method: "eth_call", params: [] }, { method: "eth_call", params: [] }])).rejects.toThrow("reverted");
+});
+
+test("an HTTP 403 'Request blocked' fails over instead of stalling the chain", async () => {
+  const seen = mockFetch((url, body) => url.includes("a.test")
+    ? new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: -32602, message: "Request blocked" }, id: (body as { id: number }).id }), { status: 403 })
+    : ok(body, () => "0x2"));
+  const pool = new RpcPool(["https://a.test", "https://b.test"]);
+  expect(await pool.request<string>("eth_getLogs", [{}])).toBe("0x2");
+  expect(seen).toEqual(["https://a.test", "https://b.test"]);
 });

@@ -13,7 +13,7 @@ export interface EndpointLimits {
 
 export function limitsFor(url: string): EndpointLimits {
   const host = (() => { try { return new URL(url).host; } catch { return url; } })();
-  if (host.includes("publicnode.com")) return { maxBatch: 500, maxLogRange: 2_000, rps: 50 };
+  if (host.includes("publicnode.com")) return { maxBatch: 100, maxLogRange: 2_000, rps: 20 };
   if (host.includes("drpc.org")) return { maxBatch: 3, maxLogRange: 100, rps: 20 };
   if (host.includes("base.org")) return { maxBatch: 1, maxLogRange: 100, rps: 10 };
   if (host.includes("alchemy.com")) return { maxBatch: 50, maxLogRange: 10, rps: 10 };
@@ -46,9 +46,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Errors that mean "this request is fine, the endpoint is busy/broken right now". */
 function isRetryable(code: number | null, message: string): boolean {
-  if (code === 429 || (code !== null && code >= 500 && code < 600)) return true;
+  // 403 is how PublicNode and others signal "blocked for now": fail over, do not give up.
+  if (code === 403 || code === 429 || (code !== null && code >= 500 && code < 600)) return true;
   if (code === -32005 || code === -32011 || code === -32603 || code === -32000) return true;
-  return /rate|limit|timeout|timed out|busy|unavailable|capacity|header not found|beyond current head|try again/i.test(message);
+  return /rate|limit|timeout|timed out|busy|unavailable|capacity|blocked|header not found|beyond current head|try again/i.test(message);
 }
 
 export class RpcPool {
@@ -168,7 +169,7 @@ export class RpcPool {
       throw new RpcError(`network: ${String(err)}`, null, true);
     }
     const text = await res.text();
-    if (!res.ok) throw new RpcError(`HTTP ${res.status}: ${text.slice(0, 160)}`, res.status, isRetryable(res.status, text));
+    if (!res.ok) throw new RpcError(`HTTP ${res.status} for ${[...new Set(calls.map((c) => c.method))].join(",")} x${calls.length}: ${text.slice(0, 160)}`, res.status, isRetryable(res.status, text));
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
