@@ -1,7 +1,7 @@
 import { AlertManager } from "./alerts/manager.ts";
 import { buildAlertPayload, telegramOutcome } from "./alerts/format.ts";
 import { TelegramSink, type AlertSink } from "./alerts/telegram.ts";
-import { chainInfo } from "./chains.ts";
+import { chainInfo, priceRef, priceRefPool } from "./chains.ts";
 import type { ArgusConfig, ChainConfig } from "./config.ts";
 import * as db from "./db.ts";
 import { TOPICS, decodeLog, type PoolRef, type RawLog } from "./ingest/decode.ts";
@@ -239,15 +239,15 @@ export class ArgusEngine {
     const watched = db.listWatchedTokens(chainId);
     const tokens = watched.map((t) => t.address);
     for (const t of watched) rt.state.setTokenMeta(t.address, { symbol: t.symbol, name: t.name, decimals: t.decimals, totalSupply: t.totalSupply });
-    const ref = chainInfo(chainId).nativeUsdPool;
-    rt.state.registerPool({ address: ref.address, dex: ref.dex, token0: ref.token0, token: chainInfo(chainId).wrappedNative, quote: ref.token0 === chainInfo(chainId).wrappedNative ? ref.token1 : ref.token0 });
+    const refs = chainInfo(chainId).priceRefs;
+    for (const r of refs) rt.state.registerPool(priceRefPool(r));
     for (const p of db.listPools(chainId)) {
       if (!tokens.includes(p.token)) continue;
       rt.state.registerPool(p, p.createdBlock);
       rt.sync.registerPool(p);
     }
     rt.sync.setWatchedTokens(tokens);
-    const events = db.loadEvents(chainId, { tokens: [...tokens, chainInfo(chainId).wrappedNative], finalizedOnly: true });
+    const events = db.loadEvents(chainId, { tokens: [...tokens, ...refs.map((r) => r.base)], finalizedOnly: true });
     for (const e of events) rt.state.apply(e);
     for (const t of tokens) {
       const s = db.getScore(chainId, t);
@@ -259,11 +259,11 @@ export class ArgusEngine {
   // ---- event flow ------------------------------------------------------------------------
 
   private async onEvents(rt: Runtime, raw: ChainEvent[]): Promise<void> {
-    const refPool = chainInfo(rt.cfg.chainId).nativeUsdPool.address;
-    // One reference-pool price per block is plenty; keep the last.
-    const lastRefPerBlock = new Map<number, ChainEvent>();
-    for (const e of raw) if (e.kind === "swap" && e.pool === refPool) lastRefPerBlock.set(e.blockNumber, e);
-    const events = raw.filter((e) => !(e.kind === "swap" && e.pool === refPool) || lastRefPerBlock.get(e.blockNumber) === e);
+    const isRef = (e: ChainEvent) => e.kind === "swap" && priceRef(rt.cfg.chainId, e.pool) !== undefined;
+    // One price per reference pool per block is plenty; keep the last.
+    const lastRef = new Map<string, ChainEvent>();
+    for (const e of raw) if (e.kind === "swap" && isRef(e)) lastRef.set(`${e.pool}:${e.blockNumber}`, e);
+    const events = raw.filter((e) => !isRef(e) || (e.kind === "swap" && lastRef.get(`${e.pool}:${e.blockNumber}`) === e));
 
     const fresh = db.insertEvents(events);
     const touched = new Set<Address>();
@@ -280,7 +280,7 @@ export class ArgusEngine {
       rt.eventsApplied++;
       if (e.blockNumber > rt.lastBlock) rt.lastBlock = e.blockNumber;
       if (e.timestamp > rt.lastTs) rt.lastTs = e.timestamp;
-      if (e.kind === "swap" && e.pool === refPool) {
+      if (isRef(e)) {
         touched.add(REF_TOUCH);
         continue;
       }

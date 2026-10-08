@@ -1,4 +1,4 @@
-import { chainInfo, quoteInfo, type DexVersion } from "./chains.ts";
+import { chainInfo, priceRef, quoteInfo, type DexVersion } from "./chains.ts";
 import { BURN_ADDRESSES, ZERO_ADDRESS, type Address, type ChainEvent, type LiquidityEvent, type PoolCreatedEvent, type ReservesEvent, type SwapEvent, type TransferEvent } from "./model.ts";
 
 // Per-chain market state derived from events. Pure (no I/O) and rewindable:
@@ -89,7 +89,8 @@ const Q96 = 2 ** 96;
 
 export class ChainState {
   readonly chainId: number;
-  nativeUsd = 0;
+  /** USD per whole token for every reference-priced token (wrapped native, ZORA, …). */
+  private refPrices = new Map<Address, number>();
   private pools = new Map<Address, PoolState>();
   private tokens = new Map<Address, TokenState>();
   private meta = new Map<Address, TokenMeta>();
@@ -100,6 +101,19 @@ export class ChainState {
 
   constructor(chainId: number) {
     this.chainId = chainId;
+  }
+
+  get nativeUsd(): number {
+    return this.refPrices.get(chainInfo(this.chainId).wrappedNative) ?? 0;
+  }
+
+  /** Seed a reference price (e.g. before the first reference swap is seen). */
+  setRefPrice(token: Address, usd: number): void {
+    if (usd > 0 && Number.isFinite(usd)) this.refPrices.set(token, usd);
+  }
+
+  refPrice(token: Address): number | null {
+    return this.refPrices.get(token) ?? null;
   }
 
   // ---- non-event facts -----------------------------------------------------------
@@ -150,7 +164,7 @@ export class ChainState {
       quoteBalance: 0n,
       sqrtPriceX96: null,
     });
-    if (ref.address !== chainInfo(this.chainId).nativeUsdPool.address) this.tokenState(ref.token, 0).pools.add(ref.address);
+    if (!priceRef(this.chainId, ref.address)) this.tokenState(ref.token, 0).pools.add(ref.address);
   }
 
   isPool(addr: Address): boolean {
@@ -175,7 +189,7 @@ export class ChainState {
   apply(evt: ChainEvent): void {
     const undos: Undo[] = [];
     switch (evt.kind) {
-      case "pool_created": this.applyPoolCreated(evt); break;
+      case "pool_created": this.applyPoolCreated(evt, undos); break;
       case "swap": this.applySwap(evt, undos); break;
       case "reserves": this.applyReserves(evt, undos); break;
       case "liquidity": this.applyLiquidity(evt, undos); break;
@@ -218,19 +232,45 @@ export class ChainState {
     return t;
   }
 
-  private applyPoolCreated(evt: PoolCreatedEvent): void {
+  private applyPoolCreated(evt: PoolCreatedEvent, undos: Undo[]): void {
     // Launch facts are recorded when the pool's first liquidity arrives (the
     // creator is the tx signer there); registration itself happens via registerPool.
     const p = this.pools.get(evt.pool);
-    if (p && p.createdBlock === null) p.createdBlock = evt.blockNumber;
+    if (!p) return;
+    const [created, sqrt] = [p.createdBlock, p.sqrtPriceX96];
+    if (p.createdBlock === null) p.createdBlock = evt.blockNumber;
+    // V4 pools are priced at Initialize, before any liquidity or swap.
+    if (p.sqrtPriceX96 === null && evt.sqrtPriceX96 !== undefined) p.sqrtPriceX96 = evt.sqrtPriceX96;
+    undos.push(() => { p.createdBlock = created; p.sqrtPriceX96 = sqrt; });
   }
 
   /** USD value of one raw unit of a quote token. */
   private quoteUnitUsd(quote: Address): number {
     const q = quoteInfo(this.chainId, quote);
     if (!q) return 0;
-    const price = q.stable ? 1 : this.nativeUsd;
+    const price = q.pricing === "stable" ? 1 : q.pricing === "native" ? this.nativeUsd : (this.refPrices.get(quote) ?? 0);
     return price / 10 ** q.decimals;
+  }
+
+  /** Reference pool swap → USD price of its base token, from the post-swap pool price. */
+  private applyRefSwap(evt: SwapEvent, undos: Undo[]): void {
+    const ref = priceRef(this.chainId, evt.pool);
+    const base = ref ? quoteInfo(this.chainId, ref.base) : undefined;
+    const usd = ref ? quoteInfo(this.chainId, ref.usd) : undefined;
+    if (!ref || !base || !usd) return;
+    let price: number;
+    if (evt.sqrtPriceX96 !== null) {
+      const ratio = (Number(evt.sqrtPriceX96) / Q96) ** 2; // raw token1 per raw token0
+      const usdPerBaseRaw = ref.base === ref.token0 ? ratio : 1 / ratio;
+      price = (usdPerBaseRaw * 10 ** base.decimals) / 10 ** usd.decimals;
+    } else {
+      if (evt.tokenAmount <= 0n) return;
+      price = (Number(evt.quoteAmount) / 10 ** usd.decimals) / (Number(evt.tokenAmount) / 10 ** base.decimals);
+    }
+    if (!(price > 0) || !Number.isFinite(price)) return;
+    const prev = this.refPrices.get(ref.base);
+    this.refPrices.set(ref.base, price);
+    undos.push(() => { if (prev === undefined) this.refPrices.delete(ref.base); else this.refPrices.set(ref.base, prev); });
   }
 
   private applySwap(evt: SwapEvent, undos: Undo[]): void {
@@ -238,7 +278,7 @@ export class ChainState {
     if (!pool) return;
     const prevSqrt = pool.sqrtPriceX96;
     if (evt.sqrtPriceX96 !== null) pool.sqrtPriceX96 = evt.sqrtPriceX96;
-    if (pool.dex === "v3") {
+    if (pool.dex !== "v2") {
       const [tb, qb] = [pool.tokenBalance, pool.quoteBalance];
       pool.tokenBalance += evt.side === "buy" ? -evt.tokenAmount : evt.tokenAmount;
       pool.quoteBalance += evt.side === "buy" ? evt.quoteAmount : -evt.quoteAmount;
@@ -246,15 +286,8 @@ export class ChainState {
     }
     undos.push(() => { pool.sqrtPriceX96 = prevSqrt; });
 
-    if (evt.pool === chainInfo(this.chainId).nativeUsdPool.address) {
-      // Reference pool: token = wrapped native, quote = USDC.
-      const prev = this.nativeUsd;
-      const usdc = quoteInfo(this.chainId, evt.quote);
-      const wrapped = quoteInfo(this.chainId, evt.token);
-      if (usdc && wrapped && evt.tokenAmount > 0n) {
-        this.nativeUsd = (Number(evt.quoteAmount) / 10 ** usdc.decimals) / (Number(evt.tokenAmount) / 10 ** wrapped.decimals);
-        undos.push(() => { this.nativeUsd = prev; });
-      }
+    if (priceRef(this.chainId, evt.pool)) {
+      this.applyRefSwap(evt, undos);
       return;
     }
 
@@ -306,18 +339,24 @@ export class ChainState {
 
   private applyLiquidity(evt: LiquidityEvent, undos: Undo[]): void {
     const pool = this.pools.get(evt.pool);
-    if (!pool || evt.pool === chainInfo(this.chainId).nativeUsdPool.address) return;
+    if (!pool || priceRef(this.chainId, evt.pool)) return;
     const t = this.tokenState(evt.token, evt.timestamp);
-    const quoteBefore = evt.action === "add" ? pool.quoteBalance : pool.quoteBalance + (pool.dex === "v2" ? evt.quoteAmount : 0n);
-    if (pool.dex === "v3") {
+    let { tokenAmount, quoteAmount } = evt;
+    if (evt.range) {
+      if (pool.sqrtPriceX96 === null) return;
+      const [a0, a1] = rangeAmounts(pool.sqrtPriceX96, evt.range.liquidity, evt.range.tickLower, evt.range.tickUpper);
+      [tokenAmount, quoteAmount] = pool.tokenIs0 ? [a0, a1] : [a1, a0];
+    }
+    const quoteBefore = evt.action === "add" ? pool.quoteBalance : pool.quoteBalance + (pool.dex === "v2" ? quoteAmount : 0n);
+    if (pool.dex !== "v2") {
       const [tb, qb] = [pool.tokenBalance, pool.quoteBalance];
       const sign = evt.action === "add" ? 1n : -1n;
-      pool.tokenBalance += sign * evt.tokenAmount;
-      pool.quoteBalance += sign * evt.quoteAmount;
+      pool.tokenBalance += sign * tokenAmount;
+      pool.quoteBalance += sign * quoteAmount;
       undos.push(() => { pool.tokenBalance = tb; pool.quoteBalance = qb; });
     }
-    const usd = 2 * Number(evt.quoteAmount) * this.quoteUnitUsd(evt.quote);
-    const fraction = evt.action === "remove" && quoteBefore > 0n ? Math.min(1, Number(evt.quoteAmount) / Number(quoteBefore)) : 0;
+    const usd = 2 * Number(quoteAmount) * this.quoteUnitUsd(evt.quote);
+    const fraction = evt.action === "remove" && quoteBefore > 0n ? Math.min(1, Number(quoteAmount) / Number(quoteBefore)) : 0;
     t.liquidity.push({ ts: evt.timestamp, block: evt.blockNumber, action: evt.action, usd, provider: evt.provider, fraction });
     undos.push(() => { t.liquidity.pop(); });
     if (evt.action === "add" && t.launch === null && pool.createdBlock !== null) {
@@ -328,7 +367,7 @@ export class ChainState {
   }
 
   private trackLiquidity(pool: PoolState, ts: number, undos: Undo[]): void {
-    if (pool.address === chainInfo(this.chainId).nativeUsdPool.address) return;
+    if (priceRef(this.chainId, pool.address)) return;
     const t = this.tokenState(pool.token, ts);
     const liq = this.tokenLiquidityUsd(t);
     const [init, peak] = [t.initialLiquidityUsd, t.peakLiquidityUsd];
@@ -384,7 +423,7 @@ export class ChainState {
     const p = this.pools.get(main.address)!;
     const qUsd = this.quoteUnitUsd(p.quote);
     if (qUsd === 0) return null;
-    if (p.dex === "v3" && p.sqrtPriceX96 !== null) {
+    if (p.dex !== "v2" && p.sqrtPriceX96 !== null) {
       const ratio = (Number(p.sqrtPriceX96) / Q96) ** 2; // raw token1 per raw token0
       const quotePerToken = p.tokenIs0 ? ratio : 1 / ratio;
       return Number.isFinite(quotePerToken) && quotePerToken > 0 ? quotePerToken * qUsd : null;
@@ -663,4 +702,25 @@ function computeMetrics(state: ChainState, t: TokenState, now: number): TokenMet
     smartBuyers: [...smartBuyers],
     mevTraders: mev.size,
   };
+}
+
+/**
+ * Token amounts (raw units) backing `liquidity` in [tickLower, tickUpper) at
+ * the current price: standard concentrated-liquidity math, in floating point
+ * (the amounts feed USD estimates, not settlement).
+ */
+export function rangeAmounts(sqrtPriceX96: bigint, liquidity: bigint, tickLower: number, tickUpper: number): [bigint, bigint] {
+  const sp = Number(sqrtPriceX96) / Q96;
+  const sa = 1.0001 ** (tickLower / 2);
+  const sb = 1.0001 ** (tickUpper / 2);
+  const l = Number(liquidity);
+  let a0 = 0;
+  let a1 = 0;
+  if (sp <= sa) a0 = (l * (sb - sa)) / (sa * sb);
+  else if (sp < sb) {
+    a0 = (l * (sb - sp)) / (sp * sb);
+    a1 = l * (sp - sa);
+  } else a1 = l * (sb - sa);
+  const big = (x: number) => (Number.isFinite(x) && x > 0 ? BigInt(Math.floor(x)) : 0n);
+  return [big(a0), big(a1)];
 }

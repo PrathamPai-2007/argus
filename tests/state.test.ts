@@ -5,7 +5,7 @@ import { ChainState } from "../src/state.ts";
 
 const WETH = CHAINS[1]!.wrappedNative;
 const USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
-const REF = CHAINS[1]!.nativeUsdPool.address;
+const REF = CHAINS[1]!.priceRefs[0]!.address;
 const MEME = "0x" + "11".repeat(20);
 const POOL = "0x" + "ab".repeat(20);
 const DEV = "0x" + "de".repeat(20);

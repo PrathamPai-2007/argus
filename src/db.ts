@@ -81,6 +81,8 @@ const BIGINT_FIELDS = ["amount", "tokenAmount", "quoteAmount", "tokenReserve", "
 export function reviveEvent(payload: string): ChainEvent {
   const e = JSON.parse(payload) as Record<string, unknown>;
   for (const k of BIGINT_FIELDS) if (typeof e[k] === "string") e[k] = BigInt(e[k] as string);
+  const range = e["range"] as { liquidity?: unknown } | undefined;
+  if (range && typeof range.liquidity === "string") range.liquidity = BigInt(range.liquidity);
   return e as unknown as ChainEvent;
 }
 

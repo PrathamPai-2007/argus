@@ -57,7 +57,7 @@ export interface ReservesEvent extends EventBase {
   quoteReserve: bigint;
 }
 
-/** Liquidity added to or removed from a pool (V2 Mint/Burn, V3 Mint/Burn). */
+/** Liquidity added to or removed from a pool (V2 Mint/Burn, V3 Mint/Burn, V4 ModifyLiquidity). */
 export interface LiquidityEvent extends EventBase {
   kind: "liquidity";
   pool: Address;
@@ -68,16 +68,26 @@ export interface LiquidityEvent extends EventBase {
   tokenAmount: bigint;
   quoteAmount: bigint;
   provider: Address;
+  /**
+   * V4 reports liquidity, not token amounts: amounts are derived in state from
+   * the position range and the pool price at that moment.
+   */
+  range?: { liquidity: bigint; tickLower: number; tickUpper: number };
 }
 
 export interface PoolCreatedEvent extends EventBase {
   kind: "pool_created";
+  /** Pool contract address, or the bytes32 pool id for V4. */
   pool: Address;
   dex: DexVersion;
   factory: Address;
   token0: Address;
   token1: Address;
   fee: number | null;
+  /** V4 initial price (pools start priced before any liquidity or swap). */
+  sqrtPriceX96?: bigint;
+  /** V4 hooks contract (address(0) when none). */
+  hooks?: Address;
 }
 
 export type FundingMethod = "native_transfer" | "disperse";

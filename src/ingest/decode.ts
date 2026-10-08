@@ -17,7 +17,22 @@ export const TOPICS = {
   v3Swap: toEventSelector("Swap(address,address,int256,int256,uint160,uint128,int24)"),
   v3Mint: toEventSelector("Mint(address,address,int24,int24,uint128,uint256,uint256)"),
   v3Burn: toEventSelector("Burn(address,int24,int24,uint128,uint256,uint256)"),
+  v4Initialize: toEventSelector("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)"),
+  v4Swap: toEventSelector("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"),
+  v4ModifyLiquidity: toEventSelector("ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)"),
 } as const;
+
+const FACTORY_TOPICS: ReadonlySet<string> = new Set([TOPICS.pairCreated, TOPICS.poolCreated, TOPICS.v4Initialize]);
+
+export function isPoolCreation(log: Pick<RawLog, "topics">): boolean {
+  return FACTORY_TOPICS.has(log.topics[0]?.toLowerCase() ?? "");
+}
+
+/** Key a pool log by its pool: the contract address, or the bytes32 pool id inside a V4 PoolManager. */
+export function poolKey(log: Pick<RawLog, "address" | "topics">, factory: (a: Address) => FactoryInfo | undefined): Address {
+  const address = log.address.toLowerCase();
+  return factory(address)?.dex === "v4" ? (log.topics[1] ?? "").toLowerCase() : address;
+}
 
 export const ALL_TOPICS: Hex[] = Object.values(TOPICS);
 
@@ -33,6 +48,7 @@ export interface RawLog {
 
 /** A registered pool, already oriented: `token` is traded, `quote` prices it. */
 export interface PoolRef {
+  /** Pool contract, or the bytes32 pool id for V4. */
   address: Address;
   dex: DexVersion;
   token0: Address;
@@ -117,8 +133,8 @@ function swap(log: RawLog, ctx: DecodeContext, pool: PoolRef, delta0: bigint, de
   };
 }
 
-function liquidity(log: RawLog, ctx: DecodeContext, pool: PoolRef, action: "add" | "remove", amount0: bigint, amount1: bigint, fallbackProvider: Address): LiquidityEvent | null {
-  if (amount0 === 0n && amount1 === 0n) return null; // V3 fee poke
+function liquidity(log: RawLog, ctx: DecodeContext, pool: PoolRef, action: "add" | "remove", amount0: bigint, amount1: bigint, fallbackProvider: Address, range?: LiquidityEvent["range"]): LiquidityEvent | null {
+  if (!range && amount0 === 0n && amount1 === 0n) return null; // V3 fee poke
   const tokenIs0 = pool.token === pool.token0;
   return {
     kind: "liquidity",
@@ -131,6 +147,7 @@ function liquidity(log: RawLog, ctx: DecodeContext, pool: PoolRef, action: "add"
     tokenAmount: tokenIs0 ? amount0 : amount1,
     quoteAmount: tokenIs0 ? amount1 : amount0,
     provider: ctx.tx(log.transactionHash.toLowerCase())?.from ?? fallbackProvider,
+    ...(range ? { range } : {}),
   };
 }
 
@@ -148,6 +165,24 @@ export function decodeLog(log: RawLog, ctx: DecodeContext): ChainEvent | null {
       from: topicAddress(log.topics[1] as Hex),
       to: topicAddress(log.topics[2] as Hex),
       amount: word(log.data, 0),
+    };
+    return evt;
+  }
+
+  if (topic0 === TOPICS.v4Initialize) {
+    // Initialize(id, currency0, currency1 | fee, tickSpacing, hooks, sqrtPriceX96, tick)
+    if (ctx.factory(address)?.dex !== "v4" || !shapeOk(log, 4, 5)) return null;
+    const evt: PoolCreatedEvent = {
+      kind: "pool_created",
+      ...base(log, ctx),
+      pool: (log.topics[1] as string).toLowerCase(),
+      dex: "v4",
+      factory: address,
+      token0: topicAddress(log.topics[2] as Hex),
+      token1: topicAddress(log.topics[3] as Hex),
+      fee: Number(word(log.data, 0)),
+      hooks: wordAddress(log.data, 2),
+      sqrtPriceX96: word(log.data, 3),
     };
     return evt;
   }
@@ -170,8 +205,24 @@ export function decodeLog(log: RawLog, ctx: DecodeContext): ChainEvent | null {
     return evt;
   }
 
-  const pool = ctx.pool(address);
+  const pool = ctx.pool(poolKey(log, ctx.factory));
   if (!pool) return null;
+
+  if (pool.dex === "v4") {
+    if (topic0 === TOPICS.v4Swap && shapeOk(log, 3, 6)) {
+      // V4 emits the swapper's balance delta (negative = the swapper paid),
+      // the opposite of V3 and of its own NatSpec — verified on a live
+      // native-ETH buy. Negate into the pool's perspective.
+      return swap(log, ctx, pool, -signedWord(log.data, 0), -signedWord(log.data, 1), topicAddress(log.topics[2] as Hex), word(log.data, 2));
+    }
+    if (topic0 === TOPICS.v4ModifyLiquidity && shapeOk(log, 3, 4)) {
+      const delta = signedWord(log.data, 2);
+      if (delta === 0n) return null;
+      const range = { liquidity: delta < 0n ? -delta : delta, tickLower: Number(signedWord(log.data, 0)), tickUpper: Number(signedWord(log.data, 1)) };
+      return liquidity(log, ctx, pool, delta > 0n ? "add" : "remove", 0n, 0n, topicAddress(log.topics[2] as Hex), range);
+    }
+    return null;
+  }
 
   if (pool.dex === "v2") {
     if (topic0 === TOPICS.v2Swap && shapeOk(log, 3, 4)) {

@@ -1,7 +1,7 @@
-import { chainInfo, factoryInfo, orientPair } from "../chains.ts";
+import { chainInfo, factoryInfo, orientPair, priceRef, priceRefPool } from "../chains.ts";
 import { log } from "../logger.ts";
 import { compareEvents, type Address, type ChainEvent, type PoolCreatedEvent } from "../model.ts";
-import { ALL_TOPICS, decodeLog, TOPICS, type PoolRef, type RawLog, type TxInfo } from "./decode.ts";
+import { ALL_TOPICS, decodeLog, isPoolCreation, poolKey, type PoolRef, type RawLog, type TxInfo } from "./decode.ts";
 import { HeadStream } from "./heads.ts";
 import { hex, type RpcPool } from "./rpc.ts";
 
@@ -105,8 +105,7 @@ export class ChainSync {
 
   setWatchedTokens(tokens: Iterable<Address>): void {
     this.tokens = new Set([...tokens].map((t) => t.toLowerCase()));
-    const ref = chainInfo(this.chainId).nativeUsdPool.address;
-    for (const p of this.pools.values()) if (p.address !== ref) this.tokens.add(p.token);
+    for (const p of this.pools.values()) if (!priceRef(this.chainId, p.address)) this.tokens.add(p.token);
   }
 
   watchedTokens(): Address[] {
@@ -117,10 +116,19 @@ export class ChainSync {
     return [...this.pools.values()];
   }
 
+  /**
+   * Log sources: factories (incl. V4 PoolManagers, which also emit every V4
+   * pool's swaps), price references, pool contracts and watched tokens. V4
+   * pools are bytes32 ids, not addresses, so they never enter the filter.
+   */
   private addresses(): Address[] {
     const info = chainInfo(this.chainId);
-    const set = new Set<Address>([...info.factories.map((f) => f.address), info.nativeUsdPool.address, ...this.pools.keys(), ...this.tokens]);
-    return [...set];
+    const pools = [...this.pools.keys()].filter((k) => k.length === 42);
+    return [...new Set<Address>([...info.factories.map((f) => f.address), ...pools, ...this.tokens])];
+  }
+
+  private poolOf(l: RawLog): PoolRef | undefined {
+    return this.pools.get(poolKey(l, (a) => factoryInfo(this.chainId, a)));
   }
 
   // ---- lifecycle ----------------------------------------------------------------
@@ -137,9 +145,7 @@ export class ChainSync {
     if (this.opts.rewindBlocks) this.cursor = Math.min(resume ?? Infinity, this.head - this.opts.rewindBlocks);
     else this.cursor = resume !== null && resume < this.head && this.head - resume <= maxGap ? resume : this.head - 1;
     this.finalized = Math.max(this.finalized, resume ?? 0);
-    const info = chainInfo(this.chainId);
-    const ref = info.nativeUsdPool;
-    this.registerPool({ address: ref.address, dex: ref.dex, token0: ref.token0, token1: ref.token1, token: info.wrappedNative, quote: ref.token0 === info.wrappedNative ? ref.token1 : ref.token0 }, { watchToken: false });
+    for (const r of chainInfo(this.chainId).priceRefs) this.registerPool(priceRefPool(r), { watchToken: false });
     if (this.opts.wsUrls.length > 0) {
       this.heads = new HeadStream(this.opts.wsUrls, (n) => this.onHead(n), `heads:${this.chainId}`);
       this.heads.start();
@@ -330,7 +336,8 @@ export class ChainSync {
     if (created.length > 0) {
       const followUp = new Set<Address>();
       for (const c of created) {
-        followUp.add(c.pool);
+        // V4 pools live in the PoolManager, whose logs are already in this range.
+        if (c.dex !== "v4") followUp.add(c.pool);
         const ref = this.pools.get(c.pool);
         if (ref) followUp.add(ref.token);
       }
@@ -390,7 +397,7 @@ export class ChainSync {
     const created: PoolCreatedEvent[] = [];
     // Factory events first so pools created in this batch are known before signer lookup.
     for (const l of logs) {
-      if (l.topics[0] !== TOPICS.pairCreated && l.topics[0] !== TOPICS.poolCreated) continue;
+      if (!isPoolCreation(l)) continue;
       const evt = decodeLog(l, this.context(l.blockNumber, timeOf, new Map()));
       if (evt?.kind !== "pool_created") continue;
       out.push(evt);
@@ -402,9 +409,9 @@ export class ChainSync {
         created.push(evt);
       }
     }
-    const txs = await this.signers(logs.filter((l) => this.pools.has(l.address)).map((l) => l.transactionHash));
+    const txs = await this.signers(logs.filter((l) => this.poolOf(l) !== undefined).map((l) => l.transactionHash));
     for (const l of logs) {
-      if (l.topics[0] === TOPICS.pairCreated || l.topics[0] === TOPICS.poolCreated) continue;
+      if (isPoolCreation(l)) continue;
       const evt = decodeLog(l, this.context(l.blockNumber, timeOf, txs));
       if (evt) out.push(evt);
     }

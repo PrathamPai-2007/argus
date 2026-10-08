@@ -47,7 +47,7 @@ export async function runDoctor(configPath?: string): Promise<number> {
       try {
         const head = Number(BigInt(await rpc.request<string>("eth_blockNumber", [])));
         const latency = Date.now() - t0;
-        const addresses = [...info.factories.map((f) => f.address), info.nativeUsdPool.address];
+        const addresses = [...info.factories.map((f) => f.address), ...info.priceRefs.map((r) => r.address)];
         const logs = await rpc.request<unknown[]>("eth_getLogs", [{ fromBlock: hex(head - 20), toBlock: hex(head - 1), address: addresses, topics: [ALL_TOPICS] }]);
         anyHttp = true;
         checks.push({ name: `http[${chain.name}]`, ok: true, detail: `${redactUrl(url)} head=${head} ${latency}ms · filtered getLogs ok (${logs.length} logs / 20 blocks)` });

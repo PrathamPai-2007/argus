@@ -1,4 +1,4 @@
-import { chainInfo } from "../chains.ts";
+import { chainInfo, priceRefPool } from "../chains.ts";
 import { loadConfig } from "../config.ts";
 import * as db from "../db.ts";
 import type { Address } from "../model.ts";
@@ -24,8 +24,7 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
   state.setServiceLabels(new Map([...labels].filter(([, l]) => ["cex", "router", "bridge"].includes(l.kind)).map(([a, l]) => [a, l.label])));
   for (const f of db.loadFunding(args.chainId)) state.setFunding(f.wallet, { funder: f.funder, funderIsService: f.funderIsService });
   state.setSmartWallets(db.smartWallets(args.chainId, cfg.smartMoney));
-  const ref = info.nativeUsdPool;
-  state.registerPool({ address: ref.address, dex: ref.dex, token0: ref.token0, token: info.wrappedNative, quote: ref.token0 === info.wrappedNative ? ref.token1 : ref.token0 });
+  for (const r of info.priceRefs) state.registerPool(priceRefPool(r));
   for (const p of db.listPools(args.chainId)) state.registerPool(p, p.createdBlock);
   for (const t of db.listWatchedTokens(args.chainId, 0)) state.setTokenMeta(t.address, { symbol: t.symbol, name: t.name, decimals: t.decimals, totalSupply: t.totalSupply });
 
@@ -57,7 +56,7 @@ export async function runReplay(args: ReplayArgs): Promise<number> {
     }
     state.apply(e);
     lastTs = e.timestamp;
-    if ((e.kind === "swap" || e.kind === "transfer" || e.kind === "liquidity" || e.kind === "reserves") && e.token !== info.wrappedNative) touched.add(e.token);
+    if ((e.kind === "swap" || e.kind === "transfer" || e.kind === "liquidity" || e.kind === "reserves") && !info.priceRefs.some((r) => r.base === e.token)) touched.add(e.token);
   }
   flush(lastTs);
 
