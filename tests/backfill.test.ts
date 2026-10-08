@@ -40,6 +40,19 @@ describe("historical providers", () => {
     expect(logs[0]?.blockNumber).toBe(100n);
   });
 
+  test("parses Etherscan's bare \"0x\" index encoding as zero", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ status: "1", message: "OK", result: [{
+      address: "0x" + "aa".repeat(20), topics: ["0x" + "11".repeat(32)], data: "0x", blockNumber: "0x64",
+      transactionHash: "0x" + "22".repeat(32), transactionIndex: "0x", logIndex: "0x", timeStamp: "0x6553f100",
+    }] }))) as unknown as typeof fetch;
+    const logs = await fetchEtherscanLogs({
+      apiUrl: "https://example.test/api", apiKey: "k", chainId: 1, addresses: ["0x" + "aa".repeat(20)],
+      topic0: ("0x" + "11".repeat(32)) as `0x${string}`, fromBlock: 100n, toBlock: 100n,
+    });
+    expect(logs[0]?.logIndex).toBe(0);
+    expect(logs[0]?.transactionIndex).toBe(0);
+  });
+
   test("reports per-request progress via onRequest", async () => {
     let calls = 0;
     globalThis.fetch = (async () => {

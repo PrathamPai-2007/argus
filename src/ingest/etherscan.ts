@@ -18,7 +18,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const INITIAL_RANGE_BLOCKS = 256n;
 
 function asNumber(value: string): number {
-  const n = value.startsWith("0x") ? Number.parseInt(value, 16) : Number(value);
+  // Etherscan encodes index 0 as a bare "0x" (observed for transactionIndex/logIndex).
+  const n = value === "0x" ? 0 : value.startsWith("0x") ? Number.parseInt(value, 16) : Number(value);
   if (!Number.isSafeInteger(n) || n < 0) throw new Error(`Etherscan log has invalid numeric field: ${value}`);
   return n;
 }
