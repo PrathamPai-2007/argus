@@ -93,6 +93,18 @@ export class RpcPool {
 
   /** Executes calls in order; results align with input. Fails if any call fails. */
   async batch(calls: RpcCall[]): Promise<unknown[]> {
+    return this.run(calls, false);
+  }
+
+  /**
+   * Like batch(), but a non-retryable per-call error (an eth_call revert, a
+   * non-contract) yields null for that item instead of failing the batch.
+   */
+  async settle(calls: RpcCall[]): Promise<unknown[]> {
+    return this.run(calls, true);
+  }
+
+  private async run(calls: RpcCall[], tolerant: boolean): Promise<unknown[]> {
     if (calls.length === 0) return [];
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < this.endpoints.length * 2; attempt++) {
@@ -102,7 +114,7 @@ export class RpcPool {
       try {
         const out: unknown[] = [];
         for (let i = 0; i < calls.length; i += ep.limits.maxBatch) {
-          out.push(...(await this.send(ep, calls.slice(i, i + ep.limits.maxBatch))));
+          out.push(...(await this.send(ep, calls.slice(i, i + ep.limits.maxBatch), tolerant)));
         }
         ep.failures = 0;
         return out;
@@ -139,7 +151,7 @@ export class RpcPool {
     }
   }
 
-  private async send(ep: Endpoint, calls: RpcCall[]): Promise<unknown[]> {
+  private async send(ep: Endpoint, calls: RpcCall[], tolerant: boolean): Promise<unknown[]> {
     await this.throttle(ep, calls.length);
     this.stats.requests++;
     this.stats.calls += calls.length;
@@ -169,7 +181,11 @@ export class RpcPool {
     return body.map((b) => {
       const r = byId.get(b.id);
       if (!r) throw new RpcError("batch reply missing id", null, true);
-      if (r.error) throw new RpcError(`${b.method}: ${r.error.message}`, r.error.code, isRetryable(r.error.code, r.error.message));
+      if (r.error) {
+        const retryable = isRetryable(r.error.code, r.error.message);
+        if (tolerant && !retryable) return null;
+        throw new RpcError(`${b.method}: ${r.error.message}`, r.error.code, retryable);
+      }
       return r.result;
     });
   }

@@ -62,3 +62,11 @@ describe("RpcPool", () => {
     expect(calls).toBe(1);
   });
 });
+
+test("settle() nulls out reverted calls without failing the batch", async () => {
+  mockFetch((_u, body) => new Response(JSON.stringify((body as Array<{ id: number }>).map((b, i) =>
+    i === 1 ? { id: b.id, error: { code: 3, message: "execution reverted" } } : { id: b.id, result: "0x01" }))));
+  const pool = new RpcPool(["https://a.test"]);
+  expect(await pool.settle([{ method: "eth_call", params: [] }, { method: "eth_call", params: [] }, { method: "eth_call", params: [] }])).toEqual(["0x01", null, "0x01"]);
+  await expect(pool.batch([{ method: "eth_call", params: [] }, { method: "eth_call", params: [] }])).rejects.toThrow("reverted");
+});
