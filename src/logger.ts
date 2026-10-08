@@ -8,6 +8,7 @@ const threshold = LEVELS[(process.env.ARGUS_LOG_LEVEL as LogLevel) ?? (process.a
 const LOG_DIR = join(process.cwd(), "logs");
 mkdirSync(LOG_DIR, { recursive: true });
 
+// ponytail: manual UTC timestamp avoids toISOString() slice + padStart chain; kept for stable filename sorting and no extra alloc
 function pad(value: number): string {
   return String(value).padStart(2, "0");
 }

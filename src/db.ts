@@ -1,3 +1,4 @@
+// ponytail: 995-line / 74-export monolith — split into db/{events,wallets,tokens,alerts,performance}.ts when second domain migrates independently; pagination dedup done via delegation (listX -> listXPage)
 import { Database } from "bun:sqlite";
 import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -747,7 +748,7 @@ export interface AlertRow {
 }
 
 export function listAlerts(limit = 100): AlertRow[] {
-  return getDb().query("SELECT * FROM alerts ORDER BY id DESC LIMIT ?").all(limit) as AlertRow[];
+  return listAlertsPage(limit).items;
 }
 
 export function listAlertsPage(limit = 100, beforeId?: number): { items: AlertRow[]; nextCursor: string | null } {
@@ -842,14 +843,7 @@ export function getPerformanceForAlert(alertId: number): PerformanceSession | nu
 }
 
 export function listPerformanceSessions(opts: { chainId?: number; tokenAddress?: Address; activeOnly?: boolean; limit?: number } = {}): PerformanceSession[] {
-  const where: string[] = [];
-  const params: (string | number)[] = [];
-  if (opts.chainId !== undefined) { where.push("chain_id = ?"); params.push(opts.chainId); }
-  if (opts.tokenAddress !== undefined) { where.push("token_address = ?"); params.push(opts.tokenAddress); }
-  if (opts.activeOnly) where.push("outcome = 'active'");
-  const sql = `SELECT * FROM performance_sessions ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`;
-  params.push(opts.limit ?? 100);
-  return (getDb().query(sql).all(...params) as PerformanceRow[]).map(mapPerformance);
+  return listPerformancePage({ ...opts }).items;
 }
 
 export function listPerformancePage(opts: { limit?: number; beforeId?: number; chainId?: number; tokenAddress?: Address; activeOnly?: boolean } = {}): { items: PerformanceSession[]; nextCursor: string | null } {
@@ -926,10 +920,7 @@ export function retractPerformanceFrom(chainId: number, fromBlock: number): numb
 }
 
 export function listSignals(chainId?: number, limit = 50): Signal[] {
-  const rows = (chainId
-    ? getDb().query("SELECT s.*, e.score AS evaluation_score, e.severity AS evaluation_severity, e.outcome AS evaluation_outcome, e.reason AS evaluation_reason, e.alert_id AS evaluation_alert_id FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.chain_id = ? AND s.retracted = 0 ORDER BY s.id DESC LIMIT ?").all(chainId, limit)
-    : getDb().query("SELECT s.*, e.score AS evaluation_score, e.severity AS evaluation_severity, e.outcome AS evaluation_outcome, e.reason AS evaluation_reason, e.alert_id AS evaluation_alert_id FROM signals s LEFT JOIN signal_evaluations e ON e.signal_id = s.id WHERE s.retracted = 0 ORDER BY s.id DESC LIMIT ?").all(limit)) as SignalRow[];
-  return rows.map(mapSignalRow);
+  return listSignalsPage(limit, undefined, chainId).items;
 }
 
 export function listSignalsPage(limit = 50, beforeId?: number, chainId?: number): { items: Signal[]; nextCursor: string | null } {

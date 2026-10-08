@@ -18,6 +18,7 @@ const REGISTRY: Record<FactoryName, Record<number, Address[]>> = {
 };
 
 // Back-compat export: chainId → canonical Uniswap V2 factory addresses.
+// ponytail: single-entry REGISTRY looks over-engineered — kept for Base/BNB portability without address sprawl in config; delete when 2nd factory ships
 export const UNIV2_FACTORIES: Record<number, Address[]> = REGISTRY["uniswap-v2"];
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;

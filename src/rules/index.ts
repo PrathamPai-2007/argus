@@ -263,6 +263,7 @@ export const R8: RuleFn = (evt, view, cfg) => {
 
 export const RULES: Record<string, RuleFn> = { R1, R2, R3, R4, R5, R6, R7, R8 };
 
+// ponytail: round2 duplicates dashboard/server.ts:393 — kept local to avoid cross-layer import (rules stay pure, zero I/O deps)
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }

@@ -7,6 +7,7 @@ import { renderPage } from "./page.ts";
 
 // Phase 4 dashboard (PLAN.md §16): local-only Bun.serve + SSE on 127.0.0.1:<port>.
 // Zero deps: plain ServerResponse API, SSE for live pushes, JSON polling for data.
+// ponytail: 8-branch if-chain router kept over table-driven map — fewer indirections for 401 audit, split when routes exceed 12
 
 export interface DashboardOptions {
   port: number;
@@ -390,6 +391,7 @@ function authorized(req: Request, token: string): boolean {
   return false;
 }
 
+// ponytail: round2 duplicates rules/index.ts:266 — kept local to keep dashboard I/O-free from rule purity layer
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }

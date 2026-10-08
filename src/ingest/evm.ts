@@ -96,6 +96,7 @@ export interface ChainAdapter {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ponytail: mapLimit is chunked Promise.all — stdlib has no concurrency limiter; keep hand-rolled until BACKFILL_CONCURRENCY grows
 /** Run `fn` over `items` with at most `limit` concurrent executions (ordering not guaranteed). */
 async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   let i = 0;

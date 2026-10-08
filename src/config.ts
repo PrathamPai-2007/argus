@@ -106,8 +106,13 @@ export interface ArgusConfig {
 // ---- .env loading (no dependency) -----------------------------------------
 
 function loadDotEnv(): void {
+  // ponytail: hand-rolled .env parser — stdlib process.loadEnvFile() exists since Node 20.12
+  // but manual parse keeps Bun <1.2 compat and preserves quoted-value + no-overwrite semantics; switch when min Node bumps.
   const path = join(process.cwd(), ".env");
   if (!existsSync(path)) return;
+  // prefer native when available (one line), fall back to manual parse
+  const native = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
+  if (native) { try { native(path); return; } catch { /* fall through to manual */ } }
   for (const raw of readFileSync(path, "utf8").split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
@@ -155,6 +160,7 @@ function reqString(obj: Record<string, unknown>, key: string, ctx: string): stri
   return v;
 }
 
+// ponytail: regex isAddress duplicates viem.isAddress — kept local to avoid importing viem in config validation hot path (config loads before viem client); switch if viem becomes config dep.
 function isAddress(s: string): boolean {
   return /^0x[0-9a-fA-F]{40}$/.test(s);
 }

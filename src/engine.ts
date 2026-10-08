@@ -55,6 +55,8 @@ const KNOWN_QUOTES: Record<number, Set<string>> = {
   ),
 };
 
+// ponytail: God object — 30+ private fields spanning drain/graph/rules/alerts/performance/volume/enrichment; split into Engine+PerformancePoller+EnrichmentQueue when file exceeds 1500 lines or second chain adapter ships
+
 export class ArgusEngine {
   private graphs = new Map<number, GraphEngine>();
   private queue = new EventQueue<QueuedEvents>(100_000, (item) => item.events.length, (item) => void this.recoverQueueOverflow(item.chainId));

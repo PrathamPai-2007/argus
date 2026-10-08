@@ -17,6 +17,7 @@ export interface CandidateScore {
   evidence: Record<string, unknown>;
 }
 
+// ponytail: explicit 8-var weighted sum kept for auditability over terse reduce — each component maps to evidence field
 const clamp = (value: number, min = 0, max = 100): number => Math.max(min, Math.min(max, value));
 
 /**
