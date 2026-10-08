@@ -64,6 +64,8 @@ const MAX_RANGE = 100; // headers per batch while catching up
 const ADDRESS_CHUNK = 500;
 const MAX_REORG_WALK = 64;
 const HASH_MEMORY = 512;
+/** Provider answers meaning "this history is pruned here", not "try again". */
+const UNSERVABLE = /first available|unknown state|archive requests|missing trie|pruned|state (is )?not available/i;
 
 class RangeRetry extends Error {}
 
@@ -252,39 +254,74 @@ export class ChainSync {
           await new Promise((r) => setTimeout(r, 300));
           continue;
         }
+        // History the providers no longer serve cannot be recovered by retrying:
+        // skip to recent blocks (best-effort recovery, invariant 8).
+        if (UNSERVABLE.test(String(err))) {
+          const skipTo = Math.max(this.cursor, this.head - 64);
+          log.warn("providers no longer serve this range — skipping ahead", { chainId: this.chainId, from, to: skipTo, err: String(err).slice(0, 200) });
+          this.stats.skippedBlocks += skipTo - this.cursor;
+          this.cursor = skipTo;
+          this.hashes.clear();
+          if (skipTo >= from) continue;
+        }
         throw err;
       }
     }
     if (this.running) this.setStatus("live");
   }
 
-  private async syncRange(from: number, requestedTo: number): Promise<void> {
-    const rpc = this.opts.rpc;
-    const raw = (await rpc.batch(
-      Array.from({ length: requestedTo - from + 1 }, (_, i) => ({ method: "eth_getBlockByNumber", params: [hex(from + i), false] })),
-    )) as Array<Header | null>;
-    // Load-balanced nodes can lag the head we saw: only process blocks this node has.
-    const headers: Header[] = [];
-    for (const h of raw) {
-      if (!h) break;
-      headers.push(h);
-    }
-    if (headers.length === 0) throw new RangeRetry("head block not available yet");
-    for (let i = 1; i < headers.length; i++) {
-      if (headers[i]!.parentHash !== headers[i - 1]!.hash) throw new RangeRetry("inconsistent header chain");
-    }
+  private async headers(blocks: number[]): Promise<Array<Header | null>> {
+    return (await this.opts.rpc.batch(blocks.map((n) => ({ method: "eth_getBlockByNumber", params: [hex(n), false] })))) as Array<Header | null>;
+  }
 
+  /**
+   * Only boundary headers (reorg anchor + range end) and the headers of blocks
+   * that actually carry logs are fetched: an idle 100-block catch-up costs two
+   * header calls instead of a hundred.
+   */
+  private async syncRange(from: number, requestedTo: number): Promise<void> {
+    let to = requestedTo;
+    let [first, last] = await this.headers(from === to ? [from] : [from, to]);
+    // Load-balanced nodes can lag the head we saw: fall back to one block, then wait.
+    if (!first) throw new RangeRetry("head block not available yet");
+    if (from !== to && !last) {
+      to = from;
+      last = first;
+    }
+    last ??= first;
     const parent = this.hashes.get(from - 1);
-    if (parent !== undefined && headers[0]!.parentHash !== parent) {
+    if (parent !== undefined && first.parentHash !== parent) {
       await this.handleReorg(from);
       return;
     }
+    const known = new Map<number, Header>([[from, first], [to, last]]);
+    const hashOf = new Map<number, string>();
+    const timeOf = new Map<number, number>();
+    const index = () => {
+      for (const [n, h] of known) {
+        hashOf.set(n, h.hash);
+        timeOf.set(n, Number(BigInt(h.timestamp)));
+      }
+    };
+    const verify = async (logs: RawLog[], hashes: Map<RawLog, string>) => {
+      const missing = [...new Set(logs.map((l) => l.blockNumber))].filter((n) => !known.has(n));
+      if (missing.length > 0) {
+        const fetched = await this.headers(missing);
+        fetched.forEach((h, i) => {
+          if (!h) throw new RangeRetry(`header ${missing[i]} unavailable`);
+          known.set(missing[i]!, h);
+        });
+      }
+      index();
+      // A log whose block hash differs from the header means the chain moved
+      // between calls: refetch the range rather than ingest a half-reorged view.
+      for (const l of logs) if (hashOf.get(l.blockNumber) !== hashes.get(l)) throw new RangeRetry(`log block hash mismatch at ${l.blockNumber}`);
+    };
+    index();
 
-    const to = from + headers.length - 1;
-    const hashOf = new Map(headers.map((h) => [Number(BigInt(h.number)), h.hash]));
-    const timeOf = new Map(headers.map((h) => [Number(BigInt(h.number)), Number(BigInt(h.timestamp))]));
-
-    const logs = await this.fetchLogs(this.addresses(), from, to, hashOf);
+    const fetched = await this.fetchLogs(this.addresses(), from, to);
+    await verify(fetched.logs, fetched.hashes);
+    const logs = fetched.logs;
     const events: ChainEvent[] = [];
     const created = await this.decodeAll(logs, timeOf, events);
 
@@ -297,9 +334,10 @@ export class ChainSync {
         const ref = this.pools.get(c.pool);
         if (ref) followUp.add(ref.token);
       }
-      const extra = await this.fetchLogs([...followUp], Math.min(...created.map((c) => c.blockNumber)), to, hashOf);
+      const extra = await this.fetchLogs([...followUp], Math.min(...created.map((c) => c.blockNumber)), to);
+      await verify(extra.logs, extra.hashes);
       const seen = new Set(logs.map((l) => `${l.transactionHash}:${l.logIndex}`));
-      await this.decodeAll(extra.filter((l) => !seen.has(`${l.transactionHash}:${l.logIndex}`)), timeOf, events);
+      await this.decodeAll(extra.logs.filter((l) => !seen.has(`${l.transactionHash}:${l.logIndex}`)), timeOf, events);
     }
 
     events.sort(compareEvents);
@@ -309,7 +347,7 @@ export class ChainSync {
     for (const n of this.hashes.keys()) if (n < to - HASH_MEMORY) this.hashes.delete(n);
     this.cursor = to;
     this.lastProcessedAt = Date.now();
-    this.stats.blocks += headers.length;
+    this.stats.blocks += to - from + 1;
     this.stats.logs += logs.length;
     this.stats.events += events.length;
 
@@ -320,20 +358,18 @@ export class ChainSync {
     }
   }
 
-  private async fetchLogs(addresses: Address[], from: number, to: number, hashOf: Map<number, string>): Promise<RawLog[]> {
+  private async fetchLogs(addresses: Address[], from: number, to: number): Promise<{ logs: RawLog[]; hashes: Map<RawLog, string> }> {
     const calls = [];
     for (let i = 0; i < addresses.length; i += ADDRESS_CHUNK) {
       calls.push({ method: "eth_getLogs", params: [{ fromBlock: hex(from), toBlock: hex(to), address: addresses.slice(i, i + ADDRESS_CHUNK), topics: [ALL_TOPICS] }] });
     }
     const results = (await this.opts.rpc.batch(calls)) as RpcLog[][];
     const out: RawLog[] = [];
+    const hashes = new Map<RawLog, string>();
     for (const l of results.flat()) {
       if (l.removed) continue;
       const block = Number(BigInt(l.blockNumber));
-      // A log from a block hash we did not see in the headers means the chain
-      // moved under us between the two calls: refetch the range.
-      if (hashOf.get(block) !== l.blockHash) throw new RangeRetry(`log block hash mismatch at ${block}`);
-      out.push({
+      const raw: RawLog = {
         address: l.address.toLowerCase(),
         topics: l.topics,
         data: l.data,
@@ -341,9 +377,11 @@ export class ChainSync {
         transactionIndex: Number(BigInt(l.transactionIndex)),
         logIndex: Number(BigInt(l.logIndex)),
         transactionHash: l.transactionHash,
-      });
+      };
+      out.push(raw);
+      hashes.set(raw, l.blockHash);
     }
-    return out;
+    return { logs: out, hashes };
   }
 
   /** Decodes logs (registering newly created pools as it goes); returns pools created. */
@@ -397,15 +435,17 @@ export class ChainSync {
 
   private async handleReorg(from: number): Promise<void> {
     this.stats.reorgs++;
-    let fork = from - 1;
+    // Hashes are sparse (range ends and log-bearing blocks); walk the ones we
+    // hold, newest first, until one is still canonical.
+    const candidates = [...this.hashes.keys()].filter((n) => n < from).sort((a, b) => b - a).slice(0, MAX_REORG_WALK);
+    let fork = candidates.at(-1) ?? from - 1;
     let matched = false;
-    for (let depth = 0; depth < MAX_REORG_WALK; depth++, fork--) {
-      const known = this.hashes.get(fork);
-      if (known === undefined) break;
-      const header = await this.opts.rpc.request<Header | null>("eth_getBlockByNumber", [hex(fork), false]);
-      if (header?.hash === known) {
+    if (candidates.length > 0) {
+      const headers = await this.headers(candidates);
+      const hit = candidates.findIndex((n, i) => headers[i]?.hash === this.hashes.get(n));
+      if (hit >= 0) {
+        fork = candidates[hit]!;
         matched = true;
-        break;
       }
     }
     if (!matched) log.error("reorg deeper than tracked history — rewinding to oldest known block", { chainId: this.chainId, from, fork });

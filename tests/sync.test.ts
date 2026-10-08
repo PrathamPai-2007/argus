@@ -144,3 +144,23 @@ describe("ChainSync", () => {
     await sync.stop();
   });
 });
+
+test("skips ranges providers no longer serve instead of retrying forever", async () => {
+  const chain = new FakeChain(400);
+  const realBatch = chain.batch.bind(chain);
+  chain.batch = async (calls) => {
+    for (const c of calls) {
+      const f = c.params[0] as { fromBlock?: string } | undefined;
+      if (c.method === "eth_getLogs" && f?.fromBlock && Number(BigInt(f.fromBlock)) < 300) throw new Error("eth_getLogs: Unknown state. First available block 300");
+    }
+    return realBatch(calls);
+  };
+  const sync = new ChainSync({ chainId: 1, rpc: chain, wsUrls: [], finalityDepth: 2, blockTimeMs: 3_600_000, resumeFrom: 100 }, {
+    onEvents: async () => {}, onReorg: async () => {}, onFinalized: () => {},
+  });
+  await sync.start();
+  await sync.idle();
+  expect(sync.status().cursor).toBe(400);
+  expect(sync.stats.skippedBlocks).toBeGreaterThan(0);
+  await sync.stop();
+});
