@@ -1,107 +1,103 @@
-import { loadConfig } from "./config.ts";
-import { DashboardServer } from "./dashboard/server.ts";
-import { openDb, closeDb } from "./db.ts";
-import { ArgusEngine } from "./engine.ts";
-import { log } from "./logger.ts";
+import { watch } from "node:fs";
 import { runDoctor } from "./cli/doctor.ts";
 import { runReplay } from "./cli/replay.ts";
-import { runBackfill } from "./cli/backfill.ts";
+import { loadConfig, reloadConfig } from "./config.ts";
+import { DashboardServer } from "./dashboard/server.ts";
+import { closeDb, openDb } from "./db.ts";
+import { ArgusEngine } from "./engine.ts";
+import { log } from "./logger.ts";
 
-// CLI entrypoints (PLAN.md §4): run | replay | backfill | doctor
+// CLI: run | doctor | replay
 
 function argValue(flag: string): string | undefined {
   const i = process.argv.indexOf(flag);
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
-function hasFlag(flag: string): boolean {
-  return process.argv.includes(flag);
-}
-
-function blockArg(flag: string): number | null {
-  const value = argValue(flag);
-  if (value === undefined || !/^\d+$/.test(value)) return null;
-  const block = Number(value);
-  return Number.isSafeInteger(block) && block >= 0 ? block : null;
+function intArg(flag: string): number | null {
+  const v = argValue(flag);
+  if (v === undefined || !/^\d+$/.test(v)) return null;
+  const n = Number(v);
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 function usage(): void {
-  console.log(`argus — real-time on-chain intelligence pipeline
+  console.log(`argus — on-chain opportunity scanner (Ethereum + Base, Uniswap V2/V3)
 
 usage:
-  bun run src/index.ts run [--config path] [--no-dashboard]
-  bun run src/index.ts doctor [--config path]
-  bun run src/index.ts replay --chain 1 --from <block> --to <block> [--token 0x...] [--preset name] [--config path]
-  bun run src/index.ts backfill --chain 1 --from <block> --to <block> [--config path]
+  bun run start                      live engine + dashboard (http://127.0.0.1:3737)
+  bun run src/index.ts run [--rewind <blocks>] [--no-dashboard] [--config path]
+        --rewind N   start N blocks behind the head and catch up through the live
+                     path (seeds launches and wallet track records; PublicNode
+                     serves ~9k blocks of logs keyless)
+  bun run doctor                     pre-flight: config, DB, RPC/WS, explorer keys, Telegram
+  bun run replay --chain <id> [--from <block>] [--to <block>]
+                                     re-score stored events offline with the current config
 
 flags:
   --verbose   debug logging
 `);
 }
 
-async function main(): Promise<number> {
+async function run(configPath: string | undefined): Promise<void> {
+  const cfg = await loadConfig(configPath);
+  openDb(cfg.dbPath);
+  const rewind = intArg("--rewind");
+  const engine = new ArgusEngine(cfg, rewind ? { rewindBlocks: rewind } : {});
+  await engine.start();
+
+  let dashboard: DashboardServer | null = null;
+  if (!process.argv.includes("--no-dashboard")) {
+    dashboard = new DashboardServer(engine, cfg);
+    dashboard.start();
+  }
+
+  let debounce: ReturnType<typeof setTimeout> | null = null;
+  const watcher = watch(configPath ?? "argus.config.ts", () => {
+    if (debounce) clearTimeout(debounce);
+    debounce = setTimeout(async () => {
+      const next = await reloadConfig(configPath);
+      if (next) engine.updateConfig(next);
+      else log.warn("config reload failed validation — keeping the previous config");
+    }, 500);
+  });
+
+  let stopping = false;
+  const shutdown = () => {
+    if (stopping) return;
+    stopping = true;
+    log.info("shutting down");
+    watcher.close();
+    dashboard?.stop();
+    void engine.stop().finally(() => {
+      closeDb();
+      process.exit(0);
+    });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  setInterval(() => log.info("engine status", { chains: engine.status().chains.map((c) => ({ chain: c.name, status: c.status, lag: c.lag, tokens: c.watchedTokens, nativeUsd: c.nativeUsd, rpc: c.rpc })) }), 60_000);
+}
+
+async function main(): Promise<number | null> {
   const cmd = process.argv[2] ?? "run";
   const configPath = argValue("--config");
-
   switch (cmd) {
+    case "run":
+      await run(configPath);
+      return null; // keep the process alive
     case "doctor":
       return runDoctor(configPath);
-
     case "replay": {
-      const chainId = Number(argValue("--chain") ?? "1");
-      const from = blockArg("--from");
-      const to = blockArg("--to");
-      if (!Number.isSafeInteger(chainId) || chainId < 1 || from === null || to === null || to < from) {
-        console.error("replay requires --from <block> --to <block>");
+      const chainId = intArg("--chain");
+      if (chainId === null) {
+        console.error("replay requires --chain <id>");
         return 1;
       }
-      const token = argValue("--token");
-      const preset = argValue("--preset");
-      return runReplay({ chainId, from, to, ...(token ? { token } : {}), ...(preset ? { preset } : {}), ...(configPath ? { configPath } : {}) });
+      const from = intArg("--from");
+      const to = intArg("--to");
+      return runReplay({ chainId, ...(from !== null ? { from } : {}), ...(to !== null ? { to } : {}), ...(configPath ? { configPath } : {}) });
     }
-
-    case "backfill": {
-      const chainId = Number(argValue("--chain") ?? "1");
-      const from = blockArg("--from");
-      const to = blockArg("--to");
-      if (!Number.isSafeInteger(chainId) || chainId < 1 || from === null || to === null || to < from) {
-        console.error("backfill requires --from <block> --to <block>");
-        return 1;
-      }
-      return runBackfill({ chainId, from, to, ...(configPath ? { configPath } : {}) });
-    }
-
-    case "run": {
-      const cfg = await loadConfig(configPath);
-      openDb(cfg.dbPath);
-      const engine = new ArgusEngine(cfg);
-      await engine.start();
-
-      let dashboard: DashboardServer | null = null;
-      if (!hasFlag("--no-dashboard")) {
-        dashboard = new DashboardServer(engine, { port: cfg.dashboard.port });
-        dashboard.start();
-      }
-
-      const shutdown = () => {
-        log.info("shutting down");
-        dashboard?.stop();
-        void engine.stop().then(() => {
-          closeDb();
-          process.exit(0);
-        });
-      };
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
-
-      // periodic status line
-      setInterval(() => {
-        const s = engine.status();
-        log.info("engine status", s as Record<string, unknown>);
-      }, 60_000);
-      return 0;
-    }
-
     default:
       usage();
       return cmd === "help" || cmd === "--help" ? 0 : 1;
@@ -110,9 +106,9 @@ async function main(): Promise<number> {
 
 main()
   .then((code) => {
-    if (process.argv[2] !== "run") process.exit(code);
+    if (code !== null) process.exit(code);
   })
   .catch((err) => {
-    console.error("fatal:", err);
+    console.error("fatal:", err instanceof Error ? err.message : err);
     process.exit(1);
   });

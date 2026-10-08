@@ -1,153 +1,86 @@
-import { beforeEach, describe, expect, test } from "bun:test";
-import { closeDb, dashboardMetrics, getCandidate, getToken, insertEvents, insertSignal, listCandidates, listSignals, listSignalsForToken, listWatchedTokens, loadEvents, openDb, promoteCandidate, recentSignals, recordSignalEvaluation, updateCandidateScore, upsertCandidate, upsertToken } from "../src/db.ts";
-import type { FundingEvent, Signal, StandardTransferEvent, SwapEvent } from "../src/types.ts";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as db from "../src/db.ts";
+import type { SwapEvent, TransferEvent } from "../src/model.ts";
+import { openPosition } from "../src/positions.ts";
 
-// Regression: payload_json round-trips bigints to strings; loadEvents must revive them
-// so replay / rebuild-from-events never hit "Invalid mix of BigInt and other type".
+const TOKEN = "0x" + "11".repeat(20);
+const base = (block: number, logIndex = 0) => ({ chainId: 1, blockNumber: block, transactionIndex: 0, logIndex, txHash: "0x" + block.toString(16).padStart(64, "0"), timestamp: 1_700_000_000 + block });
+const transfer = (block: number): TransferEvent => ({ kind: "transfer", ...base(block), token: TOKEN, from: "0x" + "aa".repeat(20), to: "0x" + "bb".repeat(20), amount: 10n ** 30n });
+const swap = (block: number): SwapEvent => ({ kind: "swap", ...base(block, 1), pool: "0x" + "cc".repeat(20), dex: "v3", token: TOKEN, quote: "0x" + "dd".repeat(20), side: "buy", tokenAmount: 5n, quoteAmount: 7n, trader: "0x" + "ee".repeat(20), traderNonce: 0, recipient: "0x" + "ee".repeat(20), sqrtPriceX96: 2n ** 96n });
 
-describe("db.loadEvents", () => {
-  beforeEach(() => {
-    closeDb();
-    openDb(":memory:");
+beforeEach(() => db.openDb(":memory:"));
+afterEach(() => db.closeDb());
+
+describe("events", () => {
+  test("insert is idempotent and bigints round-trip", () => {
+    expect(db.insertEvents([transfer(1), swap(1)])).toHaveLength(2);
+    expect(db.insertEvents([transfer(1)])).toHaveLength(0);
+    const [t, s] = db.loadEvents(1);
+    expect(t).toEqual(transfer(1));
+    expect(s).toEqual(swap(1));
   });
 
-  test("revives bigint amount fields by event kind", () => {
-    const transfer: StandardTransferEvent = {
-      kind: "transfer", chainId: 1, blockNumber: 10, logIndex: 0, txHash: "0x" + "11".repeat(32),
-      tokenAddress: "0x" + "aa".repeat(20), sender: "0x" + "bb".repeat(20), receiver: "0x" + "cc".repeat(20),
-      amount: 123_456_789n, timestamp: 1_700_000_000,
-    };
-    const swap: SwapEvent = {
-      kind: "swap", chainId: 1, blockNumber: 11, logIndex: 0, txHash: "0x" + "22".repeat(32),
-      poolAddress: "0x" + "dd".repeat(20), tokenAddress: "0x" + "aa".repeat(20), buyer: "0x" + "ee".repeat(20),
-      direction: "buy", tokenAmount: 50n, quoteAmount: 10n, timestamp: 1_700_000_012,
-    };
-    const funding: FundingEvent = {
-      kind: "funding", chainId: 1, blockNumber: 12, logIndex: 0, txHash: "0x" + "33".repeat(32),
-      funder: "0x" + "f1".repeat(20), funded: "0x" + "f2".repeat(20), amount: 7n, method: "native_transfer",
-      timestamp: 1_700_000_024,
-    };
-    insertEvents([transfer, swap, funding], true);
+  test("finalize advances the cursor; reorg deletes only unfinalized rows", () => {
+    db.insertEvents([transfer(1), transfer(2), transfer(3)]);
+    db.markFinalized(1, 2);
+    expect(db.finalizedCursor(1)).toBe(2);
+    db.deleteUnfinalizedFrom(1, 1);
+    expect(db.loadEvents(1).map((e) => e.blockNumber)).toEqual([1, 2]);
+    expect(db.loadEvents(1, { finalizedOnly: true, tokens: [TOKEN] })).toHaveLength(2);
+    db.markFinalized(1, 1); // cursor never moves backwards
+    expect(db.finalizedCursor(1)).toBe(2);
+  });
+});
 
-    const loaded = loadEvents(1, 0, 1_000_000, { finalizedOnly: true });
-    expect(loaded).toHaveLength(3);
-    const t = loaded[0] as StandardTransferEvent;
-    const s = loaded[1] as SwapEvent;
-    const f = loaded[2] as FundingEvent;
-    expect(t.amount).toBe(123_456_789n);
-    expect(s.tokenAmount).toBe(50n);
-    expect(s.quoteAmount).toBe(10n);
-    expect(f.amount).toBe(7n);
-    expect(typeof t.timestamp).toBe("number");
+describe("alerts and positions", () => {
+  const payload: db.AlertPayload = { chainId: 1, token: TOKEN, kind: "opportunity", verdict: "alert", score: 70, symbol: "T", headline: "h", signals: [], priceUsd: 1, liquidityUsd: 1, ageSec: 1, links: {} };
+
+  test("reorg retracts unconfirmed alerts and their positions; confirmed ones survive", () => {
+    const early = db.insertAlert(payload, 10, false);
+    const late = db.insertAlert(payload, 20, false);
+    db.insertPosition(openPosition({ chainId: 1, token: TOKEN, kind: "alert", alertId: late, score: 70, entryUnitUsd: 1, entryAt: 1, entryBlock: 20 }));
+    db.markFinalized(1, 10);
+    expect(db.retractAlertsFrom(1, 5)).toEqual([late]);
+    expect(db.getAlert(early)?.confirmed).toBe(true);
+    expect(db.listPositions()).toHaveLength(0);
+    expect(db.lastAlert(1, TOKEN, "opportunity")?.id).toBe(early);
   });
 
-  test("returns only newly inserted event facts", () => {
-    const event: StandardTransferEvent = {
-      kind: "transfer", chainId: 1, blockNumber: 10, logIndex: 0, txHash: "0x" + "44".repeat(32),
-      tokenAddress: "0x" + "aa".repeat(20), sender: "0x" + "bb".repeat(20), receiver: "0x" + "cc".repeat(20), amount: 1n, timestamp: 1,
-    };
-    expect(insertEvents([event], false)).toHaveLength(1);
-    expect(insertEvents([event], false)).toHaveLength(0);
+  test("only one baseline position per token", () => {
+    const p = openPosition({ chainId: 1, token: TOKEN, kind: "baseline", alertId: null, score: 20, entryUnitUsd: 1, entryAt: 1, entryBlock: 1 });
+    expect(db.insertPosition(p)).toBeGreaterThan(0);
+    expect(db.insertPosition(p)).toBe(0);
   });
+});
 
-  test("loads same-block events in transaction then log order", () => {
-    const make = (transactionIndex: number, logIndex: number): StandardTransferEvent => ({
-      kind: "transfer", chainId: 1, blockNumber: 10, transactionIndex, logIndex,
-      txHash: `0x${String(transactionIndex).padStart(64, "0")}`, tokenAddress: "0x" + "aa".repeat(20),
-      sender: "0x" + "bb".repeat(20), receiver: "0x" + "cc".repeat(20), amount: 1n, timestamp: 1,
-    });
-    insertEvents([make(2, 0), make(1, 9), make(1, 2)], true);
-    expect(loadEvents(1, 10, 10).map((event) => [event.transactionIndex, event.logIndex])).toEqual([[1, 2], [1, 9], [2, 0]]);
+describe("wallet track records", () => {
+  test("closed trades, wins and prorated realized PnL", () => {
+    const W = "0x" + "ab".repeat(20);
+    db.applyWalletTrades(1, [
+      // token A: bought $100, sold 95% for $300 → closed win
+      { wallet: W, token: "0xa", side: "buy", tokenAmount: 100, usd: 100, at: 1 },
+      { wallet: W, token: "0xa", side: "sell", tokenAmount: 95, usd: 300, at: 2 },
+      // token B: bought $100, sold all for $40 → closed loss
+      { wallet: W, token: "0xb", side: "buy", tokenAmount: 10, usd: 100, at: 3 },
+      { wallet: W, token: "0xb", side: "sell", tokenAmount: 10, usd: 40, at: 4 },
+      // token C: half sold for $80 of a $100 entry → open, +$30 realized on the sold half
+      { wallet: W, token: "0xc", side: "buy", tokenAmount: 10, usd: 100, at: 5 },
+      { wallet: W, token: "0xc", side: "sell", tokenAmount: 5, usd: 80, at: 6 },
+    ]);
+    const [s] = db.walletLeaderboard({ minClosedTrades: 1 });
+    expect(s).toMatchObject({ closedTrades: 2, wins: 1, tokensTraded: 3 });
+    expect(s!.realizedPnlUsd).toBeCloseTo(205 - 60 + 30, 6);
+    expect(db.smartWallets(1, { minClosedTrades: 2, minWinRate: 0.5, minPnlUsd: 0 }).has(W)).toBe(true);
+    expect(db.smartWallets(1, { minClosedTrades: 3, minWinRate: 0.5, minPnlUsd: 0 }).has(W)).toBe(false);
   });
+});
 
-  test("upsertToken updates expires_at on conflict and preserves it when omitted", () => {
-    const addr = "0x" + "ab".repeat(20);
-    upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt: 1000 });
-    expect(getToken(1, addr)?.expires_at).toBe(1000);
-    // sliding auto-watch window: a later upsert extends it
-    upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt: 2000 });
-    expect(getToken(1, addr)?.expires_at).toBe(2000);
-    // metadata-only refresh must NOT clobber the expiry back to NULL
-    upsertToken({ chainId: 1, address: addr, symbol: "TST", decimals: 18, totalSupply: 10n, source: "factory" });
-    expect(getToken(1, addr)?.expires_at).toBe(2000);
-    expect(getToken(1, addr)?.symbol).toBe("TST");
-  });
-
-  test("maps signal rows consistently across signal queries", () => {
-    const signal: Signal = {
-      chainId: 1,
-      tokenAddress: "0x" + "aa".repeat(20),
-      ruleId: "R1",
-      weight: 35,
-      evidence: { freshWalletPct: 12.5 },
-      blockNumber: 10,
-      timestamp: 1_700_000_000,
-    };
-    insertSignal(signal);
-
-    expect(recentSignals(1, signal.tokenAddress, 1_600_000_000)).toEqual([signal]);
-    expect(listSignals(1)).toEqual([signal]);
-    expect(listSignalsForToken(1, signal.tokenAddress)).toEqual([signal]);
-  });
-
-  test("exposes durable signal evaluation outcomes", () => {
-    const signal: Signal = {
-      chainId: 1, tokenAddress: "0x" + "aa".repeat(20), ruleId: "R2", weight: 25,
-      evidence: { spikePct: 150 }, blockNumber: 10, timestamp: 1_700_000_000,
-    };
-    const id = insertSignal(signal);
-    recordSignalEvaluation({ signalId: id, score: 25, severity: null, outcome: "below_threshold", reason: "below_info_threshold" });
-    expect(listSignals(1)[0]).toMatchObject({ score: 25, severity: null, outcome: "below_threshold", outcomeReason: "below_info_threshold" });
-    expect(dashboardMetrics().signalOutcomes).toEqual({ below_threshold: 1 });
-  });
-
-  test("deduplicates a signal from the same source event", () => {
-    const signal: Signal = {
-      chainId: 1, tokenAddress: "0x" + "aa".repeat(20), ruleId: "R1", weight: 35,
-      evidence: {}, blockNumber: 10, timestamp: 1_700_000_000,
-    };
-    const source = { txHash: "0x" + "11".repeat(32), logIndex: 4 };
-    expect(insertSignal(signal, source)).toBeGreaterThan(0);
-    expect(insertSignal(signal, source)).toBe(0);
-    expect(listSignals(1)).toHaveLength(1);
-    expect(listSignals(1)[0]?.sourceTxHash).toBe(source.txHash);
-  });
-
-  test("uses signal provenance when no separate source argument is supplied", () => {
-    const signal: Signal = { chainId: 1, tokenAddress: "0x" + "aa".repeat(20), ruleId: "R2", weight: 20, evidence: {}, blockNumber: 11, timestamp: 1_700_000_001, sourceTxHash: "0x" + "22".repeat(32), sourceLogIndex: 3 };
-    expect(insertSignal(signal)).toBeGreaterThan(0);
-    expect(listSignals(1)[0]?.sourceLogIndex).toBe(3);
-  });
-
-  test("keeps candidates out of active watches until promotion", () => {
-    const addr = "0x" + "cd".repeat(20);
-    upsertCandidate({ chainId: 1, address: addr, source: "ranked", firstSeenAt: 10, expiresAt: 1000 });
-    upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt: 1000 });
-    expect(listWatchedTokens(1, 20).some((t) => t.address === addr)).toBe(false);
-    updateCandidateScore(1, addr, 80, { independentBuyerCount: 4 }, "promoted");
-    promoteCandidate(1, addr, "ranked", 2000);
-    expect(getCandidate(1, addr)?.status).toBe("promoted");
-    expect(getToken(1, addr)?.source).toBe("ranked");
-    expect(listWatchedTokens(1, 20).some((t) => t.address === addr)).toBe(true);
-    expect(listCandidates(1)).toHaveLength(1);
-  });
-
-  test("updates an existing token when it enters the candidate state", () => {
-    const addr = "0x" + "ef".repeat(20);
-    upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "ranked", expiresAt: 1000 });
-    upsertToken({ chainId: 1, address: addr, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt: 2000 });
-    expect(getToken(1, addr)?.source).toBe("candidate");
-    expect(listWatchedTokens(1, 20).some((t) => t.address === addr)).toBe(false);
-  });
-
-  test("reports truthful dashboard aggregates and candidate funnel metrics", () => {
-    const addr = "0x" + "ab".repeat(20);
-    upsertCandidate({ chainId: 1, address: addr, source: "ranked", firstSeenAt: 1, expiresAt: 5000 });
-    updateCandidateScore(1, addr, 70, { eligible: true }, "promoted");
-    promoteCandidate(1, addr, "ranked", 5000);
-    const metrics = dashboardMetrics(1000);
-    expect(metrics.candidates.evaluated).toBe(1);
-    expect(metrics.candidates.promoted).toBe(1);
-    expect(metrics.candidates.promotionRate).toBe(100);
-  });
+test("manual tokens stay watched forever; launches expire", () => {
+  db.upsertToken({ chainId: 1, address: TOKEN, source: "launch", firstSeenAt: 1, watchUntil: 100 });
+  expect(db.listWatchedTokens(1, 50)).toHaveLength(1);
+  expect(db.listWatchedTokens(1, 150)).toHaveLength(0);
+  db.upsertToken({ chainId: 1, address: TOKEN, source: "manual", firstSeenAt: 1 });
+  expect(db.getToken(1, TOKEN)).toMatchObject({ source: "manual", watchUntil: null });
+  db.upsertToken({ chainId: 1, address: TOKEN, source: "launch", firstSeenAt: 1, watchUntil: 5 });
+  expect(db.getToken(1, TOKEN)?.source).toBe("manual");
 });

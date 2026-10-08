@@ -35,6 +35,10 @@ export interface SyncOptions {
   maxGapBlocks?: number;
   /** Auto-register new pools emitted by known factories. */
   autoRegisterPools?: boolean;
+  /** Resume after this block (persisted finalized cursor) when within maxGapBlocks of the head. */
+  resumeFrom?: number | null;
+  /** Start this many blocks behind the head (historical catch-up through the live path). */
+  rewindBlocks?: number;
 }
 
 interface Header {
@@ -122,9 +126,15 @@ export class ChainSync {
   async start(): Promise<void> {
     this.running = true;
     this.setStatus("starting");
-    // Live startup is independent of history (invariant 7): begin at the head.
+    // Live startup never waits on history (invariant 7): resume from the
+    // persisted finalized cursor only when the gap is within the recovery window.
     this.head = Number(BigInt(await this.opts.rpc.request<string>("eth_blockNumber", [])));
-    this.cursor = this.head - 1;
+    const resume = this.opts.resumeFrom ?? null;
+    const maxGap = Math.max(this.opts.maxGapBlocks ?? 2_000, this.opts.rewindBlocks ?? 0);
+    this.opts.maxGapBlocks = maxGap;
+    if (this.opts.rewindBlocks) this.cursor = Math.min(resume ?? Infinity, this.head - this.opts.rewindBlocks);
+    else this.cursor = resume !== null && resume < this.head && this.head - resume <= maxGap ? resume : this.head - 1;
+    this.finalized = Math.max(this.finalized, resume ?? 0);
     const info = chainInfo(this.chainId);
     const ref = info.nativeUsdPool;
     this.registerPool({ address: ref.address, dex: ref.dex, token0: ref.token0, token1: ref.token1, token: info.wrappedNative, quote: ref.token0 === info.wrappedNative ? ref.token1 : ref.token0 }, { watchToken: false });

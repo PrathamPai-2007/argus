@@ -1,0 +1,106 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Observatory palette: ink-navy night, one warm lamplight accent for signal
+   strength, sea-teal / coral reserved for profit and loss. */
+:root {
+  --bg: #f4f6fa;
+  --surface: #ffffff;
+  --raised: #eef1f7;
+  --line: #d9dfea;
+  --text: #131a2b;
+  --muted: #5a6680;
+  --faint: #8d97ab;
+  --amber: #b97a0b;
+  --amber-soft: rgb(185 122 11 / 0.12);
+  --gain: #12936b;
+  --loss: #d2463e;
+  --warn: #b8642b;
+  --focus: #3d6fd8;
+}
+
+.dark {
+  --bg: #0d1322;
+  --surface: #141c2e;
+  --raised: #1b2540;
+  --line: #28324d;
+  --text: #e7ebf3;
+  --muted: #8a96ae;
+  --faint: #5b6782;
+  --amber: #f2b544;
+  --amber-soft: rgb(242 181 68 / 0.12);
+  --gain: #4ccfa3;
+  --loss: #ef6f68;
+  --warn: #e4935a;
+  --focus: #7aa2ff;
+}
+
+@theme inline {
+  --font-display: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-text: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-amber: var(--amber);
+  --color-amber-soft: var(--amber-soft);
+  --color-gain: var(--gain);
+  --color-loss: var(--loss);
+  --color-warn: var(--warn);
+  --color-focus: var(--focus);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "tnum" 1, "zero" 1;
+  }
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  ::selection {
+    background: var(--amber-soft);
+  }
+}
+
+@utility num {
+  font-variant-numeric: tabular-nums slashed-zero;
+}
+
+/* xyflow: blend into the palette */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-edge-stroke: var(--line);
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__attribution {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}

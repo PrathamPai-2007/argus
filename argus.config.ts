@@ -1,76 +1,51 @@
-// Argus configuration — see README.md for usage. Secrets live in .env and are
-// referenced here as ${VAR_NAME} placeholders.
+// Argus configuration. Secrets live in .env and are referenced as ${VAR};
+// ${VAR:-default} supplies a fallback, and an endpoint whose variable is unset
+// is simply skipped. Everything below except `chains` is optional.
 export default {
   chains: [
     {
       chainId: 1,
-      name: "ethereum",
-      enabled: true,
-      // Pool is used with automatic failover. Public endpoints work for dev;
-      // put keyed endpoints in .env for production use.
-      rpcs: ["${RPC_ETH_MAINNET}", "${RPC_ETH_BACKUP:-wss://ethereum-rpc.publicnode.com}"],
-      httpRpcs: [process.env.RPC_ETH_HTTP ?? `https://rpc.ankr.com/eth/${process.env.ANKR_API_KEY ?? ""}`, process.env.RPC_ETH_BACKUP_HTTP ?? "https://ethereum-rpc.publicnode.com"],
-      infuraRetryMinutes: 5,
-      finalityDepth: 12,
-      staleAfterMs: 30_000,
-      backfill: {
-        etherscan: { enabled: true, apiUrl: "https://api.etherscan.io/v2/api", apiKey: "${ETHERSCAN_API_KEY}", requestsPerSecond: 3 },
-        bigquery: { enabled: false, projectId: null, credentialsPath: null, dataset: "bigquery-public-data.crypto_ethereum", maxBytesBilled: null },
-        bigqueryThresholdHours: 6,
-      },
+      // HTTP endpoints in priority order. PublicNode batches 500 calls and serves
+      // ~9k blocks of logs keyless; dRPC is a rate-limited fallback.
+      http: ["${RPC_ETH_HTTP}", "https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+      ws: ["${RPC_ETH_WS}", "${RPC_ETH_MAINNET}", "wss://ethereum-rpc.publicnode.com"],
     },
-    // { chainId: 56, name: "bnb", enabled: false, rpcs: ["wss://..."], finalityDepth: 32, staleAfterMs: 9_000 },
-    // { chainId: 8453, name: "base", enabled: false, rpcs: ["wss://..."], finalityDepth: 32, staleAfterMs: 6_000 },
+    {
+      chainId: 8453,
+      http: ["${RPC_BASE_HTTP}", "https://base-rpc.publicnode.com", "https://base.drpc.org"],
+      ws: ["${RPC_BASE_WS}", "wss://base-rpc.publicnode.com"],
+    },
   ],
 
+  // Tokens to watch forever, regardless of discovery.
   watchlist: [
-    // { chainId: 1, address: "0x..." },
-    // Tip for a smoke test: watch a high-velocity token like USDT
-    // { chainId: 1, address: "0xdac17f958d2ee523a2206206994597c13d831ec7" },
+    // { chainId: 8453, address: "0x..." },
   ],
 
-  autoWatch: { enabled: true, factories: ["uniswap-v2"], watchHours: 24 },
+  // New V2/V3 pools against WETH/stablecoins are watched from their first block.
+  discovery: { newPools: true, watchHours: 6, maxWatchHours: 48, maxWatchedPerChain: 400, baselineLiquidityUsd: 10_000 },
 
-  // Candidates are evaluated with targeted history before they become live watches.
-  candidateDiscovery: {
-    enabled: true,
-    maxCandidatesPerCycle: 10,
-    evaluationMinutes: 15,
-    candidateTtlHours: 24,
-    promotionScore: 25,
-    minimumLiquidityUsd: 5_000,
-    minimumIndependentBuyers: 2,
+  // Signal thresholds: any key from DEFAULT_SIGNALS in src/signals.ts can be overridden here.
+  signals: {
+    alertScore: 60,
+    highConvictionScore: 80,
+    minLiquidityUsd: 10_000,
   },
 
-  // DexScreener stablecoin-quoted volume drives slow background enrichment.
-  volumeRanking: { pollMinutes: 5, topN: 10, backfillHours: 1 },
+  // A wallet counts as "smart money" after this realized track record on watched tokens.
+  smartMoney: { minClosedTrades: 5, minWinRate: 0.55, minPnlUsd: 0 },
 
-  rules: {
-    R1: { enabled: true, supplyPct: 8, windowHours: 4, walletAgeDays: 14, weight: 35 },
-    R2: { enabled: true, volumeSpikePct: 150, windowMinutes: 30, weight: 25 },
-    R3: { enabled: true, minRecipients: 5, windowMinutes: 30, weight: 30 },
-    R4: { enabled: true, warnPct: 6, critPct: 12, critWeight: 45, weight: 30 },
-    R5: { enabled: true, minBuyers: 3, walletAgeDays: 14, weight: 25 },
-    R6: { enabled: true, maxHops: 3, minClusterPct: 0.5, weight: 50 },
-    R7: { enabled: true, minLockedPct: 50, minPoolAgeHours: 24, weight: 20 },
-    R8: { enabled: true, minWallets: 2, windowMinutes: 120, weight: 20 },
-  },
-
-  scoring: { info: 25, alert: 50, critical: 75, signalWindowHours: 6 },
-
-  alerts: { telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID), cooldownMinutes: 15, escalationDelta: 10, maxAlertsPerMinute: 20 },
+  alerts: { cooldownMinutes: 30, rescoreDelta: 10, maxPerHour: 30 },
 
   dashboard: { port: 3737 },
 
-  // Outbound webhooks: POST JSON to an HTTP(S) endpoint (Discord/Slack/n8n/your server).
-  // Private, loopback, link-local, and metadata destinations are rejected by validation.
-  // events: which payloads to send — "alert" (new alerts + reorg retractions) and/or "signal".
-  // secret: optional; signs the body as x-argus-signature: sha256=<HMAC-SHA256 hex>. Keep in .env.
+  // Outbound webhooks (Discord/Slack/n8n/your server). Private, loopback and
+  // metadata targets are rejected; `secret` signs bodies as x-argus-signature.
   webhooks: [
-    // { url: "https://hooks.slack.com/services/T000/B000/XXX", events: ["alert"], secret: null, timeoutMs: 10_000, retries: 2 },
+    // { url: "${ARGUS_WEBHOOK_URL}", events: ["alert", "exit"], secret: "${ARGUS_WEBHOOK_SECRET}" },
   ],
 
-  retention: { eventDays: 7 },
+  retention: { eventDays: 3 },
 
   dbPath: "data/argus.db",
 };

@@ -1,4 +1,4 @@
-import type { Address } from "./types.ts";
+import type { Address } from "./model.ts";
 
 // Static per-chain DEX knowledge. Every address here was verified on-chain
 // (symbol/decimals for quotes, factory.getPair/getPool for reference pools).

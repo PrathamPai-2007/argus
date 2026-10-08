@@ -1,1444 +1,620 @@
-import { watch } from "node:fs";
 import { AlertManager } from "./alerts/manager.ts";
-import { scoreCandidate } from "./candidates.ts";
-import { buildAlertLinks, formatPerformanceOutcomeMessage, TelegramSink, type AlertSink } from "./alerts/telegram.ts";
-import { loadConfig, reloadConfig, type ArgusConfig } from "./config.ts";
+import { buildAlertPayload, telegramOutcome } from "./alerts/format.ts";
+import { TelegramSink, type AlertSink } from "./alerts/telegram.ts";
+import { chainInfo } from "./chains.ts";
+import type { ArgusConfig, ChainConfig } from "./config.ts";
 import * as db from "./db.ts";
-import { resolveFactories } from "./factories.ts";
-import { GraphEngine, DEFAULT_GRAPH_TUNING } from "./graph/engine.ts";
-import { EvmAdapter, type AdapterStatus, type ChainAdapter } from "./ingest/evm.ts";
-import { rankStablecoinVolume, fetchTokenPrice, fetchTokenPriceForPool, type RankedToken, type TokenPriceObservation } from "./ingest/dexscreener.ts";
-import { log, redactUrl } from "./logger.ts";
-import { decimalsForAddress, priceFromSwap, thresholds, updateSession, PERFORMANCE_WINDOW_SECS, type PerformanceEvent, type PerformanceSession } from "./performance.ts";
-import { EventQueue } from "./queue.ts";
-import { RULES } from "./rules/index.ts";
-import { scoreToken } from "./scorer.ts";
+import { TOPICS, decodeLog, type PoolRef, type RawLog } from "./ingest/decode.ts";
+import { defaultExplorer, FunderResolver } from "./ingest/funders.ts";
+import { discoverPools, readPoolBalances, readTokenMeta } from "./ingest/reads.ts";
+import { hex, RpcPool } from "./ingest/rpc.ts";
+import { ChainSync, type SyncStatus } from "./ingest/sync.ts";
+import { log } from "./logger.ts";
+import type { Address, ChainEvent, PoolCreatedEvent, SwapEvent } from "./model.ts";
+import { expire, observe, openPosition, type Position } from "./positions.ts";
 import { seedLabels } from "./seeds.ts";
+import { assess, type Assessment, type Signal } from "./signals.ts";
+import { ChainState, type TokenMetrics } from "./state.ts";
 import { WebhookDispatcher } from "./webhooks.ts";
-import type { Address, AlertPayload, Signal, StandardEvent, TokenMeta } from "./types.ts";
 
-// Orchestrator (PLAN.md §4): adapters → queue → graph → rules → scorer → alerts.
+// Orchestrator: ChainSync → persist facts → ChainState → assess touched tokens
+// → signal log / alerts / paper positions. Backpressure is natural: the sync
+// loop awaits onEvents, so nothing is ever dropped between layers.
 
-interface QueuedEvents {
-  chainId: number;
-  events: StandardEvent[];
-}
+export type LiveUpdate =
+  | { type: "scores"; chainId: number; items: db.ScoreRow[] }
+  | { type: "alert"; alert: db.AlertRow }
+  | { type: "trades"; chainId: number; token: Address; trades: Array<{ ts: number; side: "buy" | "sell"; usd: number; trader: Address; txHash: string }> }
+  | { type: "signal"; entry: db.SignalLogRow }
+  | { type: "position"; position: Position }
+  | { type: "status"; status: EngineStatus };
 
-interface ChainRuntime {
-  adapter: ChainAdapter;
-  status: AdapterStatus;
-  lastAppliedBlock: number;
+interface Runtime {
+  cfg: ChainConfig;
+  rpc: RpcPool;
+  sync: ChainSync;
+  state: ChainState;
+  funders: FunderResolver | null;
+  status: SyncStatus;
+  lastBlock: number;
+  lastTs: number;
+  /** Swaps awaiting finality before they count toward wallet track records. */
+  pendingTrades: Array<{ block: number } & db.WalletTradeDelta>;
+  lastSignals: Map<Address, Signal[]>;
+  metaInFlight: Set<Address>;
   eventsApplied: number;
 }
 
-const KNOWN_QUOTES: Record<number, Set<string>> = {
-  1: new Set(
-    [
-      "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", // WETH
-      "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC
-      "0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT
-      "0x6b175474e89094c44da98b954eedeac495271d0f", // DAI
-    ].map((a) => a.toLowerCase()),
-  ),
-  56: new Set(
-    [
-      "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", // WBNB
-      "0x55d398326f99059ff775485246999027b3197955", // USDT
-      "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
-    ].map((a) => a.toLowerCase()),
-  ),
-  8453: new Set(
-    [
-      "0x4200000000000000000000000000000000000006", // WETH
-      "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
-    ].map((a) => a.toLowerCase()),
-  ),
-};
+export interface EngineStatus {
+  startedAt: number;
+  chains: Array<{
+    chainId: number;
+    name: string;
+    status: SyncStatus;
+    head: number;
+    cursor: number;
+    lag: number;
+    lastBlockAt: number;
+    headStream: string;
+    nativeUsd: number;
+    watchedTokens: number;
+    pools: number;
+    eventsApplied: number;
+    funderQueue: number | null;
+    funderCoverage: string;
+    endpoints: Array<{ url: string; healthy: boolean; failures: number }>;
+    rpc: { requests: number; calls: number; failovers: number; errors: number };
+  }>;
+  failedEvents: number;
+}
 
-// ponytail: God object — 30+ private fields spanning drain/graph/rules/alerts/performance/volume/enrichment; split into Engine+PerformancePoller+EnrichmentQueue when file exceeds 1500 lines or second chain adapter ships
+const REF_TOUCH = "__ref__";
+const ACTIVE_SECS = 30 * 60;
 
 export class ArgusEngine {
-  private graphs = new Map<number, GraphEngine>();
-  private queue = new EventQueue<QueuedEvents>(100_000, (item) => item.events.length, (item) => void this.recoverQueueOverflow(item.chainId));
-  private queueRecoveryRunning = new Set<number>();
-  private chains = new Map<number, ChainRuntime>();
-  private alertManager: AlertManager;
-  private drainTimer: ReturnType<typeof setInterval> | null = null;
-  private draining = false;
-  private pruneTimer: ReturnType<typeof setInterval> | null = null;
-  private performanceTimer: ReturnType<typeof setInterval> | null = null;
-  private performancePollRunning = false;
-  private volumeTimer: ReturnType<typeof setInterval> | null = null;
-  private configWatcher: ReturnType<typeof watch> | null = null;
-  private significance = new Map<string, { lastAt: number; lastValue: number | null }>();
-  private metaInFlight = new Set<string>();
-  private metaFailed = new Set<string>(); // tokens whose totalSupply() reverts — never re-fetch (meta-fetch storm)
-  private nonceInFlight = new Set<string>();
-  private pendingFinalized = new Map<number, number>();
-  private finalizing = new Set<number>();
-  private controlTail: Promise<void> = Promise.resolve();
-  private ingestTails = new Map<number, Promise<void>>();
-  private running = false;
-  private alertHook: ((payload: AlertPayload, id: number) => void) | null = null;
-  private performanceHook: ((event: PerformanceEvent) => void) | null = null;
+  private runtimes = new Map<number, Runtime>();
+  private alerts: AlertManager;
   private webhooks = new WebhookDispatcher();
-  private enrichmentQueue: RankedToken[] = [];
-  private enrichmentQueued = new Set<string>();
-  private enrichmentRunning = false;
-  private volumeRankingStatus: { lastSuccessAt: number | null; lastErrorAt: number | null; lastResultCount: number; lastError: string | null } = {
-    lastSuccessAt: null, lastErrorAt: null, lastResultCount: 0, lastError: null,
-  };
-  private failedEventRetries = new Map<string, number>();
-  private failedEventTimers = new Set<ReturnType<typeof setTimeout>>();
+  private listeners = new Set<(u: LiveUpdate) => void>();
+  private openPositions = new Map<string, Position[]>();
+  private timers: Array<ReturnType<typeof setInterval>> = [];
+  private running = false;
+  private startedAt = 0;
 
-  private signalHook?: (signal: Signal) => void;
-  private eventHook?: (event: StandardEvent) => void;
-  private tokenHook?: (token: TokenMeta) => void;
-  /** Optional live hook for emitted alerts (Phase 4 dashboard SSE/WS). */
-  setAlertHook(hook: (payload: AlertPayload, id: number) => void): void {
-    this.alertHook = hook;
-  }
-
-  setPerformanceHook(hook: (event: PerformanceEvent) => void): void {
-    this.performanceHook = hook;
-  }
-
-  setSignalHook(hook: (signal: Signal) => void): void {
-    this.signalHook = hook;
-  }
-
-  setEventHook(hook: (event: StandardEvent) => void): void {
-    this.eventHook = hook;
-  }
-
-  setTokenHook(hook: (token: TokenMeta) => void): void {
-    this.tokenHook = hook;
-  }
-
-  /** Active chain ids (Phase 4 dashboard). */
-  chainsForStatus(): number[] {
-    return [...this.chains.keys()];
-  }
-
-  /** Live graph view for the dashboard/API (read-only; never mutate from outside). */
-  graphView(chainId?: number): GraphEngine {
-    if (chainId !== undefined) return this.graphFor(chainId);
-    const firstChain = this.chains.keys().next().value ?? 1;
-    return this.graphFor(firstChain);
-  }
-
-  private graphFor(chainId: number): GraphEngine {
-    let graph = this.graphs.get(chainId);
-    if (!graph) {
-      graph = new GraphEngine(DEFAULT_GRAPH_TUNING);
-      this.graphs.set(chainId, graph);
-    }
-    return graph;
-  }
-
-  constructor(private cfg: ArgusConfig) {
+  constructor(private cfg: ArgusConfig, private opts: { rewindBlocks?: number } = {}) {
     const sinks: AlertSink[] = [];
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chat = process.env.TELEGRAM_CHAT_ID;
     if (cfg.alerts.telegram) {
-      const token = process.env.TELEGRAM_BOT_TOKEN;
-      const chatId = process.env.TELEGRAM_CHAT_ID;
-      if (token && chatId) {
-        sinks.push(new TelegramSink(token, chatId));
-      } else {
-        log.warn("alerts.telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set — alerts will only be logged");
-      }
+      if (token && chat) sinks.push(new TelegramSink(token, chat));
+      else log.warn("alerts.telegram is on but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are unset — alerts stay on the dashboard");
     }
-    this.alertManager = new AlertManager(cfg.alerts, cfg.scoring, sinks);
     this.webhooks.setTargets(cfg.webhooks);
+    this.alerts = new AlertManager(cfg.alerts, sinks, this.webhooks);
   }
 
-  // ---- startup ----------------------------------------------------------------
+  // ---- public surface (dashboard) ------------------------------------------------------
+
+  subscribe(fn: (u: LiveUpdate) => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  stateFor(chainId: number): ChainState | null {
+    return this.runtimes.get(chainId)?.state ?? null;
+  }
+
+  chainIds(): number[] {
+    return [...this.runtimes.keys()];
+  }
+
+  metrics(chainId: number, token: Address): TokenMetrics | null {
+    const rt = this.runtimes.get(chainId);
+    return rt ? rt.state.metrics(token, this.chainNow(rt)) : null;
+  }
+
+  status(): EngineStatus {
+    return {
+      startedAt: this.startedAt,
+      failedEvents: db.countFailedEvents(),
+      chains: [...this.runtimes.values()].map((rt) => {
+        const s = rt.sync.status();
+        return {
+          chainId: rt.cfg.chainId,
+          name: rt.cfg.name,
+          status: rt.status,
+          head: s.head,
+          cursor: s.cursor,
+          lag: s.lag,
+          lastBlockAt: s.lastProcessedAt,
+          headStream: s.headStream,
+          nativeUsd: Math.round(rt.state.nativeUsd * 100) / 100,
+          watchedTokens: s.tokens,
+          pools: s.pools,
+          eventsApplied: rt.eventsApplied,
+          funderQueue: rt.funders?.pending ?? null,
+          funderCoverage: rt.funders ? `${db.countFunding(rt.cfg.chainId)} wallets resolved` : "disabled (no explorer key)",
+          endpoints: s.endpoints,
+          rpc: { ...rt.rpc.stats },
+        };
+      }),
+    };
+  }
+
+  // ---- lifecycle -----------------------------------------------------------------------
 
   async start(): Promise<void> {
     this.running = true;
-    db.resetSessionData();
-    const enabled = this.cfg.chains.filter((c) => c.enabled);
-    seedLabels(enabled.map((c) => c.chainId));
+    this.startedAt = Math.floor(Date.now() / 1000);
+    const chains = this.cfg.chains.filter((c) => c.enabled);
+    seedLabels(chains.map((c) => c.chainId));
+    for (const p of db.listPositions({ openOnly: true })) this.trackPosition(p);
 
-    for (const c of enabled) {
-      this.loadChainStateIntoGraph(c.chainId);
-      for (const failed of db.loadFailedEvents(c.chainId)) {
-        if (failed.graphApplied) this.scheduleEventRetry(c.chainId, failed.event, true);
-        else this.queue.push({ chainId: c.chainId, events: [failed.event] });
-      }
+    for (const c of chains) {
+      const rt = this.createRuntime(c);
+      this.runtimes.set(c.chainId, rt);
+      await this.restore(rt);
     }
-
-    // Config watchlist → tokens table
-    const now = Math.floor(Date.now() / 1000);
     for (const w of this.cfg.watchlist) {
-      db.upsertToken({ chainId: w.chainId, address: w.address, symbol: null, decimals: null, totalSupply: null, source: "manual" });
+      const rt = this.runtimes.get(w.chainId);
+      if (rt) void this.watchManual(rt, w.address).catch((err) => log.warn("watchlist setup failed", { chainId: w.chainId, token: w.address, err: String(err) }));
     }
+    await Promise.all([...this.runtimes.values()].map((rt) => rt.sync.start().catch((err) => {
+      log.error("chain sync failed to start", { chainId: rt.cfg.chainId, err: String(err) });
+    })));
 
-    // Adapters
-    for (const c of enabled) {
-      const adapter = new EvmAdapter(c, {
-        onEvents: async (chainId, events) => this.enqueueIngestion(chainId, async () => {
-          const safeEvents = events.map((event) => {
-            const safe = { ...event, timestamp: Number((event as unknown as { timestamp: unknown }).timestamp) } as StandardEvent;
-            if (safe.kind === "transfer" || safe.kind === "funding") safe.amount = BigInt(safe.amount);
-            if (safe.kind === "swap") {
-              safe.tokenAmount = BigInt(safe.tokenAmount);
-              safe.quoteAmount = BigInt(safe.quoteAmount);
-            }
-             return safe;
-           });
-           const inserted = db.insertEvents(safeEvents, false);
-            if (inserted.length > 0) {
-            for (let i = 0; i < inserted.length; i += 256) {
-              this.queue.push({ chainId, events: inserted.slice(i, i + 256) });
-            }
-            // Hooks are observers only. Facts are queued first and a bad observer
-            // must never reject the adapter handoff.
-            for (const event of inserted) {
-              try { this.eventHook?.(event); } catch (err) { log.error("event hook failed", { chainId, err }); }
-            }
-            await this.drain();
-          }
-        }),
-        onFinalized: (chainId, upTo) => this.onFinalized(chainId, upTo),
-        onReorg: (chainId, from) => this.onReorg(chainId, from),
-          onStatus: (chainId, status, detail) => this.onAdapterStatus(chainId, status, detail),
-          getAppliedBlock: (chainId) => this.chains.get(chainId)?.lastAppliedBlock ?? 0,
-      });
-      const labels = db.loadLabels(c.chainId);
-      adapter.setDisperseContracts([...labels.entries()].filter(([, l]) => l.kind === "disperse").map(([a]) => a));
-      const watched = db.listWatchedTokens(c.chainId, now).map((t) => t.address);
-      adapter.setWatchedTokens(watched);
-      if (this.cfg.autoWatch.enabled) adapter.setFactories(resolveFactories(c.chainId, this.cfg.autoWatch.factories));
-      // Seed funding-follow set with known infra/CEX/disperse addresses so their
-      // gas-funding edges are tracked from the start (Bug A: relevance-gated funding).
-      adapter.addRelevantAddresses([...labels.keys()]);
-      // Register pools known from the DB so LP/Swap subscriptions are live immediately.
-      for (const p of db.listPools(c.chainId)) {
-        this.graphFor(c.chainId).registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
-        const t0 = p.token0 ?? p.tokenAddress;
-        const t1 = p.token1 ?? p.quoteToken ?? p.tokenAddress;
-        if (db.getToken(c.chainId, p.tokenAddress)?.source !== "candidate") adapter.registerPool(p.poolAddress, t0, t1);
-      }
-      this.chains.set(c.chainId, { adapter, status: "connecting", lastAppliedBlock: 0, eventsApplied: 0 });
-    }
-
-    this.drainTimer = setInterval(() => this.drain(), 250);
-    this.pruneTimer = setInterval(() => this.retentionSweep(), 60 * 60_000);
-    this.performanceTimer = setInterval(() => void this.expirePerformance(), 15_000);
-
-    for (const [chainId, rt] of this.chains) {
-      rt.adapter.start(null).catch((err) => {
-        const safeErr = redactUrl(String(err));
-        log.error("adapter start failed", { chainId, err: safeErr });
-        this.onAdapterStatus(chainId, "error", { err: safeErr });
-      });
-    }
-    void this.primeWatchlistPools();
-
-    this.watchConfigFile();
-    this.volumeTimer = setInterval(() => void this.refreshVolumeRankings(), this.cfg.volumeRanking.pollMinutes * 60_000);
-    setTimeout(() => void this.refreshVolumeRankings(), 10_000);
-    log.info("argus engine started", {
-      chains: enabled.map((c) => c.chainId),
-      configuredWatchlist: this.cfg.watchlist.length,
-      activeWatchlist: enabled.reduce((n, c) => n + db.listWatchedTokens(c.chainId, now).length, 0),
-    });
+    this.timers.push(setInterval(() => void this.housekeeping(), 60_000));
+    this.timers.push(setInterval(() => this.emit({ type: "status", status: this.status() }), 5_000));
+    this.timers.push(setInterval(() => this.pruneRetention(), 3_600_000));
+    log.info("argus engine started", { chains: chains.map((c) => c.name), watchlist: this.cfg.watchlist.length });
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.drainTimer) clearInterval(this.drainTimer);
-    if (this.pruneTimer) clearInterval(this.pruneTimer);
-    if (this.performanceTimer) clearInterval(this.performanceTimer);
-    if (this.volumeTimer) clearInterval(this.volumeTimer);
-    this.configWatcher?.close();
-    for (const rt of this.chains.values()) await rt.adapter.stop();
-    for (const timer of this.failedEventTimers) clearTimeout(timer);
-    this.failedEventTimers.clear();
-    for (const rt of this.chains.values()) await rt.adapter.flushEvents();
-    await this.drainUntilEmpty();
-    await this.controlTail;
+    for (const t of this.timers) clearInterval(t);
+    this.timers = [];
+    for (const rt of this.runtimes.values()) {
+      rt.funders?.stop();
+      await rt.sync.stop();
+    }
     this.webhooks.stop();
     log.info("argus engine stopped");
   }
 
-  private loadChainStateIntoGraph(chainId: number): void {
-    db.rebuildDerivedProjections(chainId);
-    const graph = this.graphFor(chainId);
-    graph.setLabels(db.loadLabels(chainId));
-    const now = Math.floor(Date.now() / 1000);
-    for (const t of db.listWatchedTokens(chainId, now)) {
-      if (t.totalSupply !== null) graph.setTotalSupply(t.address, t.totalSupply);
-    }
-    for (const p of db.listPools(chainId)) {
-      graph.registerPool(p.poolAddress, p.createdBlock, p.createdTs ?? undefined);
-    }
-    // Rebuild derived graph state from local finalized facts without waiting for RPC history.
-    for (const event of db.loadEvents(chainId, 0, Number.MAX_SAFE_INTEGER, { finalizedOnly: true })) {
-      graph.applyEvent(event);
-    }
+  updateConfig(next: ArgusConfig): void {
+    this.cfg.signals = next.signals;
+    this.cfg.alerts = next.alerts;
+    this.cfg.discovery = next.discovery;
+    this.cfg.smartMoney = next.smartMoney;
+    this.cfg.webhooks = next.webhooks;
+    this.alerts.updateConfig(next.alerts);
+    this.webhooks.setTargets(next.webhooks);
+    log.info("config hot-reloaded (signals, alerts, discovery, smartMoney, webhooks)");
   }
 
-  // ---- adapter callbacks ---------------------------------------------------------
-
-  private onAdapterStatus(chainId: number, status: AdapterStatus, detail?: Record<string, unknown>): void {
-    const rt = this.chains.get(chainId);
-    if (rt) rt.status = status;
-    log.info("adapter status", { chainId, status, ...detail });
-  }
-
-  private onFinalized(chainId: number, upToBlock: number): void {
-    const previous = this.pendingFinalized.get(chainId) ?? 0;
-    this.pendingFinalized.set(chainId, Math.max(previous, upToBlock));
-    if (this.finalizing.has(chainId)) return;
-    this.finalizing.add(chainId);
-    void this.enqueueControl(async () => {
-      try {
-        await this.drainUntilEmpty();
-        const boundary = this.pendingFinalized.get(chainId);
-        if (boundary === undefined) return;
-         db.markEventsFinalized(chainId, boundary);
-         db.markSignalsFinalized(chainId, boundary);
-         db.confirmAlertsUpTo(chainId, boundary);
-         this.graphFor(chainId).finalize(boundary);
-         this.syncAllClusters();
-        if (this.pendingFinalized.get(chainId) === boundary) this.pendingFinalized.delete(chainId);
-      } finally {
-        this.finalizing.delete(chainId);
-        if (this.pendingFinalized.has(chainId)) this.onFinalized(chainId, this.pendingFinalized.get(chainId) as number);
-      }
-    }).catch((err) => log.error("finalization failed", { chainId, err }));
-  }
-
-  private async onReorg(chainId: number, fromBlock: number): Promise<void> {
-    const rt = this.chains.get(chainId);
-    return this.enqueueControl(async () => {
-      if (rt) await rt.adapter.flushEvents();
-      await this.drainUntilEmpty();
-      const pending = this.pendingFinalized.get(chainId);
-      if (pending !== undefined && pending >= fromBlock) this.pendingFinalized.delete(chainId);
-      const rewound = this.graphFor(chainId).rewindTo(fromBlock);
-       db.deleteDerivedFrom(chainId, fromBlock);
-       db.deleteUnfinalizedFrom(chainId, fromBlock);
-       this.syncAllClusters();
-      if (rt && rt.lastAppliedBlock >= fromBlock) rt.lastAppliedBlock = fromBlock - 1;
-      const reason = `reorg at block ${fromBlock}`;
-      const retracted = await this.alertManager.retractUnconfirmed(chainId, fromBlock, reason);
-      const retractedPerformance = db.retractPerformanceForAlerts(retracted);
-      const forkedPerformance = db.retractPerformanceFrom(chainId, fromBlock);
-      for (const id of [...new Set([...retractedPerformance, ...forkedPerformance])]) {
-        const session = db.getPerformanceSession(id);
-        if (session) this.performanceHook?.({ type: "performance_retracted", session });
-      }
-      for (const id of retracted) {
-        const row = db.getAlert(id);
-        if (row) this.webhooks.dispatchRetraction(id, chainId, row.token_address, reason);
-      }
-      this.significance = new Map([...this.significance].filter(([key]) => !key.startsWith(`${chainId}:`)));
-      log.warn("reorg handled", { chainId, fromBlock, rewoundTransitions: rewound, retracted: retracted.length });
-    });
-  }
-
-  private enqueueControl(fn: () => Promise<void>): Promise<void> {
-    const next = this.controlTail.then(fn, fn);
-    this.controlTail = next.catch(() => undefined);
-    return next;
-  }
-
-  private async drainUntilEmpty(): Promise<void> {
-    do {
-      await this.drain();
-      if (this.draining || this.queue.depth > 0) await new Promise((resolve) => setTimeout(resolve, 0));
-    } while (this.draining || this.queue.depth > 0);
-  }
-
-  private async recoverQueueOverflow(chainId: number): Promise<void> {
-    if (this.queueRecoveryRunning.has(chainId)) return;
-    this.queueRecoveryRunning.add(chainId);
-    return this.enqueueControl(async () => {
-      try {
-        await this.drainUntilEmpty();
-        const runtime = this.chains.get(chainId);
-        if (!runtime) return;
-        // Re-fetch the last applied block: the queue can drop only the later
-        // events of a partially applied block.
-        const from = Math.max(0, runtime.lastAppliedBlock);
-        db.deleteUnfinalizedFrom(chainId, from);
-        await runtime.adapter.recover("queue-overflow");
-      } finally {
-        this.queueRecoveryRunning.delete(chainId);
-      }
-    });
-  }
-
-  private enqueueIngestion(chainId: number, fn: () => Promise<void>): Promise<void> {
-    const next = (this.ingestTails.get(chainId) ?? Promise.resolve()).then(fn, fn);
-    this.ingestTails.set(chainId, next.catch(() => undefined));
-    return next;
-  }
-
-  private scheduleEventRetry(chainId: number, evt: StandardEvent, graphApplied: boolean): void {
-    const key = `${evt.chainId}:${evt.blockNumber}:${evt.logIndex}:${evt.kind}`;
-    const attempts = this.failedEventRetries.get(key) ?? 0;
-    if (attempts >= 3 || !this.running) return;
-    this.failedEventRetries.set(key, attempts + 1);
-    const timer = setTimeout(() => {
-      this.failedEventTimers.delete(timer);
-      try {
-        if (graphApplied) {
-          this.postProcess(chainId, evt);
-          db.clearFailedEvent(evt);
-        }
-        else this.queue.push({ chainId, events: [evt] });
-        this.failedEventRetries.delete(key);
-      } catch (err) {
-        log.error("event retry failed", { chainId, block: evt.blockNumber, kind: evt.kind, err });
-        this.scheduleEventRetry(chainId, evt, graphApplied);
-      }
-      void this.drain();
-    }, 1_000 * (attempts + 1));
-    this.failedEventTimers.add(timer);
-  }
-
-  // ---- main drain loop --------------------------------------------------------------
-
-  private async drain(): Promise<void> {
-    if (this.draining) return;
-    this.draining = true;
-    try {
-      // Smaller slices + far more frequent yields: rule scans are O(events) (R4 walks
-      // the full ledger/DSU ~60ms on busy tokens), so a 5k-event batch with 512-event
-      // yields could block the event loop for 30s+ and starve the dashboard/SSE
-      // (Bug: /api/status timed out during USDT backfills). Yield every 64 events so
-      // the longest synchronous stretch stays ~4s even at 60ms/event.
-      const batch = this.queue.drain(1_000);
-      for (const { chainId, events } of batch) {
-        events.sort((a, b) => a.blockNumber - b.blockNumber || a.logIndex - b.logIndex);
-        const rt = this.chains.get(chainId);
-        for (let i = 0; i < events.length; i++) {
-          const evt = events[i] as StandardEvent;
-          const graph = this.graphFor(chainId);
-          let graphApplied = false;
-          try {
-            graph.applyEvent(evt);
-            graphApplied = true;
-            if (rt) {
-              rt.eventsApplied++;
-              if (evt.blockNumber > rt.lastAppliedBlock) rt.lastAppliedBlock = evt.blockNumber;
-            }
-            this.postProcess(chainId, evt);
-            db.clearFailedEvent(evt);
-            this.failedEventRetries.delete(`${evt.chainId}:${evt.blockNumber}:${evt.logIndex}:${evt.kind}`);
-          } catch (err) {
-            db.recordFailedEvent(evt, graphApplied, err);
-            this.scheduleEventRetry(chainId, evt, graphApplied);
-            log.error("event processing failed — skipping", {
-              chainId,
-              block: evt.blockNumber,
-              kind: evt.kind,
-              err,
-              stack: (err as Error)?.stack,
-            });
-          }
-          if ((i & 63) === 63) await new Promise((r) => setTimeout(r, 0));
-        }
-      }
-    } finally {
-      this.draining = false;
-    }
-  }
-
-  /** Rules + metadata + auto-watch, per applied event. */
-  private postProcess(chainId: number, evt: StandardEvent): void {
-    const now = Math.floor(Date.now() / 1000);
-
-    if (evt.kind === "pool_created") {
-      this.handlePoolCreated(evt);
-      return;
-    }
-
-    if (evt.kind === "funding") {
-      db.upsertWallet({ address: evt.funded, chainId, firstSeenBlock: evt.blockNumber, firstSeenAt: evt.timestamp, funder: evt.funder });
-       db.insertFundingEdge({ funder: evt.funder, funded: evt.funded, chainId, amount: evt.amount, blockNumber: evt.blockNumber, method: evt.method, txHash: evt.txHash, logIndex: evt.logIndex });
-      // funders of relevant wallets are themselves relevant (feeds R6 funder chains)
-      this.chains.get(chainId)?.adapter.addRelevantAddresses([evt.funder]);
-      
-      // Re-evaluate rules for tokens this wallet bought, since retroactive funding
-      // arrives after the transfer event that discovered the wallet.
-      const tokens = this.graphFor(chainId).getTokensBoughtBy(evt.funded);
-      for (const token of tokens) {
-        const meta = db.getToken(chainId, token);
-        if (!meta || meta.source === "candidate" || (meta.expires_at !== null && meta.expires_at <= now)) continue;
-
-        // Ensure token has had on-chain activity recently (e.g. within 15 minutes)
-        const lastSwap = db.latestSwapForToken(chainId, token);
-        if (lastSwap && now - lastSwap.timestamp > 900) continue;
-
-        const syn: StandardEvent = {
-          kind: "transfer",
-          chainId,
-          blockNumber: evt.blockNumber,
-          timestamp: evt.timestamp,
-          txHash: evt.txHash,
-          logIndex: 0,
-          tokenAddress: token,
-          sender: "0x0000000000000000000000000000000000000000",
-          receiver: evt.funded,
-          amount: 0n,
-        };
-        this.runRules(chainId, syn);
-      }
-      return;
-    }
-
-    if (evt.kind === "swap") {
-      this.updatePerformance(evt);
-      // R2 volume anomaly: run rules for watched tokens only
-      const tokenMeta = db.getToken(chainId, evt.tokenAddress);
-      if (!tokenMeta) return;
-      this.chains.get(chainId)?.adapter.addRelevantAddresses([evt.buyer]);
-      if (tokenMeta.source === "candidate") return;
-      this.runRules(chainId, evt);
-      return;
-    }
-
-    if (evt.kind !== "transfer") return;
-    const token = evt.tokenAddress;
-    const graph = this.graphFor(chainId);
-    const isPoolLp = graph.isPool(token);
-
-    if (!isPoolLp) {
-      const meta = db.getToken(chainId, token);
-      if (!meta) return; // not watched (shouldn't happen — subscription filters)
-      if (meta.expires_at !== null && meta.expires_at <= now) return; // auto-watch expired
-
-      // Auto-watch is a sliding window: a token that is still moving stays watched.
-      // Without this, expires_at was never extended and active tokens quietly dropped
-      // out mid-activity (Bug: expired watched tokens vanished from subscriptions).
-      if (meta.expires_at !== null && this.cfg.autoWatch.enabled && meta.expires_at - now < this.cfg.autoWatch.watchHours * 3600) {
-        db.upsertToken({
-          chainId,
-          address: token,
-          symbol: meta.symbol,
-          decimals: meta.decimals,
-          totalSupply: meta.totalSupply,
-          source: meta.source,
-          expiresAt: now + this.cfg.autoWatch.watchHours * 3600,
-        });
-      }
-
-      // lazy metadata (totalSupply/decimals/symbol), cached in SQLite — fetched once (PLAN.md §6)
-      if (meta.totalSupply === null) this.fetchMeta(chainId, token);
-
-      // follow the participants: their native funding edges now matter (Bug A)
-      this.chains.get(chainId)?.adapter.addRelevantAddresses([evt.sender, evt.receiver]);
-
-      // lazy nonce check for fresh receivers (PLAN.md §6 "nonce 0–1 = genuinely fresh")
-      if (graph.isFresh(evt.receiver, evt.timestamp, 30) && graph.nonceOf(evt.receiver) === null) {
-        this.fetchNonce(chainId, evt.receiver);
-      }
-      if (meta.source === "candidate") return;
-      this.runRules(chainId, evt);
+  private createRuntime(c: ChainConfig): Runtime {
+    const rpc = new RpcPool(c.http, `rpc:${c.chainId}`);
+    const state = new ChainState(c.chainId);
+    const rt: Runtime = {
+      cfg: c, rpc, state, funders: null, status: "starting", lastBlock: 0, lastTs: 0, pendingTrades: [], lastSignals: new Map(), metaInFlight: new Set(), eventsApplied: 0,
+      sync: null as unknown as ChainSync,
+    };
+    rt.sync = new ChainSync(
+      { chainId: c.chainId, rpc, wsUrls: c.ws, finalityDepth: c.finalityDepth, blockTimeMs: c.blockTimeMs, autoRegisterPools: this.cfg.discovery.newPools, resumeFrom: db.finalizedCursor(c.chainId), ...(this.opts.rewindBlocks ? { rewindBlocks: this.opts.rewindBlocks } : {}) },
+      {
+        onEvents: (_id, events) => this.onEvents(rt, events),
+        onReorg: (_id, from) => this.onReorg(rt, from),
+        onFinalized: (_id, block) => this.onFinalized(rt, block),
+        onStatus: (_id, status, detail) => {
+          rt.status = status;
+          log.info("chain status", { chainId: c.chainId, status, ...detail });
+        },
+        onPoolRegistered: (_id, ref, created) => this.onLaunch(rt, ref, created),
+      },
+    );
+    const explorer = defaultExplorer(c.chainId, this.cfg.explorerKeys);
+    if (explorer) {
+      const labels = db.loadLabels(c.chainId);
+      rt.funders = new FunderResolver(c.chainId, explorer, rpc, (r) => {
+        db.saveFunding(c.chainId, r);
+        state.setFunding(r.wallet, { funder: r.funder, funderIsService: r.funderIsService });
+      }, (a) => labels.get(a)?.kind === "cex");
     } else {
-      const poolDb = db.getDb().query("SELECT token_address FROM pools WHERE chain_id = ? AND pool_address = ?").get(chainId, token) as { token_address: string } | undefined;
-      if (poolDb) {
-        this.runRules(chainId, evt, poolDb.token_address as Address);
-      }
+      log.warn("no explorer key for funder lookups — clustering signals degrade", { chainId: c.chainId, hint: c.chainId === 1 ? "set ETHERSCAN_API_KEY" : "set BLOCKSCOUT_API_KEY (free at blockscout.com)" });
     }
+    return rt;
   }
 
-  private runRules(chainId: number, evt: StandardEvent, targetTokenOverride?: Address): void {
-    for (const [id, rule] of Object.entries(RULES)) {
-      const ruleCfg = this.cfg.rules[id as keyof typeof this.cfg.rules];
-      if (!ruleCfg?.enabled) continue;
-      let signal: Signal | null = null;
+  /** Rebuild state from local finalized facts (no RPC) and re-register watched pools. */
+  private async restore(rt: Runtime): Promise<void> {
+    const chainId = rt.cfg.chainId;
+    const cursor = db.finalizedCursor(chainId);
+    // Session reset (invariant 13): unfinalized facts are re-ingested from the cursor.
+    db.deleteUnfinalizedFrom(chainId, (cursor ?? 0) + 1);
+    const labels = db.loadLabels(chainId);
+    rt.state.setServiceLabels(new Map([...labels].filter(([, l]) => ["cex", "router", "bridge"].includes(l.kind)).map(([a, l]) => [a, l.label])));
+    for (const f of db.loadFunding(chainId)) rt.state.setFunding(f.wallet, { funder: f.funder, funderIsService: f.funderIsService });
+    rt.state.setSmartWallets(db.smartWallets(chainId, this.cfg.smartMoney));
+
+    const watched = db.listWatchedTokens(chainId);
+    const tokens = watched.map((t) => t.address);
+    for (const t of watched) rt.state.setTokenMeta(t.address, { symbol: t.symbol, name: t.name, decimals: t.decimals, totalSupply: t.totalSupply });
+    const ref = chainInfo(chainId).nativeUsdPool;
+    rt.state.registerPool({ address: ref.address, dex: ref.dex, token0: ref.token0, token: chainInfo(chainId).wrappedNative, quote: ref.token0 === chainInfo(chainId).wrappedNative ? ref.token1 : ref.token0 });
+    for (const p of db.listPools(chainId)) {
+      if (!tokens.includes(p.token)) continue;
+      rt.state.registerPool(p, p.createdBlock);
+      rt.sync.registerPool(p);
+    }
+    rt.sync.setWatchedTokens(tokens);
+    const events = db.loadEvents(chainId, { tokens: [...tokens, chainInfo(chainId).wrappedNative], finalizedOnly: true });
+    for (const e of events) rt.state.apply(e);
+    for (const t of tokens) {
+      const s = db.getScore(chainId, t);
+      if (s) rt.lastSignals.set(t, s.signals);
+    }
+    if (events.length > 0) log.info("restored chain state from local facts", { chainId, tokens: tokens.length, events: events.length });
+  }
+
+  // ---- event flow ------------------------------------------------------------------------
+
+  private async onEvents(rt: Runtime, raw: ChainEvent[]): Promise<void> {
+    const refPool = chainInfo(rt.cfg.chainId).nativeUsdPool.address;
+    // One reference-pool price per block is plenty; keep the last.
+    const lastRefPerBlock = new Map<number, ChainEvent>();
+    for (const e of raw) if (e.kind === "swap" && e.pool === refPool) lastRefPerBlock.set(e.blockNumber, e);
+    const events = raw.filter((e) => !(e.kind === "swap" && e.pool === refPool) || lastRefPerBlock.get(e.blockNumber) === e);
+
+    const fresh = db.insertEvents(events);
+    const touched = new Set<Address>();
+    const trades = new Map<Address, Array<{ ts: number; side: "buy" | "sell"; usd: number; trader: Address; txHash: string }>>();
+    for (const e of fresh) {
       try {
-        signal = rule(evt, this.graphFor(chainId), this.cfg.rules);
+        rt.state.apply(e);
+        db.clearFailedEvent(e);
       } catch (err) {
-        log.error("rule evaluation failed", { rule: id, err });
+        db.recordFailedEvent(e, err);
+        log.error("event application failed", { chainId: rt.cfg.chainId, block: e.blockNumber, kind: e.kind, err: String(err) });
         continue;
       }
-      if (signal) {
-        if (targetTokenOverride) signal.tokenAddress = targetTokenOverride;
-        this.handleSignal(signal, false, evt);
+      rt.eventsApplied++;
+      if (e.blockNumber > rt.lastBlock) rt.lastBlock = e.blockNumber;
+      if (e.timestamp > rt.lastTs) rt.lastTs = e.timestamp;
+      if (e.kind === "swap" && e.pool === refPool) {
+        touched.add(REF_TOUCH);
+        continue;
       }
+      if (e.kind === "swap") {
+        touched.add(e.token);
+        this.onTrade(rt, e, trades);
+      } else if (e.kind === "transfer" || e.kind === "liquidity" || e.kind === "reserves") {
+        touched.add(e.token);
+        if (e.kind === "transfer") this.maybeResolveHolder(rt, e.token, e.to, e.amount);
+      }
+    }
+    for (const [token, list] of trades) this.emit({ type: "trades", chainId: rt.cfg.chainId, token, trades: list });
+    touched.delete(REF_TOUCH);
+    if (touched.size > 0) await this.assessTokens(rt, [...touched]);
+  }
+
+  private onTrade(rt: Runtime, e: SwapEvent, out: Map<Address, Array<{ ts: number; side: "buy" | "sell"; usd: number; trader: Address; txHash: string }>>): void {
+    const last = rt.state.tradesOf(e.token).at(-1);
+    const usd = last && last.txHash === e.txHash ? last.usd : 0;
+    rt.pendingTrades.push({ block: e.blockNumber, wallet: e.trader, token: e.token, side: e.side, tokenAmount: Number(e.tokenAmount), usd, at: e.timestamp });
+    const list = out.get(e.token) ?? [];
+    list.push({ ts: e.timestamp, side: e.side, usd, trader: e.trader, txHash: e.txHash });
+    out.set(e.token, list);
+    if (e.side === "buy" && rt.funders && !rt.state.fundingOf(e.trader)) {
+      const m = rt.state.tradersOf(e.token).get(e.trader);
+      const metaLaunch = db.getToken(rt.cfg.chainId, e.token)?.launchBlock ?? null;
+      const priority = metaLaunch !== null && e.blockNumber <= metaLaunch + 2 ? 0 : m && m.buys <= 1 ? 2 : 4;
+      if (priority <= 2 || rt.funders.pending < 5_000) rt.funders.enqueue(e.trader, priority);
     }
   }
 
-  /** Significance filter: don't persist the same (token, rule) signal twice unless it intensifies or the window elapsed. */
-  private handleSignal(signal: Signal, finalized: boolean, sourceEvent?: StandardEvent): void {
-    const key = `${signal.chainId}:${signal.tokenAddress}:${signal.ruleId}`;
-    const now = signal.timestamp;
-    const value = extractSignalValue(signal);
-    const prev = this.significance.get(key);
-    const cooldownSecs = this.cfg.alerts.cooldownMinutes * 60;
-    if (prev) {
-      // intensified = materially worse than last time (1.5×) and at least 60s ago —
-      // otherwise rising counters re-fire on every single event
-      const intensified = value !== null && prev.lastValue !== null && value > prev.lastValue * 1.5 && now - prev.lastAt > 60;
-      const expired = now - prev.lastAt > cooldownSecs;
-      if (!intensified && !expired) return;
-    }
-    const persistedSignal: Signal = sourceEvent
-      ? { ...signal, sourceTxHash: sourceEvent.txHash, sourceLogIndex: sourceEvent.logIndex }
-      : signal;
-    const signalId = db.insertSignal(persistedSignal);
-    if (signalId === 0) return;
-    persistedSignal.id = signalId;
-    this.significance.set(key, { lastAt: now, lastValue: value });
+  /** Large transfer recipients are where distribution wallets hide: resolve their funders. */
+  private maybeResolveHolder(rt: Runtime, token: Address, to: Address, amount: bigint): void {
+    if (!rt.funders || rt.state.fundingOf(to) || rt.state.isPool(to)) return;
+    const supply = rt.state.tokenMeta(token)?.totalSupply;
+    if (supply && supply > 0n && amount * 200n >= supply) rt.funders.enqueue(to, 1);
+  }
 
-    const res = scoreToken(persistedSignal.chainId, persistedSignal.tokenAddress, this.cfg.scoring, now);
-    if (res.severity === null) {
-      db.recordSignalEvaluation({ signalId, score: res.score, severity: null, outcome: "below_threshold", reason: "below_info_threshold" });
-      const evaluated = { ...persistedSignal, score: res.score, severity: null, outcome: "below_threshold" as const, outcomeReason: "below_info_threshold" };
-      this.signalHook?.(evaluated);
-      this.webhooks.dispatchSignal(evaluated);
+  private chainNow(rt: Runtime): number {
+    // Chain time keeps windows deterministic (replay) and honest during catch-up.
+    return rt.lastTs || Math.floor(Date.now() / 1000);
+  }
+
+  private async assessTokens(rt: Runtime, tokens: Address[]): Promise<void> {
+    const chainId = rt.cfg.chainId;
+    const now = this.chainNow(rt);
+    const scores: db.ScoreRow[] = [];
+    for (const token of tokens) {
+      const m = rt.state.metrics(token, now);
+      if (!m) continue;
+      const a = assess(m, this.cfg.signals);
+      const summary = metricsSummary(m, rt.state.tokenMeta(token)?.decimals ?? null);
+      db.upsertScore(a, rt.lastBlock, summary);
+      scores.push({ chainId, token, at: a.at, block: rt.lastBlock, score: a.score, verdict: a.verdict, gate: a.gate, signals: a.signals, metrics: summary });
+      this.logSignalChanges(rt, token, a);
+      await this.actOn(rt, a, m);
+      this.markPositions(rt, token, m);
+    }
+    if (scores.length > 0) this.emit({ type: "scores", chainId, items: scores });
+  }
+
+  private logSignalChanges(rt: Runtime, token: Address, a: Assessment): void {
+    const prev = new Map((rt.lastSignals.get(token) ?? []).map((s) => [s.id, s]));
+    const next = new Map(a.signals.map((s) => [s.id, s]));
+    const changes: Array<[Signal, db.SignalLogRow["change"]]> = [];
+    for (const [id, s] of next) {
+      const p = prev.get(id);
+      if (!p) changes.push([s, "fired"]);
+      else if (p.severity !== s.severity) changes.push([s, "escalated"]);
+    }
+    for (const [id, s] of prev) if (!next.has(id)) changes.push([s, "cleared"]);
+    rt.lastSignals.set(token, a.signals);
+    for (const [s, change] of changes) {
+      const id = db.logSignal(rt.cfg.chainId, token, s, change, rt.lastBlock, a.at);
+      this.emit({ type: "signal", entry: { id, chainId: rt.cfg.chainId, token, signalId: s.id, kind: s.kind, severity: s.severity, change, title: s.title, evidence: s.evidence, block: rt.lastBlock, at: a.at } });
+    }
+  }
+
+  private async actOn(rt: Runtime, a: Assessment, m: TokenMetrics): Promise<void> {
+    const chainId = rt.cfg.chainId;
+    const key = `${chainId}:${a.token}`;
+    const decimals = rt.state.tokenMeta(a.token)?.decimals ?? null;
+    const hasAlertPosition = (this.openPositions.get(key) ?? []).some((p) => p.kind === "alert");
+    const confirmed = false; // alerts confirm when their block finalizes
+
+    if ((a.verdict === "alert" || a.verdict === "high_conviction") && m.priceUnitUsd !== null) {
+      const payload = buildAlertPayload("opportunity", a, m, decimals, this.cfg.dashboard.port);
+      const id = await this.alerts.emit(payload, rt.lastBlock, confirmed);
+      if (id !== null) {
+        const row = db.getAlert(id);
+        if (row) this.emit({ type: "alert", alert: row });
+        if (!hasAlertPosition) this.open(rt, a.token, "alert", id, a.score, m.priceUnitUsd);
+        db.setWatchUntil(chainId, a.token, Math.floor(Date.now() / 1000) + 86_400);
+      }
       return;
     }
-    const scored = { ...persistedSignal, score: res.score, severity: res.severity };
-    this.signalHook?.(scored);
-    this.webhooks.dispatchSignal(scored);
-    const payload = this.buildAlertPayload(signal.chainId, signal.tokenAddress, res.score, res.severity, res.signals);
-    void this.alertManager.maybeAlertDetailed(payload, finalized).then(async ({ id, reason }) => {
-      if (id === null) {
-        db.recordSignalEvaluation({ signalId, score: res.score, severity: res.severity, outcome: "alert_suppressed", reason });
-        this.signalHook?.({ ...scored, outcome: "alert_suppressed", outcomeReason: reason });
-        return;
+    if (a.verdict === "avoid" && hasAlertPosition) {
+      const payload = buildAlertPayload("exit", a, m, decimals, this.cfg.dashboard.port);
+      const id = await this.alerts.emit(payload, rt.lastBlock, confirmed);
+      const row = id !== null ? db.getAlert(id) : null;
+      if (row) this.emit({ type: "alert", alert: row });
+      return;
+    }
+    // Baseline cohort: liquid launches we watched from block one and never alerted.
+    if (m.launchObserved && m.priceUnitUsd !== null && m.liquidityUsd >= this.cfg.discovery.baselineLiquidityUsd && !(this.openPositions.get(key) ?? []).length && !db.lastAlert(chainId, a.token, "opportunity")) {
+      this.open(rt, a.token, "baseline", null, a.score, m.priceUnitUsd);
+    }
+  }
+
+  private open(rt: Runtime, token: Address, kind: "alert" | "baseline", alertId: number | null, score: number, unitUsd: number): void {
+    const p = openPosition({ chainId: rt.cfg.chainId, token, kind, alertId, score, entryUnitUsd: unitUsd, entryAt: this.chainNow(rt), entryBlock: rt.lastBlock });
+    const id = db.insertPosition(p);
+    if (id === 0) return; // a baseline already exists
+    const saved = { ...p, id };
+    this.trackPosition(saved);
+    this.emit({ type: "position", position: saved });
+  }
+
+  private trackPosition(p: Position): void {
+    const key = `${p.chainId}:${p.token}`;
+    this.openPositions.set(key, [...(this.openPositions.get(key) ?? []).filter((x) => x.id !== p.id), p]);
+  }
+
+  private markPositions(rt: Runtime, token: Address, m: TokenMetrics): void {
+    const key = `${rt.cfg.chainId}:${token}`;
+    const list = this.openPositions.get(key);
+    if (!list || m.priceUnitUsd === null) return;
+    const next: Position[] = [];
+    for (const p of list) {
+      const u = observe(p, m.priceUnitUsd, this.chainNow(rt));
+      if (u !== p) {
+        db.savePosition(u);
+        this.emit({ type: "position", position: u });
+        if (u.closedAt !== null) void this.onPositionClosed(u, m.symbol);
       }
-      db.recordSignalEvaluation({ signalId, score: res.score, severity: res.severity, outcome: "alert_created", alertId: id });
-      this.signalHook?.({ ...scored, outcome: "alert_created", alertId: id });
-      {
-        const alert = db.getAlert(id);
-        if (!alert || alert.retracted) return;
-        // Permanently watch alerted token across sessions
-        db.upsertToken({ chainId: payload.chainId, address: payload.tokenAddress, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt: null });
-        this.refreshWatchSubscription(payload.chainId);
-        await this.ensureTokenPoolsRegistered(payload.chainId, payload.tokenAddress);
-        await this.openPerformanceSession(id, signal.chainId, signal.tokenAddress, sourceEvent);
-        const clusters = this.graphFor(signal.chainId).clusterBreakdown(payload.tokenAddress);
-         db.syncClusters(clusters.map((cluster) => ({ ...cluster, chainId: signal.chainId })));
-        this.alertHook?.(payload, id);
-        this.webhooks.dispatchAlert(payload, id, finalized);
-      }
-    }).catch((err) => {
-      log.error("alert pipeline failed", { token: payload.tokenAddress, err });
+      if (u.closedAt === null) next.push(u);
+    }
+    if (next.length) this.openPositions.set(key, next);
+    else this.openPositions.delete(key);
+  }
+
+  private async onPositionClosed(p: Position, symbol: string | null): Promise<void> {
+    if (p.kind === "alert") await this.alerts.broadcast(telegramOutcome(p, symbol));
+  }
+
+  // ---- launches & watches ------------------------------------------------------------------
+
+  private onLaunch(rt: Runtime, ref: PoolRef, created: PoolCreatedEvent): void {
+    const chainId = rt.cfg.chainId;
+    const watched = rt.sync.watchedTokens().length;
+    if (watched > this.cfg.discovery.maxWatchedPerChain) this.evictQuietest(rt);
+    db.insertPool({ chainId, ...ref, createdBlock: created.blockNumber });
+    db.upsertToken({
+      chainId, address: ref.token, source: "launch", firstSeenAt: created.timestamp, launchBlock: created.blockNumber, launchAt: created.timestamp,
+      watchUntil: created.timestamp + this.cfg.discovery.watchHours * 3600,
     });
+    rt.state.registerPool(ref, created.blockNumber);
+    void this.fetchMeta(rt, ref.token);
+    void this.backfillHolders(rt, ref.token, created.blockNumber);
   }
 
-  private async ensureTokenPoolsRegistered(chainId: number, token: Address): Promise<void> {
-    const existing = db.listPoolsForToken(chainId, token);
-    if (existing.length > 0) {
-      for (const p of existing) {
-        const quote = p.quote_token ?? token;
-        this.chains.get(chainId)?.adapter.registerPool(p.pool_address, token, quote);
-        this.graphFor(chainId).registerPool(p.pool_address);
-      }
-      return;
+  private async watchManual(rt: Runtime, token: Address): Promise<void> {
+    const chainId = rt.cfg.chainId;
+    db.upsertToken({ chainId, address: token, source: "manual", firstSeenAt: Math.floor(Date.now() / 1000) });
+    await this.fetchMeta(rt, token);
+    const pools = await discoverPools(rt.rpc, chainId, token);
+    for (const p of pools) {
+      const balances = await readPoolBalances(rt.rpc, p);
+      // Ignore dust pools: they add log volume without price information.
+      if (!balances || balances.quoteBalance === 0n) continue;
+      db.insertPool({ chainId, ...p, createdBlock: null });
+      rt.state.registerPool(p);
+      rt.state.setPoolBalances(p.address, balances.tokenBalance, balances.quoteBalance);
+      rt.sync.registerPool(p);
     }
-    const fallback = await fetchTokenPrice(chainId, token);
-    if (fallback) {
-      db.insertPool({
-        chainId,
-        poolAddress: fallback.poolAddress,
-        tokenAddress: token,
-        quoteToken: fallback.quoteToken,
-        factory: "dexscreener",
-        createdBlock: 0,
-      });
-      this.chains.get(chainId)?.adapter.registerPool(fallback.poolAddress, token, fallback.quoteToken);
-      this.graphFor(chainId).registerPool(fallback.poolAddress);
-    }
+    rt.sync.setWatchedTokens([...rt.sync.watchedTokens(), token]);
+    log.info("watching token", { chainId, token, pools: pools.length });
   }
 
-  private async primeWatchlistPools(): Promise<void> {
-    for (const watch of this.cfg.watchlist) {
-      const runtime = this.chains.get(watch.chainId);
-      if (!runtime || db.listPoolsForToken(watch.chainId, watch.address).length > 0) continue;
-      const fallback = await fetchTokenPrice(watch.chainId, watch.address);
-      if (!fallback) continue;
-      db.insertPool({
-        chainId: watch.chainId,
-        poolAddress: fallback.poolAddress,
-        tokenAddress: watch.address,
-        quoteToken: fallback.quoteToken,
-        factory: "dexscreener",
-        createdBlock: runtime.adapter.status().lastHead,
-      });
-      runtime.adapter.registerPool(fallback.poolAddress, watch.address, fallback.quoteToken);
-      this.graphFor(watch.chainId).registerPool(fallback.poolAddress);
-      log.info("watchlist pool primed", { chainId: watch.chainId, token: watch.address, pool: fallback.poolAddress });
-    }
-  }
-
-  /** Decimals verified by token metadata or a hardcoded known address; null when unknown. */
-  private verifiedDecimals(chainId: number, address: Address): number | null {
-    const meta = db.getToken(chainId, address);
-    if (meta?.decimals != null && meta.decimals > 0) return meta.decimals;
-    const known = decimalsForAddress(address, -1);
-    return known >= 0 ? known : null;
-  }
-
-  private async openPerformanceSession(alertId: number, chainId: number, tokenAddress: Address, sourceEvent?: StandardEvent): Promise<void> {
-    db.setAlertPerformanceStatus(alertId, "evaluating");
-    const now = Math.floor(Date.now() / 1000);
-    let swap = sourceEvent?.kind === "swap" ? sourceEvent : db.latestSwapForToken(chainId, tokenAddress);
-
-    const isStale = swap ? (now - swap.timestamp > 300) : true;
-    if (isStale) {
-      db.setAlertPerformanceStatus(alertId, "skipped_stale_swap", "swap_older_than_5_minutes");
-      return;
-    }
-
-    const swapPool = swap ? db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
-      .get(chainId, swap.poolAddress, tokenAddress) as { quote_token: Address | null } | undefined : undefined;
-    const tokenDecimals = this.verifiedDecimals(chainId, tokenAddress);
-    const quoteTokenFromPool = swapPool?.quote_token ?? null;
-    const quoteDecimals = quoteTokenFromPool ? this.verifiedDecimals(chainId, quoteTokenFromPool) : null;
-
-    if (tokenDecimals === null || (quoteTokenFromPool !== null && quoteDecimals === null)) {
-      // Without verified decimals every derived price would be off by orders of
-      // magnitude; refusing beats guessing 18 and reporting false TP/SL.
-      db.setAlertPerformanceStatus(alertId, "skipped_unknown_decimals", "token_or_quote_decimals_unverified");
-      return;
-    }
-
-    // Entry pricing is on-chain first: a fresh swap with verified decimals on
-    // both sides. Unverified decimals must never silently default to 18.
-    let entryPrice = quoteDecimals !== null
-      ? priceFromSwap(swap!, tokenDecimals, quoteDecimals)
-      : null;
-    let poolAddress: Address | undefined = swap?.poolAddress;
-    let quoteToken: Address | null = quoteTokenFromPool;
-    const openedAt = sourceEvent?.timestamp ?? (swap?.timestamp ?? now);
-    const entryBlock = sourceEvent?.blockNumber ?? (swap?.blockNumber ?? 0);
-
-    if (entryPrice === null) {
-      // No trustworthy on-chain price: fall back to DexScreener only to locate
-      // a priced pool. Its quote-relative price is accepted only because no
-      // swap-derived entry exists to conflict with.
-      const observation = await fetchTokenPriceForPool(chainId, tokenAddress, poolAddress ?? undefined);
-      if (observation.kind === "liquidity_lost") {
-        db.setAlertPerformanceStatus(alertId, "skipped_liquidity_unavailable", "pool_has_no_liquidity");
-        return;
-      }
-      if (observation.kind === "pool_missing") {
-        db.setAlertPerformanceStatus(alertId, "skipped_no_pool", "reference_pool_not_found");
-        return;
-      }
-      if (observation.kind === "provider_error") {
-        db.setAlertPerformanceStatus(alertId, "provider_error", "price_provider_unavailable");
-        return;
-      }
-      entryPrice = observation.value.price;
-      poolAddress = observation.value.poolAddress;
-      quoteToken = observation.value.quoteToken;
-      db.insertPool({
-        chainId,
-        poolAddress: observation.value.poolAddress,
-        tokenAddress,
-        quoteToken: observation.value.quoteToken,
-        factory: "dexscreener",
-        createdBlock: entryBlock,
-      });
-      this.chains.get(chainId)?.adapter.registerPool(observation.value.poolAddress, tokenAddress, observation.value.quoteToken);
-      this.graphFor(chainId).registerPool(observation.value.poolAddress);
-    }
-
-    if (entryPrice === null || !poolAddress) {
-      db.setAlertPerformanceStatus(alertId, "skipped_invalid_price", "swap_price_unavailable");
-      return;
-    }
-    const pool = db.listPoolsForToken(chainId, tokenAddress).find((p) => p.pool_address === poolAddress);
-    const { targetPrice, stopPrice } = thresholds(entryPrice);
-    const id = db.createPerformanceSession({
-      alertId,
-      chainId,
-      tokenAddress,
-      poolAddress,
-      quoteToken: quoteToken ?? pool?.quote_token ?? null,
-      entryPrice,
-      targetPrice,
-      stopPrice,
-      openedAt,
-      expiresAt: openedAt + PERFORMANCE_WINDOW_SECS,
-      entryBlock,
-      entrySource: "swap",
-    });
-    const session = db.getPerformanceSession(id);
-    db.setAlertPerformanceStatus(alertId, "opened");
-    if (session) this.performanceHook?.({ type: "performance_opened", session });
-  }
-
-  private updatePerformance(swap: StandardEvent & { kind: "swap" }): void {
-    const pool = db.getDb().query("SELECT quote_token FROM pools WHERE chain_id = ? AND pool_address = ? AND token_address = ?")
-      .get(swap.chainId, swap.poolAddress, swap.tokenAddress) as { quote_token: Address | null } | undefined;
-    const tokenDecimals = this.verifiedDecimals(swap.chainId, swap.tokenAddress);
-    const quoteDecimals = pool?.quote_token ? this.verifiedDecimals(swap.chainId, pool.quote_token) : null;
-    // Unverified decimals would corrupt every derived price; skip instead of guessing 18.
-    if (tokenDecimals === null || quoteDecimals === null) return;
-    const price = priceFromSwap(swap, tokenDecimals, quoteDecimals);
-    if (price === null) return;
-     const sessions = db.listPerformanceSessions({ chainId: swap.chainId, tokenAddress: swap.tokenAddress, activeOnly: true });
-     for (const session of sessions) {
-       if (session.pool_address !== swap.poolAddress) continue;
-       if (swap.blockNumber < session.last_block || (swap.blockNumber === session.last_block && swap.timestamp < session.updated_at)) continue;
-      const result = updateSession(session, price, swap.timestamp);
-        db.updatePerformanceSession({
-        id: session.id,
-        outcome: result.outcome,
-        currentPrice: result.currentPrice,
-        minPrice: result.minPrice,
-        maxPrice: result.maxPrice,
-        lastBlock: swap.blockNumber,
-        updatedAt: swap.timestamp,
-          closedAt: result.closedAt,
-           missingObservations: 0,
-           closeReason: result.outcome === "active" ? null : "price_threshold",
-           observationSource: "swap",
-           observationBlock: swap.blockNumber,
-         });
-      const updated = db.getPerformanceSession(session.id);
-      if (!updated) continue;
-      this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
-      if (updated.outcome !== "active") {
-        this.dispatchOutcomeNotification(updated);
-      }
-    }
-  }
-
-  private async expirePerformance(): Promise<void> {
-    if (this.performancePollRunning || !this.running) return;
-    this.performancePollRunning = true;
+  private async fetchMeta(rt: Runtime, token: Address): Promise<void> {
+    if (rt.metaInFlight.has(token)) return;
+    rt.metaInFlight.add(token);
     try {
-      const ids = db.expirePerformanceSessions(Math.floor(Date.now() / 1000));
-      for (const id of ids) {
-        const session = db.getPerformanceSession(id);
-        if (session) {
-          this.performanceHook?.({ type: "performance_closed", session });
-          this.dispatchOutcomeNotification(session);
-        }
-      }
-
-      // Polling check for active sessions with low swap frequency.
-      const activeSessions = db.listPerformanceSessions({ activeOnly: true });
-      const now = Math.floor(Date.now() / 1000);
-      log.debug("performance price poll started", { intervalSeconds: 15, activeSessions: activeSessions.length });
-
-      await Promise.all(activeSessions.map(async (session) => {
-        if (now - session.updated_at < 3) return;
-        
-        let observation: TokenPriceObservation | null = null;
-        const adapter = this.chains.get(session.chain_id)?.adapter as EvmAdapter | undefined;
-
-        if (adapter && session.quote_token) {
-          try {
-            const res = await adapter.fetchPoolReserves(session.pool_address);
-            if (res) {
-              if (res.reserve0 === 0n || res.reserve1 === 0n) {
-                observation = { kind: "liquidity_lost" };
-              } else {
-                const tokenA = session.token_address.toLowerCase();
-                const tokenB = session.quote_token.toLowerCase();
-                const isToken0 = tokenA < tokenB;
-                const tokenAmount = isToken0 ? res.reserve0 : res.reserve1;
-                const quoteAmount = isToken0 ? res.reserve1 : res.reserve0;
-                
-                const tokenDecimals = this.verifiedDecimals(session.chain_id, session.token_address);
-                const quoteDecimals = this.verifiedDecimals(session.chain_id, session.quote_token!);
-                
-                const price = tokenDecimals !== null && quoteDecimals !== null
-                  ? priceFromSwap({ tokenAmount, quoteAmount }, tokenDecimals, quoteDecimals)
-                  : null;
-                if (price !== null) {
-                  observation = { kind: "price", value: { price, poolAddress: session.pool_address, quoteToken: session.quote_token, liquidityUsd: null, volumeUsd: null } };
-                }
-              }
-            }
-          } catch (err) {
-            log.warn("On-chain price poll failed, falling back", { chainId: session.chain_id, token: session.token_address, err });
-          }
-        }
-        
-        if (!observation) {
-          observation = await fetchTokenPriceForPool(session.chain_id, session.token_address, session.pool_address);
-        }
-
-        if (observation.kind === "provider_error") return;
-        if (observation.kind === "pool_missing" || observation.kind === "liquidity_lost") {
-          // A single bad reading is not a rug: require consecutive failures
-          // before closing, and never fabricate a zero price on closure.
-          const missing = session.missing_observations + 1;
-          if (missing >= 3) {
-            db.updatePerformanceSession({
-              id: session.id,
-              outcome: "stop_hit",
-              currentPrice: session.current_price,
-              minPrice: session.min_price,
-              maxPrice: session.max_price,
-              lastBlock: session.last_block,
-              updatedAt: now,
-              closedAt: now,
-              lastPollAt: now,
-              missingObservations: missing,
-              closeReason: observation.kind === "liquidity_lost" ? "liquidity_lost" : "pool_unreachable",
-              observationSource: "pool_reserves",
-              observationBlock: session.last_block,
-            });
-            const closed = db.getPerformanceSession(session.id);
-            if (closed) {
-              this.performanceHook?.({ type: "performance_closed", session: closed });
-              this.dispatchOutcomeNotification(closed);
-            }
-          } else {
-            db.updatePerformanceSession({
-              id: session.id,
-              outcome: session.outcome,
-              currentPrice: session.current_price,
-              minPrice: session.min_price,
-              maxPrice: session.max_price,
-              lastBlock: session.last_block,
-              updatedAt: session.updated_at,
-              closedAt: session.closed_at,
-              lastPollAt: now,
-              missingObservations: missing,
-            });
-          }
-          return;
-        }
-
-        const latest = db.getPerformanceSession(session.id);
-        if (!latest || latest.outcome !== "active" || latest.updated_at > session.updated_at) return;
-        const result = updateSession(session, observation.value.price, now);
-        db.updatePerformanceSession({
-          id: session.id,
-          outcome: result.outcome,
-          currentPrice: result.currentPrice,
-          minPrice: result.minPrice,
-          maxPrice: result.maxPrice,
-          lastBlock: session.last_block,
-          updatedAt: now,
-          closedAt: result.closedAt,
-          lastPollAt: now,
-          missingObservations: 0,
-          closeReason: result.outcome === "active" ? null : "price_threshold",
-          observationSource: "pool_reserves",
-          observationBlock: session.last_block,
-        });
-        const updated = db.getPerformanceSession(session.id);
-        if (updated) {
-          log.debug("performance price observation", { chainId: session.chain_id, token: session.token_address, pool: session.pool_address, sessionId: session.id, outcome: updated.outcome, price: observation.value.price.toString() });
-          this.performanceHook?.({ type: updated.outcome === "active" ? "performance_updated" : "performance_closed", session: updated });
-          if (updated.outcome !== "active") {
-            this.dispatchOutcomeNotification(updated);
-          }
-        }
-      }));
-    } finally {
-      this.performancePollRunning = false;
-    }
-  }
-
-  private dispatchOutcomeNotification(session: PerformanceSession): void {
-    const msg = formatPerformanceOutcomeMessage(session);
-    for (const sink of this.alertManager["sinks"]) {
-      void sink.sendText(msg).catch((err) => log.error("outcome sink failed", { sink: sink.name, err }));
-    }
-    try {
-      const fs = require("node:fs");
-      const path = "data/trades.csv";
-      if (!fs.existsSync(path)) {
-        fs.writeFileSync(path, "Timestamp,ChainID,TokenAddress,PoolAddress,Outcome,EntryPrice,CurrentPrice,TargetPrice,StopPrice,CloseReason\n");
-      }
-      const ts = new Date((session.closed_at ?? Math.floor(Date.now() / 1000)) * 1000).toISOString();
-      const line = [ts, session.chain_id, session.token_address, session.pool_address, session.outcome, session.entry_price.toString(), session.current_price.toString(), session.target_price.toString(), session.stop_price.toString(), session.close_reason ?? ""].join(",") + "\n";
-      fs.appendFileSync(path, line);
+      const meta = await readTokenMeta(rt.rpc, token);
+      rt.state.setTokenMeta(token, meta);
+      const existing = db.getToken(rt.cfg.chainId, token);
+      if (existing) db.upsertToken({ ...existing, ...meta, totalSupply: meta.totalSupply });
     } catch (err) {
-      log.error("failed to write trade to csv", { err });
+      log.debug("token metadata fetch failed", { chainId: rt.cfg.chainId, token, err: String(err) });
+    } finally {
+      rt.metaInFlight.delete(token);
     }
   }
 
-  private buildAlertPayload(chainId: number, token: Address, score: number, severity: AlertPayload["severity"], signals: Signal[]): AlertPayload {
-    const topCluster = this.graphFor(chainId).clusterBreakdown(token).find((c) => c.memberCount > 1);
-    const headline = topCluster
-      ? `${topCluster.memberCount} wallets hold ${topCluster.pctOfSupply.toFixed(2)}% of supply in one cluster`
-      : (signals[0] ? ruleHeadline(signals[0]) : "suspicious activity detected");
-    const lines = signals.map((s) => ruleLine(s));
-    if (topCluster) lines.push(`Top cluster ${topCluster.clusterId.slice(0, 10)}… — ${topCluster.memberCount} wallets, ${topCluster.pctOfSupply.toFixed(2)}% of supply`);
-    return {
-      chainId,
-      tokenAddress: token,
-      score,
-      severity,
-      signals,
-      headline,
-      lines,
-      links: buildAlertLinks(chainId, token, this.cfg.dashboard.port),
-    };
-  }
-
-  // ---- metadata / nonces (lazy, once per token/wallet) ---------------------------------
-
-  private metaAttempts = new Map<string, number>();
-
-  private fetchMeta(chainId: number, token: Address): void {
-    const key = `${chainId}:${token}`;
-    if (this.metaInFlight.has(key) || this.metaFailed.has(key)) return;
-    this.metaInFlight.add(key);
-    const rt = this.chains.get(chainId);
-    if (!rt) {
-      this.metaInFlight.delete(key);
-      return;
-    }
-    rt.adapter
-      .fetchTokenMeta(token)
-      .then((meta) => {
-        const existing = db.getToken(chainId, token);
-        const totalSupply = meta.totalSupply ?? existing?.totalSupply ?? null;
-        db.upsertToken({
-          chainId,
-          address: token,
-          symbol: (meta.symbol as string) ?? existing?.symbol ?? null,
-          decimals: (meta.decimals as number) ?? existing?.decimals ?? null,
-          totalSupply,
-          source: existing?.source ?? "manual",
-        });
-        if (totalSupply) this.graphFor(chainId).setTotalSupply(token, totalSupply);
-        if (totalSupply === null) this.metaFailed.add(key);
-        else this.metaAttempts.delete(key);
-        log.info("fetched token metadata", { chainId, token, symbol: meta.symbol, totalSupply: totalSupply?.toString() });
-      })
-      .catch((err) => {
-        const attempts = (this.metaAttempts.get(key) ?? 0) + 1;
-        this.metaAttempts.set(key, attempts);
-        if (attempts >= 3) {
-          this.metaFailed.add(key);
-          log.warn("metadata fetch failed permanently after retries", { chainId, token, err });
-        } else {
-          log.warn("metadata fetch failed (will retry on next event)", { chainId, token, attempts, err });
-        }
-      })
-      .finally(() => this.metaInFlight.delete(key));
-  }
-
-  private fetchNonce(chainId: number, addr: Address): void {
-    const key = `${chainId}:${addr}`;
-    if (this.nonceInFlight.has(key)) return;
-    this.nonceInFlight.add(key);
-    const rt = this.chains.get(chainId);
-    if (!rt) return;
-    rt.adapter
-      .getNonce(addr)
-      .then((nonce) => this.graphFor(chainId).setNonce(addr, nonce))
-      .catch(() => void 0)
-      .finally(() => this.nonceInFlight.delete(key));
-  }
-
-  // ---- auto-watch (PLAN.md §12) -----------------------------------------------------------
-
-  private handlePoolCreated(evt: StandardEvent & { kind: "pool_created" }): void {
-    const quotes = KNOWN_QUOTES[evt.chainId] ?? new Set<string>();
-    const token0IsQuote = quotes.has(evt.token0);
-    const token1IsQuote = quotes.has(evt.token1);
-    const candidates: Address[] = [];
-    if (!token0IsQuote) candidates.push(evt.token0);
-    if (!token1IsQuote) candidates.push(evt.token1);
-    const quote = token0IsQuote ? evt.token0 : token1IsQuote ? evt.token1 : null;
-
-    for (const token of candidates) {
-      db.insertPool({
-        chainId: evt.chainId,
-        poolAddress: evt.poolAddress,
-        tokenAddress: token,
-        quoteToken: quote,
-        factory: evt.factory,
-        createdBlock: evt.blockNumber,
-        createdTs: evt.timestamp,
-        token0: evt.token0,
-        token1: evt.token1,
-      });
-      this.graphFor(evt.chainId).registerPool(evt.poolAddress, evt.blockNumber, evt.timestamp);
-      if (!this.cfg.autoWatch.enabled) continue;
-      const existing = db.getToken(evt.chainId, token);
-      if (existing && existing.expires_at === null) continue; // permanent watch already
-      const expiresAt = Math.floor(Date.now() / 1000) + this.cfg.autoWatch.watchHours * 3600;
-      if (this.cfg.candidateDiscovery.enabled) {
-        db.upsertCandidate({ chainId: evt.chainId, address: token, source: "factory", firstSeenAt: evt.timestamp, expiresAt });
-        db.upsertToken({ chainId: evt.chainId, address: token, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt });
-        log.info("candidate: new pool token", { chainId: evt.chainId, token, pool: evt.poolAddress });
-      } else {
-        db.upsertToken({ chainId: evt.chainId, address: token, symbol: null, decimals: null, totalSupply: null, source: "factory", expiresAt });
-        log.info("auto-watch: new pool token", { chainId: evt.chainId, token, pool: evt.poolAddress, watchHours: this.cfg.autoWatch.watchHours });
-        this.chains.get(evt.chainId)?.adapter.registerPool(evt.poolAddress, evt.token0, evt.token1);
-      }
-      this.refreshWatchSubscription(evt.chainId);
-      this.fetchMeta(evt.chainId, token);
+  /**
+   * Holder history before the pool existed (the mint and the dev's distribution)
+   * lives in blocks we never synced. One bounded getLogs fetches it; holder
+   * deltas commute and those blocks are long final, so applying them now is safe.
+   */
+  private async backfillHolders(rt: Runtime, token: Address, launchBlock: number): Promise<void> {
+    const span = Math.min(rt.rpc.primaryLimits.maxLogRange, 2_000);
+    try {
+      const from = Math.max(0, launchBlock - span);
+      const logs = (await rt.rpc.request<Array<{ address: string; topics: `0x${string}`[]; data: `0x${string}`; blockNumber: string; transactionIndex: string; logIndex: string; transactionHash: `0x${string}` }>>(
+        "eth_getLogs", [{ fromBlock: hex(from), toBlock: hex(launchBlock - 1), address: token, topics: [TOPICS.transfer] }],
+      ));
+      const ctx = { chainId: rt.cfg.chainId, timestamp: 0, pool: () => undefined, factory: () => undefined, isWatchedToken: () => true, tx: () => undefined };
+      const events = logs.map((l): RawLog => ({ ...l, address: l.address.toLowerCase(), blockNumber: Number(BigInt(l.blockNumber)), transactionIndex: Number(BigInt(l.transactionIndex)), logIndex: Number(BigInt(l.logIndex)) }))
+        .map((l) => decodeLog(l, ctx)).filter((e): e is ChainEvent => e !== null);
+      for (const e of db.insertEvents(events)) rt.state.apply(e);
+      if (events.length > 0) log.debug("backfilled pre-launch holders", { chainId: rt.cfg.chainId, token, transfers: events.length });
+    } catch (err) {
+      log.debug("pre-launch holder backfill skipped", { chainId: rt.cfg.chainId, token, err: String(err).slice(0, 200) });
     }
   }
 
-  private refreshWatchSubscription(chainId: number): void {
-    const rt = this.chains.get(chainId);
-    if (!rt) return;
-    const now = Math.floor(Date.now() / 1000);
-    rt.adapter.setWatchedTokens(db.listWatchedTokens(chainId, now).map((t) => t.address));
+  private unwatch(rt: Runtime, token: Address): void {
+    for (const p of db.listPools(rt.cfg.chainId, token)) rt.sync.unregisterPool(p.address);
+    rt.sync.setWatchedTokens(rt.sync.watchedTokens().filter((t) => t !== token));
+    rt.state.dropToken(token);
+    rt.lastSignals.delete(token);
+    db.deleteScore(rt.cfg.chainId, token);
   }
 
-  // ---- retention / hot reload -------------------------------------------------
-
-  private retentionSweep(): void {
-    const now = Math.floor(Date.now() / 1000);
-    const pruned = db.pruneEvents(this.cfg.retention.eventDays * 86_400);
-    this.refreshWatchSubscriptionForExpiry();
-    this.pruneSignificance();
-    
-    for (const chainId of this.chains.keys()) {
-      // Preserve graph memory beyond the watchlist: tokens active in the last
-      // day and tokens with open performance sessions still feed rules and
-      // TP/SL watches. Pruning them mid-session amnesiacs the cluster graph.
-      const activeTokens = new Set(db.listWatchedTokens(chainId, now).map(t => t.address));
-      for (const addr of db.listRecentEventTokens(chainId, now - 24 * 3_600)) activeTokens.add(addr);
-      for (const session of db.listPerformanceSessions({ chainId, activeOnly: true })) activeTokens.add(session.token_address);
-      const activePools = new Set<string>();
-      for (const token of activeTokens) {
-        for (const pool of db.listPoolsForToken(chainId, token)) {
-          activePools.add(pool.pool_address);
-        }
-      }
-      this.graphFor(chainId).prune(activeTokens, activePools);
-      const adapter = this.chains.get(chainId)?.adapter as EvmAdapter | undefined;
-      if (adapter) adapter.prunePools(activePools);
-      log.info("retention sweep", { chainId, activeTokens: activeTokens.size, prunedEvents: pruned });
+  private evictQuietest(rt: Runtime): void {
+    const now = this.chainNow(rt);
+    const candidates = db.listWatchedTokens(rt.cfg.chainId).filter((t) => t.source !== "manual" && !this.openPositions.has(`${rt.cfg.chainId}:${t.address}`));
+    const lastTrade = (t: Address) => rt.state.tradesOf(t).at(-1)?.ts ?? 0;
+    const quiet = candidates.sort((a, b) => lastTrade(a.address) - lastTrade(b.address)).slice(0, Math.max(1, Math.floor(candidates.length / 10)));
+    for (const t of quiet) {
+      db.setWatchUntil(rt.cfg.chainId, t.address, now);
+      this.unwatch(rt, t.address);
     }
-    
-    this.syncAllClusters();
+    log.info("watch cap reached — evicted quiet tokens", { chainId: rt.cfg.chainId, evicted: quiet.length });
   }
 
-  private pruneSignificance(): void {
-    const now = Math.floor(Date.now() / 1000);
-    const cooldownSecs = this.cfg.alerts.cooldownMinutes * 60;
-    for (const [key, entry] of this.significance.entries()) {
-      if (now - entry.lastAt > cooldownSecs) {
-        this.significance.delete(key);
-      }
-    }
-  }
-
-  private syncAllClusters(): void {
-    for (const chainId of this.chains.keys()) {
-      const graph = this.graphFor(chainId);
-      const activeTokens = db.listWatchedTokens(chainId, Math.floor(Date.now() / 1000));
-      const allClusters: db.ClusterMaterialized[] = [];
-      for (const t of activeTokens) {
-         const breakdown = graph.clusterBreakdown(t.address);
-         for (const c of breakdown) {
-           allClusters.push({
-             chainId,
-             clusterId: c.clusterId,
-             memberCount: c.memberCount,
-             members: c.members,
-           });
-         }
-       }
-       db.syncClusters(allClusters, [chainId]);
-    }
-  }
-
-  private refreshWatchSubscriptionForExpiry(): void {
-    for (const chainId of this.chains.keys()) this.refreshWatchSubscription(chainId);
-  }
-
-  private async refreshVolumeRankings(): Promise<void> {
+  private async housekeeping(): Promise<void> {
     if (!this.running) return;
-    for (const chain of this.cfg.chains.filter((c) => c.enabled)) {
+    const wall = Math.floor(Date.now() / 1000);
+    for (const rt of this.runtimes.values()) {
+      const chainId = rt.cfg.chainId;
+      rt.state.setSmartWallets(db.smartWallets(chainId, this.cfg.smartMoney));
+      const active = new Set(rt.sync.watchedTokens());
+      for (const t of db.listWatchedTokens(chainId, 0)) {
+        if (t.watchUntil === null || t.watchUntil > wall || !active.has(t.address)) continue;
+        const lastTrade = rt.state.tradesOf(t.address).at(-1)?.ts ?? 0;
+        const age = wall - (t.launchAt ?? t.firstSeenAt);
+        const held = this.openPositions.has(`${chainId}:${t.address}`);
+        if (held || (wall - lastTrade < ACTIVE_SECS && age < this.cfg.discovery.maxWatchHours * 3600)) {
+          db.setWatchUntil(chainId, t.address, wall + 3600);
+        } else {
+          this.unwatch(rt, t.address);
+        }
+      }
+    }
+    for (const [key, list] of this.openPositions) {
+      const kept: Position[] = [];
+      for (const p of list) {
+        const e = expire(p, wall);
+        if (e !== p) {
+          db.savePosition(e);
+          this.emit({ type: "position", position: e });
+          void this.onPositionClosed(e, this.stateFor(p.chainId)?.tokenMeta(p.token)?.symbol ?? null);
+        } else kept.push(p);
+      }
+      if (kept.length) this.openPositions.set(key, kept);
+      else this.openPositions.delete(key);
+    }
+  }
+
+  private pruneRetention(): void {
+    const pruned = db.pruneEvents(Math.floor(Date.now() / 1000) - this.cfg.retention.eventDays * 86_400);
+    if (pruned > 0) log.info("retention sweep", { prunedEvents: pruned });
+  }
+
+  // ---- finality & reorgs -------------------------------------------------------------------
+
+  private onFinalized(rt: Runtime, block: number): void {
+    db.markFinalized(rt.cfg.chainId, block);
+    rt.state.finalize(block, this.chainNow(rt));
+    const ready = rt.pendingTrades.filter((t) => t.block <= block);
+    if (ready.length > 0) {
+      rt.pendingTrades = rt.pendingTrades.filter((t) => t.block > block);
+      db.applyWalletTrades(rt.cfg.chainId, ready.filter((t) => t.usd > 0));
+    }
+  }
+
+  private async onReorg(rt: Runtime, fromBlock: number): Promise<void> {
+    const chainId = rt.cfg.chainId;
+    const rewound = rt.state.rewindTo(fromBlock);
+    db.deleteUnfinalizedFrom(chainId, fromBlock);
+    rt.pendingTrades = rt.pendingTrades.filter((t) => t.block < fromBlock);
+    const retracted = await this.alerts.retract(chainId, fromBlock);
+    for (const [key, list] of this.openPositions) {
+      const kept = list.filter((p) => !(p.chainId === chainId && p.alertId !== null && retracted.includes(p.alertId)));
+      if (kept.length) this.openPositions.set(key, kept);
+      else this.openPositions.delete(key);
+    }
+    rt.lastBlock = Math.min(rt.lastBlock, fromBlock - 1);
+    log.warn("reorg handled", { chainId, fromBlock, rewound, retracted: retracted.length });
+  }
+
+  private emit(u: LiveUpdate): void {
+    for (const fn of this.listeners) {
       try {
-        const ranked = await rankStablecoinVolume(chain.chainId, this.cfg.volumeRanking.topN);
-        const now = Math.floor(Date.now() / 1000);
-        db.expireCandidates(now);
-        const runtime = this.chains.get(chain.chainId);
-        if (!runtime) continue;
-         const head = runtime.adapter.status().lastHead;
-         const candidates = ranked.slice(0, this.cfg.candidateDiscovery.maxCandidatesPerCycle);
-        if (this.cfg.candidateDiscovery.enabled) {
-          const dbCandidates = db.listCandidates(chain.chainId).filter((c) =>
-            (c.status === "discovered" || c.status === "evaluating" || c.status === "rejected") &&
-            (!c.lastEvaluatedAt || now - c.lastEvaluatedAt >= this.cfg.candidateDiscovery.evaluationMinutes * 60)
-          );
-           for (const c of dbCandidates.slice(0, Math.max(0, this.cfg.candidateDiscovery.maxCandidatesPerCycle - candidates.length))) {
-            if (candidates.some((r) => r.address === c.address)) continue;
-            const fallback = await fetchTokenPrice(chain.chainId, c.address);
-            if (fallback) {
-              candidates.push({
-                chainId: chain.chainId,
-                address: c.address,
-                volume: fallback.volumeUsd ?? 0,
-                pools: [{
-                  poolAddress: fallback.poolAddress,
-                  tokenAddress: c.address,
-                  quoteToken: fallback.quoteToken,
-                  volume: fallback.volumeUsd ?? 0,
-                  liquidityUsd: fallback.liquidityUsd,
-                  createdAt: null,
-                }],
-              });
-          }
-           }
-         }
-         this.volumeRankingStatus = { lastSuccessAt: now, lastErrorAt: this.volumeRankingStatus.lastErrorAt, lastResultCount: ranked.length, lastError: null };
-        for (const token of candidates) {
-          const existing = db.getToken(token.chainId, token.address);
-          if (existing?.source === "manual" || existing?.source === "factory") continue;
-          if (this.cfg.candidateDiscovery.enabled && existing?.source === "ranked") continue;
-          const candidate = db.getCandidate(token.chainId, token.address);
-          const due = !candidate?.lastEvaluatedAt || now - candidate.lastEvaluatedAt >= this.cfg.candidateDiscovery.evaluationMinutes * 60;
-          if (this.cfg.candidateDiscovery.enabled) {
-            db.upsertCandidate({
-              chainId: token.chainId, address: token.address, source: "ranked",
-              firstSeenAt: db.getCandidate(token.chainId, token.address)?.firstSeenAt ?? now,
-              expiresAt: now + this.cfg.candidateDiscovery.candidateTtlHours * 3600,
-            });
-            db.upsertToken({ chainId: token.chainId, address: token.address, symbol: null, decimals: null, totalSupply: null, source: "candidate", expiresAt: now + this.cfg.candidateDiscovery.candidateTtlHours * 3600 });
-          } else {
-            db.upsertToken({ chainId: token.chainId, address: token.address, symbol: null, decimals: null, totalSupply: null, source: "ranked", expiresAt: now + this.cfg.volumeRanking.pollMinutes * 120 });
-          }
-          for (const pool of token.pools) {
-            db.insertPool({
-              chainId: token.chainId,
-              poolAddress: pool.poolAddress,
-              tokenAddress: pool.tokenAddress,
-              quoteToken: pool.quoteToken,
-              factory: "dexscreener",
-              createdBlock: head,
-              ...(pool.createdAt !== null ? { createdTs: pool.createdAt } : {}),
-              token0: pool.tokenAddress,
-              token1: pool.quoteToken,
-            });
-            this.graphFor(token.chainId).registerPool(pool.poolAddress, head, pool.createdAt ?? undefined);
-            if (!this.cfg.candidateDiscovery.enabled) runtime.adapter.registerPool(pool.poolAddress, pool.tokenAddress, pool.quoteToken);
-          }
-          this.fetchMeta(token.chainId, token.address);
-          if (due) this.enqueueEnrichment(token);
-        }
-        this.refreshWatchSubscription(chain.chainId);
-        log.info("token candidates refreshed", { chainId: chain.chainId, candidates: candidates.map((token) => ({ token: token.address, volume: token.volume })) });
+        fn(u);
       } catch (err) {
-        const now = Math.floor(Date.now() / 1000);
-        this.volumeRankingStatus = { ...this.volumeRankingStatus, lastErrorAt: now, lastError: String(err) };
-        log.warn("volume ranking refresh failed", { chainId: chain.chainId, err });
+        log.error("live listener failed", { err: String(err) });
       }
     }
-    void this.drainEnrichmentQueue();
-  }
-
-  private enqueueEnrichment(token: RankedToken): void {
-    const key = `${token.chainId}:${token.address}`;
-    if (this.enrichmentQueued.has(key)) return;
-    this.enrichmentQueued.add(key);
-    this.enrichmentQueue.push(token);
-  }
-
-  private async drainEnrichmentQueue(): Promise<void> {
-    if (this.enrichmentRunning || !this.running) return;
-    this.enrichmentRunning = true;
-    try {
-      while (this.running && this.enrichmentQueue.length > 0) {
-        const token = this.enrichmentQueue.shift() as RankedToken;
-        const key = `${token.chainId}:${token.address}`;
-        this.enrichmentQueued.delete(key);
-        const runtime = this.chains.get(token.chainId);
-        if (!runtime) continue;
-        const head = runtime.adapter.status().lastHead;
-        if (head === 0) {
-          this.enrichmentQueue.unshift(token);
-          this.enrichmentQueued.add(key);
-          await new Promise((r) => setTimeout(r, 1000));
-          continue;
-        }
-        const requestedBlocks = Math.max(1, Math.ceil(this.cfg.volumeRanking.backfillHours * 300));
-        const maxDepth = runtime.adapter.getMaxArchiveDepth();
-        const blocks = Math.min(requestedBlocks, maxDepth);
-        const from = BigInt(Math.max(0, head - blocks));
-        const startedAt = Date.now();
-        log.info("candidate enrichment started", { chainId: token.chainId, token: token.address, head, from: Number(from), to: head, requestedBlocks, maxArchiveDepth: maxDepth, queueDepth: this.enrichmentQueue.length });
-        try {
-          await runtime.adapter.backfillToken(token.address, from, BigInt(head));
-          await this.evaluateCandidate(token, head);
-          log.info("candidate enrichment completed", { chainId: token.chainId, token: token.address, from: Number(from), to: head, durationMs: Date.now() - startedAt });
-        } catch (err) {
-          log.warn("candidate enrichment failed", { chainId: token.chainId, token: token.address, from: Number(from), to: head, durationMs: Date.now() - startedAt, failure: "backfill_or_evaluation", err });
-        }
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    } finally {
-      this.enrichmentRunning = false;
-    }
-  }
-
-  private async evaluateCandidate(token: RankedToken, head: number): Promise<void> {
-    const candidate = db.getCandidate(token.chainId, token.address);
-    if (!candidate || candidate.status === "promoted" || candidate.expiresAt <= Math.floor(Date.now() / 1000)) return;
-    const now = Math.floor(Date.now() / 1000);
-    db.updateCandidateScore(token.chainId, token.address, candidate.score, candidate.evidence, "evaluating");
-    const liquidityUsd = token.pools.reduce((max, pool) => Math.max(max, pool.liquidityUsd ?? 0), 0) || null;
-    const created = token.pools.map((pool) => pool.createdAt).filter((value): value is number => value !== null);
-    const createdAt = created.length > 0 ? Math.min(...created) : null;
-    const stats = this.graphFor(token.chainId).candidateBuyerStats(token.address, now - 86_400, now);
-    const result = scoreCandidate({
-      liquidityUsd,
-      volumeUsd: token.volume,
-      poolAgeHours: createdAt === null ? null : Math.max(0, (now - createdAt) / 3600),
-      ...stats,
-      minimumLiquidityUsd: this.cfg.candidateDiscovery.minimumLiquidityUsd,
-      minimumIndependentBuyers: this.cfg.candidateDiscovery.minimumIndependentBuyers,
-    });
-    const status = result.eligible && result.score >= this.cfg.candidateDiscovery.promotionScore ? "promoted" : "rejected";
-    const evidence: Record<string, unknown> = { ...result.evidence, promotionThreshold: this.cfg.candidateDiscovery.promotionScore };
-    db.updateCandidateScore(token.chainId, token.address, result.score, evidence, status);
-    log.info("candidate evaluation complete", {
-      chainId: token.chainId,
-      token: token.address,
-      status,
-      score: result.score,
-      promotionThreshold: this.cfg.candidateDiscovery.promotionScore,
-      liquidityUsd,
-      volumeUsd: token.volume,
-      poolAgeHours: createdAt === null ? null : Math.max(0, (now - createdAt) / 3600),
-      ...stats,
-      eligible: result.eligible,
-      rejectionReason: evidence["rejectionReason"],
-      missingInputs: evidence["missingInputs"],
-      components: evidence["components"],
-    });
-    if (status === "promoted") {
-      db.promoteCandidate(token.chainId, token.address, candidate.source === "factory" ? "factory" : "ranked", now + this.cfg.autoWatch.watchHours * 3600);
-      const runtime = this.chains.get(token.chainId);
-      for (const pool of db.listPoolsForToken(token.chainId, token.address)) {
-        this.graphFor(token.chainId).registerPool(pool.pool_address, head);
-        runtime?.adapter.registerPool(pool.pool_address, token.address, pool.quote_token ?? token.address);
-      }
-      this.refreshWatchSubscription(token.chainId);
-      log.info("promoted quality token candidate", { chainId: token.chainId, token: token.address, score: result.score, head });
-    }
-  }
-
-  private watchConfigFile(): void {
-    try {
-      let debounce: ReturnType<typeof setTimeout> | null = null;
-      this.configWatcher = watch("argus.config.ts", () => {
-        if (debounce) clearTimeout(debounce);
-        debounce = setTimeout(() => void this.hotReload(), 500);
-      });
-    } catch (err) {
-      log.warn("config hot-reload watcher failed", { err });
-    }
-  }
-
-  /** Hot-reload rules/scoring/alerts (PLAN.md §12). Chain/watchlist changes need a restart. */
-  private async hotReload(): Promise<void> {
-    const next = await reloadConfig();
-    if (!next) {
-      log.warn("config reload failed validation — keeping previous config");
-      return;
-    }
-    this.cfg.rules = next.rules;
-    this.cfg.scoring = next.scoring;
-    this.cfg.alerts = next.alerts;
-    this.alertManager.updateConfig(next.alerts, next.scoring);
-    this.cfg.autoWatch = next.autoWatch;
-    this.cfg.candidateDiscovery = next.candidateDiscovery;
-    this.cfg.volumeRanking = next.volumeRanking;
-    this.cfg.webhooks = next.webhooks;
-    this.webhooks.setTargets(next.webhooks);
-    log.info("config hot-reloaded (rules/scoring/alerts/autoWatch/candidateDiscovery/volumeRanking/webhooks)");
-  }
-
-  // ---- status ------------------------------------------------------------------------------
-
-  status(): Record<string, unknown> {
-    const chains: Record<string, unknown> = {};
-    for (const [chainId, rt] of this.chains) {
-      chains[String(chainId)] = {
-        ...rt.adapter.status(),
-        lastAppliedBlock: rt.lastAppliedBlock,
-        eventsApplied: rt.eventsApplied,
-      };
-    }
-    const candidates = db.listCandidates();
-    return {
-      chains,
-      queueDepth: this.queue.depth,
-      queueDropped: this.queue.dropped,
-      wallets: [...this.graphs.values()].reduce((n, graph) => n + graph.wallets.size, 0),
-      candidates: {
-        total: candidates.length,
-        discovered: candidates.filter((c) => c.status === "discovered").length,
-        evaluating: candidates.filter((c) => c.status === "evaluating").length,
-        promoted: candidates.filter((c) => c.status === "promoted").length,
-        rejected: candidates.filter((c) => c.status === "rejected").length,
-        expired: candidates.filter((c) => c.status === "expired").length,
-      },
-      volumeRanking: this.volumeRankingStatus,
-    };
   }
 }
 
-// ---- alert text helpers -------------------------------------------------------------
-
-function extractSignalValue(s: Signal): number | null {
-  const e = s.evidence;
-  const v =
-    e["freshWalletPct"] ??
-    e["pctOfSupply"] ??
-    e["clusterPctOfSupply"] ??
-    e["recipientCount"] ??
-    e["freshBuyerCount"] ??
-    e["walletCount"] ??
-    e["spikePct"] ??
-    e["lockedPct"];
-  return typeof v === "number" ? v : null;
-}
-
-function ruleHeadline(s: Signal): string {
-  switch (s.ruleId) {
-    case "R1":
-      return `Fresh wallets accumulated ${String(s.evidence["freshWalletPct"])}% of supply in ${String(s.evidence["windowHours"])}h`;
-    case "R2":
-      return `Volume spike: ${String(s.evidence["spikePct"])}% vs prior ${String(s.evidence["windowMinutes"])}m`;
-    case "R3":
-      return `Sybil fan-out: ${String(s.evidence["recipientCount"])} sub-wallets from one sender`;
-    case "R4":
-      return `Cluster holds ${String(s.evidence["pctOfSupply"])}% of supply`;
-    case "R5":
-      return `${String(s.evidence["freshBuyerCount"])} fresh wallets bought in block ${String(s.evidence["block"])}`;
-    case "R6":
-      return "Accumulating cluster is funded by the token deployer";
-    case "R7":
-      return `Liquidity exiting: ${String(s.evidence["lockedPct"])}% of LP still locked`;
-    case "R8":
-      return `${String(s.evidence["walletCount"])} wallets funded same-size from ${String(s.evidence["exchangeLabel"])}`;
-    default:
-      return "suspicious activity detected";
-  }
-}
-
-function ruleLine(s: Signal): string {
-  const e = s.evidence;
-  switch (s.ruleId) {
-    case "R1":
-      return `R1 fresh-wallet accumulation: ${String(e["freshWalletPct"])}% in ${String(e["windowHours"])}h across ${String(e["freshWalletCount"])} wallets (<${String(e["walletAgeDays"])}d old)`;
-    case "R2":
-      return `R2 volume spike: ${String(e["spikePct"])}% over ${String(e["windowMinutes"])}m (cur ${String(e["currentVolume"])} vs ${String(e["priorVolume"])})`;
-    case "R3":
-      return `R3 sybil fan-out: ${String(e["sender"]).slice(0, 12)}… sent identical amounts to ${String(e["recipientCount"])} wallets in ${String(e["windowMinutes"])}m`;
-    case "R4":
-      return `R4 cluster concentration: ${String(e["memberCount"])} wallets hold ${String(e["pctOfSupply"])}% (threshold ${String(e["threshold"])}%)`;
-    case "R5":
-      return `R5 bundled buys: ${String(e["freshBuyerCount"])} fresh wallets in block ${String(e["block"])}`;
-    case "R6":
-      return `R6 deployer-linked funding: ${String(e["linkedCount"])}/${String(e["clusterSize"])} wallets within ${String(e["maxHops"])} hops of deployer ${String(e["deployer"]).slice(0, 12)}…`;
-    case "R7":
-      return `R7 LP-lock safety: pool ${String(e["pool"]).slice(0, 12)}… only ${String(e["lockedPct"])}% of ${String(e["lpMinted"])} LP still locked (${String(e["poolAgeHours"])}h old)`;
-    case "R8":
-      return `R8 exchange fan-out: ${String(e["walletCount"])} wallets funded ${String(e["identicalAmount"])} wei each from ${String(e["exchangeLabel"])} within ${String(e["windowMinutes"])}m`;
-    default:
-      return `${s.ruleId} (weight ${s.weight})`;
-  }
+/** Compact, JSON-safe metrics for the board and API (no bigints). */
+export function metricsSummary(m: TokenMetrics, decimals: number | null): Record<string, unknown> {
+  const w = (x: TokenMetrics["w15m"]) => ({ buys: x.buys, sells: x.sells, buyUsd: Math.round(x.buyUsd), sellUsd: Math.round(x.sellUsd), buyers: x.buyers, organicBuyers: x.organicBuyers, freshBuyers: x.freshBuyers, traders: x.traders });
+  return {
+    symbol: m.symbol,
+    ageSec: m.ageSec,
+    launchObserved: m.launchObserved,
+    priceUsd: m.priceUnitUsd !== null && decimals !== null ? m.priceUnitUsd * 10 ** decimals : null,
+    priceUnitUsd: m.priceUnitUsd,
+    marketCapUsd: m.priceUnitUsd !== null && m.totalSupply !== null ? m.priceUnitUsd * Number(m.totalSupply) : null,
+    liquidityUsd: Math.round(m.liquidityUsd),
+    initialLiquidityUsd: m.initialLiquidityUsd === null ? null : Math.round(m.initialLiquidityUsd),
+    w5m: w(m.w5m), w15m: w(m.w15m), w1h: w(m.w1h),
+    trades: m.trades,
+    smartBuyers: m.smartBuyers.length,
+    earlyBuyers: m.earlyBuyers,
+    earlyBuyersHolding: m.earlyBuyersHolding,
+    launchSupplyPct: m.launchSupplyPct,
+    topClusterPct: m.topClusterPct,
+    topHolderPct: m.topHolderPct,
+    funderCoverage: Math.round(m.funderCoverage * 100) / 100,
+    creator: m.creator,
+  };
 }

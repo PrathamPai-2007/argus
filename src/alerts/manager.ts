@@ -1,95 +1,72 @@
-import type { AlertsConfig, ScoringConfig } from "../config.ts";
-import { alertsInLastMinute, insertAlert, lastAlertForToken, retractAlert, getDb } from "../db.ts";
+import type { AlertsConfig } from "../config.ts";
+import * as db from "../db.ts";
 import { log } from "../logger.ts";
-import type { AlertPayload } from "../types.ts";
+import type { WebhookDispatcher } from "../webhooks.ts";
+import { telegramAlert } from "./format.ts";
 import type { AlertSink } from "./telegram.ts";
 
-// Alert quality controls (PLAN.md §7/§8):
-//  - dedup: same token can't re-alert within cooldownMinutes…
-//  - …unless score rose ≥ escalationDelta (pattern intensifying)
-//  - global max-alerts-per-minute; critical bypasses the global rate limit
-//  - every alert persisted to SQLite; unconfirmed alerts retracted on reorg
+// Alert delivery policy:
+//  - opportunity: once per token per cooldown, unless the score rises by
+//    rescoreDelta or the verdict upgrades to high conviction
+//  - exit: once per alerted token while its position is open
+//  - global hourly cap; high-conviction and exit alerts bypass it
+//  - unconfirmed alerts are retracted on reorg (invariant 4)
+
+export type AlertDecision = { send: true } | { send: false; reason: string };
 
 export class AlertManager {
-  constructor(
-    private alertsCfg: AlertsConfig,
-    private scoringCfg: ScoringConfig,
-    private sinks: AlertSink[],
-  ) {}
+  constructor(private cfg: AlertsConfig, private sinks: AlertSink[], private webhooks: WebhookDispatcher | null) {}
 
-  updateConfig(alertsCfg: AlertsConfig, scoringCfg: ScoringConfig): void {
-    this.alertsCfg = alertsCfg;
-    this.scoringCfg = scoringCfg;
+  updateConfig(cfg: AlertsConfig): void {
+    this.cfg = cfg;
   }
 
-  /** Returns the new alert id, or null if suppressed. */
-  async maybeAlert(payload: AlertPayload, confirmed: boolean): Promise<number | null> {
-    return (await this.maybeAlertDetailed(payload, confirmed)).id;
+  decide(p: db.AlertPayload, nowSecs: number): AlertDecision {
+    const last = db.lastAlert(p.chainId, p.token, p.kind);
+    if (p.kind === "exit") {
+      return last && nowSecs - last.createdAt < 6 * 3600 ? { send: false, reason: "exit_already_sent" } : { send: true };
+    }
+    if (last && nowSecs - last.createdAt < this.cfg.cooldownMinutes * 60) {
+      const upgraded = p.verdict === "high_conviction" && last.verdict !== "high_conviction";
+      if (!upgraded && p.score < last.score + this.cfg.rescoreDelta) return { send: false, reason: "cooldown" };
+    }
+    if (p.verdict !== "high_conviction" && db.alertsSince(nowSecs - 3600) >= this.cfg.maxPerHour) return { send: false, reason: "hourly_cap" };
+    return { send: true };
   }
 
-  async maybeAlertDetailed(payload: AlertPayload, confirmed: boolean): Promise<{ id: number | null; reason: string | null }> {
-    if (payload.score < this.scoringCfg.info) return { id: null, reason: "below_info_threshold" };
-    const now = Math.floor(Date.now() / 1000);
-
-    const last = lastAlertForToken(payload.chainId, payload.tokenAddress);
-    if (last) {
-      const cooldownSecs = this.alertsCfg.cooldownMinutes * 60;
-      const timeSinceLast = now - last.created_at;
-      const inCooldown = timeSinceLast < cooldownSecs;
-      
-      let lastPayloadSev: string | null = null;
-      try { lastPayloadSev = JSON.parse(last.payload_json).severity; } catch {}
-      const newCritical = payload.severity === "critical" && lastPayloadSev !== "critical";
-      
-      if (inCooldown) {
-        const escalated = payload.score >= last.score + this.alertsCfg.escalationDelta;
-        if (!newCritical && !escalated) {
-          log.debug("alert suppressed by cooldown", { token: payload.tokenAddress, score: payload.score, lastScore: last.score, timeSinceLast });
-          return { id: null, reason: "cooldown" };
-        }
-        log.info("alert escalation inside cooldown", { token: payload.tokenAddress, from: last.score, to: payload.score });
-      } else {
-        if (payload.score <= last.score && payload.severity === lastPayloadSev) {
-          log.debug("alert suppressed (score didn't increase)", { token: payload.tokenAddress, score: payload.score });
-           return { id: null, reason: "score_not_increased" };
-        }
-      }
+  /** Persist and deliver; returns the alert id, or null when policy suppresses it. */
+  async emit(p: db.AlertPayload, block: number, confirmed: boolean, nowSecs = Math.floor(Date.now() / 1000)): Promise<number | null> {
+    const decision = this.decide(p, nowSecs);
+    if (!decision.send) {
+      log.debug("alert suppressed", { token: p.token, kind: p.kind, score: p.score, reason: decision.reason });
+      return null;
     }
+    const id = db.insertAlert(p, block, confirmed);
+    log.info("ALERT", { id, chainId: p.chainId, token: p.token, symbol: p.symbol, kind: p.kind, verdict: p.verdict, score: p.score, confirmed });
+    await this.broadcast(telegramAlert(p, id, confirmed));
+    this.webhooks?.dispatchAlert(p, id, confirmed);
+    return id;
+  }
 
-    if (payload.severity !== "critical" && alertsInLastMinute() >= this.alertsCfg.maxAlertsPerMinute) {
-      log.warn("alert suppressed by global rate limit", { token: payload.tokenAddress, score: payload.score });
-      return { id: null, reason: "global_rate_limit" };
-    }
-
-    const id = insertAlert(payload, confirmed, payload.signals.length > 0 ? Math.max(...payload.signals.map((s) => s.blockNumber)) : null);
-    log.info("ALERT", { id, token: payload.tokenAddress, score: payload.score, severity: payload.severity, confirmed });
+  async broadcast(html: string): Promise<void> {
     for (const sink of this.sinks) {
       try {
-        await sink.send(payload, id, confirmed);
+        await sink.sendText(html);
       } catch (err) {
-        log.error("alert sink failed", { sink: sink.name, err });
+        log.error("alert sink failed", { sink: sink.name, err: String(err) });
       }
     }
-    return { id, reason: null };
   }
 
-  /** Retract unconfirmed alerts at or after the reorg boundary. */
-  async retractUnconfirmed(chainId: number, fromBlock: number, reason: string): Promise<number[]> {
-    const rows = getDb()
-      .query("SELECT id, token_address FROM alerts WHERE chain_id = ? AND confirmed = 0 AND retracted = 0 AND (block_number IS NULL OR block_number >= ?)")
-      .all(chainId, fromBlock) as { id: number; token_address: string }[];
-    for (const r of rows) {
-      retractAlert(r.id);
-      const text = `↩️ ARGUS retraction: alert #${r.id} (${r.token_address}) invalidated — ${reason}`;
-      for (const sink of this.sinks) {
-        try {
-          await sink.sendText(text);
-        } catch (err) {
-          log.error("retraction sink failed", { sink: sink.name, err });
-        }
-      }
+  async retract(chainId: number, fromBlock: number): Promise<number[]> {
+    const ids = db.retractAlertsFrom(chainId, fromBlock);
+    for (const id of ids) {
+      const a = db.getAlert(id);
+      if (!a) continue;
+      await this.broadcast(`↩️ <b>Retracted</b> alert #${id} (${a.symbol ? `$${a.symbol}` : a.token.slice(0, 10)}): chain reorganized at block ${fromBlock}.`);
+      this.webhooks?.dispatchRetraction(id, chainId, a.token, `reorg at block ${fromBlock}`);
     }
-    if (rows.length > 0) log.warn("retracted unconfirmed alerts", { chainId, count: rows.length, reason });
-    return rows.map((r) => r.id);
+    if (ids.length > 0) log.warn("retracted unconfirmed alerts", { chainId, fromBlock, count: ids.length });
+    return ids;
   }
 }

@@ -1,123 +1,54 @@
 import { describe, expect, test } from "bun:test";
-import { validateConfig, ConfigError } from "../src/config.ts";
+import { ConfigError, isPrivateHost, validateConfig } from "../src/config.ts";
+import { DEFAULT_SIGNALS } from "../src/signals.ts";
 
-function baseConfig(): Record<string, unknown> {
-  return {
-    chains: [{ chainId: 1, name: "ethereum", enabled: true, rpcs: ["wss://example.com"], finalityDepth: 12, staleAfterMs: 15_000 }],
-    watchlist: [{ chainId: 1, address: "0x" + "ab".repeat(20) }],
-    autoWatch: { enabled: true, factories: ["uniswap-v2"], watchHours: 24 },
-    rules: {
-      R1: { enabled: true, supplyPct: 15, windowHours: 2, walletAgeDays: 7, weight: 35 },
-      R2: { enabled: false, volumeSpikePct: 300, windowMinutes: 15, weight: 25 },
-      R3: { enabled: true, minRecipients: 10, windowMinutes: 15, weight: 30 },
-      R4: { enabled: true, warnPct: 10, critPct: 20, critWeight: 45, weight: 30 },
-      R5: { enabled: true, minBuyers: 5, walletAgeDays: 7, weight: 25 },
-      R6: { enabled: true, maxHops: 2, minClusterPct: 1, weight: 50 },
-      R7: { enabled: false, minLockedPct: 30, minPoolAgeHours: 48, weight: 20 },
-      R8: { enabled: true, minWallets: 3, windowMinutes: 60, weight: 20 },
-    },
-    scoring: { info: 40, alert: 60, critical: 80, signalWindowHours: 6 },
-    alerts: { telegram: false, cooldownMinutes: 30, escalationDelta: 20, maxAlertsPerMinute: 10 },
-    dashboard: { port: 3737 },
-  };
-}
+const base = () => ({ chains: [{ chainId: 8453, http: ["https://base-rpc.publicnode.com"] }] }) as Record<string, unknown>;
 
 describe("validateConfig", () => {
-  test("valid config passes", () => {
-    const cfg = validateConfig(baseConfig());
-    expect(cfg.chains[0]?.chainId).toBe(1);
-    expect(cfg.chains[0]?.infuraRetryMinutes).toBe(5);
-    expect(cfg.rules.R1.supplyPct).toBe(15);
-    expect(cfg.candidateDiscovery.promotionScore).toBe(65);
-    expect(cfg.dbPath).toBe("data/argus.db"); // default
+  test("fills chain facts from the registry and defaults the rest", () => {
+    const cfg = validateConfig(base());
+    expect(cfg.chains[0]).toMatchObject({ chainId: 8453, name: "Base", enabled: true, finalityDepth: 32, blockTimeMs: 2_000, ws: [] });
+    expect(cfg.signals).toEqual(DEFAULT_SIGNALS);
+    expect(cfg.discovery.watchHours).toBe(6);
+    expect(cfg.dbPath).toBe("data/argus.db");
   });
 
-  test("rejects bad scoring order", () => {
-    const c = baseConfig();
-    (c["scoring"] as Record<string, unknown>)["alert"] = 90;
-    expect(() => validateConfig(c)).toThrow(ConfigError);
+  test("rejects unsupported chains and enabled chains without HTTP endpoints", () => {
+    expect(() => validateConfig({ chains: [{ chainId: 56, http: ["https://x.example"] }] })).toThrow(ConfigError);
+    expect(() => validateConfig({ chains: [{ chainId: 1, http: [] }] })).toThrow("needs at least one");
   });
 
-  test("rejects invalid watchlist address", () => {
-    const c = baseConfig();
-    ((c["watchlist"] as unknown[])[0] as Record<string, unknown>)["address"] = "0xnotanaddress";
-    expect(() => validateConfig(c)).toThrow(/not a valid address/);
+  test("skips endpoints whose env var is unset, keeps defaults, substitutes set ones", () => {
+    process.env["ARGUS_TEST_RPC"] = "https://rpc.example/key";
+    const cfg = validateConfig({ chains: [{ chainId: 1, http: ["${ARGUS_TEST_RPC}", "${ARGUS_UNSET_RPC}", "${ARGUS_UNSET_2:-https://fallback.example}"] }] });
+    expect(cfg.chains[0]!.http).toEqual(["https://rpc.example/key", "https://fallback.example"]);
+    delete process.env["ARGUS_TEST_RPC"];
   });
 
-  test("rejects watchlist chainId without matching chain", () => {
-    const c = baseConfig();
-    ((c["watchlist"] as unknown[])[0] as Record<string, unknown>)["chainId"] = 999;
-    expect(() => validateConfig(c)).toThrow(/no matching chain/);
+  test("signal overrides deep-merge onto defaults and reject unknown or non-numeric keys", () => {
+    const cfg = validateConfig({ ...base(), signals: { alertScore: 55, organic: { minBuyers: 20 } } });
+    expect(cfg.signals.alertScore).toBe(55);
+    expect(cfg.signals.organic).toEqual({ ...DEFAULT_SIGNALS.organic, minBuyers: 20 });
+    expect(() => validateConfig({ ...base(), signals: { organc: {} } })).toThrow("not a known setting");
+    expect(() => validateConfig({ ...base(), signals: { alertScore: "60" } })).toThrow("finite number");
+    expect(() => validateConfig({ ...base(), signals: { alertScore: 90, highConvictionScore: 80 } })).toThrow(ConfigError);
   });
 
-  test("rejects R4 warnPct >= critPct", () => {
-    const c = baseConfig();
-    ((c["rules"] as Record<string, Record<string, unknown>>)["R4"] as Record<string, unknown>)["warnPct"] = 25;
-    expect(() => validateConfig(c)).toThrow(/warnPct/);
+  test("watchlist entries must match a configured chain and be valid addresses", () => {
+    expect(validateConfig({ ...base(), watchlist: [{ chainId: 8453, address: "0x" + "AB".repeat(20) }] }).watchlist[0]!.address).toBe("0x" + "ab".repeat(20));
+    expect(() => validateConfig({ ...base(), watchlist: [{ chainId: 1, address: "0x" + "ab".repeat(20) }] })).toThrow("no matching chain");
+    expect(() => validateConfig({ ...base(), watchlist: [{ chainId: 8453, address: "0x12" }] })).toThrow("not a valid address");
   });
 
-  test("env var interpolation in rpc urls", () => {
-    process.env.ARGUS_TEST_RPC = "wss://secret.example.com/key123";
-    const c = baseConfig();
-    ((c["chains"] as unknown[])[0] as Record<string, unknown>)["rpcs"] = ["${ARGUS_TEST_RPC}"];
-    const cfg = validateConfig(c);
-    expect(cfg.chains[0]?.rpcs[0]).toBe("wss://secret.example.com/key123");
-    delete process.env.ARGUS_TEST_RPC;
+  test("webhooks reject private, loopback and credentialed targets", () => {
+    for (const url of ["http://127.0.0.1/x", "http://10.0.0.5/x", "http://[::1]/x", "http://169.254.169.254/latest", "https://user:pw@hooks.example/x", "http://metadata.google.internal/"]) {
+      expect(() => validateConfig({ ...base(), webhooks: [{ url }] })).toThrow(ConfigError);
+    }
+    expect(validateConfig({ ...base(), webhooks: [{ url: "https://hooks.example/abc" }] }).webhooks[0]!.events).toEqual(["alert", "exit"]);
   });
 
-  test("missing env var fails loudly", () => {
-    const c = baseConfig();
-    ((c["chains"] as unknown[])[0] as Record<string, unknown>)["rpcs"] = ["${ARGUS_DEFINITELY_UNSET}"];
-    expect(() => validateConfig(c)).toThrow(/ARGUS_DEFINITELY_UNSET/);
-  });
-
-  test("disabled chains may defer endpoint secrets", () => {
-    const c = baseConfig();
-    ((c["chains"] as unknown[])[0] as Record<string, unknown>).enabled = false;
-    ((c["chains"] as unknown[])[0] as Record<string, unknown>).rpcs = ["${ARGUS_DISABLED_RPC}"];
-    expect(validateConfig(c).chains[0]?.enabled).toBe(false);
-  });
-
-  test("rejects private webhook destinations", () => {
-    const c = baseConfig();
-    c["webhooks"] = [{ url: "http://127.0.0.1:9000/hook", events: ["alert"] }];
-    expect(() => validateConfig(c)).toThrow(/private hosts/);
-  });
-
-  test("autoWatch.factories accepts a raw address", () => {
-    const c = baseConfig();
-    ((c["autoWatch"] as Record<string, unknown>)["factories"]) = ["0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f"];
-    const cfg = validateConfig(c);
-    expect(cfg.autoWatch.factories[0]).toBe("0x5c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f");
-  });
-
-  test("rejects unknown autoWatch factory name", () => {
-    const c = baseConfig();
-    ((c["autoWatch"] as Record<string, unknown>)["factories"]) = ["unicorn-factory"];
-    expect(() => validateConfig(c)).toThrow(/known factory name/);
-  });
-
-  test("rejects non-string autoWatch factory entry", () => {
-    const c = baseConfig();
-    ((c["autoWatch"] as Record<string, unknown>)["factories"]) = [42];
-    expect(() => validateConfig(c)).toThrow(/known factory name/);
-  });
-
-  test("rejects non-ws/http rpc url", () => {
-    const c = baseConfig();
-    ((c["chains"] as unknown[])[0] as Record<string, unknown>)["rpcs"] = ["ftp://nope"];
-    expect(() => validateConfig(c)).toThrow(/ws\(s\)/);
-  });
-
-  test("validates candidate promotion threshold", () => {
-    const c = baseConfig();
-    c["candidateDiscovery"] = { enabled: true, promotionScore: 101 };
-    expect(() => validateConfig(c)).toThrow(/promotionScore/);
-  });
-
-  test("validates Infura retry duration", () => {
-    const c = baseConfig();
-    ((c["chains"] as unknown[])[0] as Record<string, unknown>)["infuraRetryMinutes"] = 0;
-    expect(() => validateConfig(c)).toThrow(/infuraRetryMinutes/);
+  test("isPrivateHost unwraps IPv4-mapped IPv6", () => {
+    expect(isPrivateHost("::ffff:127.0.0.1")).toBe(true);
+    expect(isPrivateHost("hooks.slack.com")).toBe(false);
   });
 });
