@@ -1,6 +1,6 @@
 # AGENTS.md — Argus
 
-On-chain opportunity scanner for new tokens on **Ethereum and Base** (Uniswap V2 + V3).
+On-chain opportunity scanner for new tokens on **Ethereum and Base** (Uniswap V2 + V3 + V4).
 It watches launches from their first block, scores independent demand, vetoes rugs and
 honeypots, alerts on the dashboard and Telegram, and paper-trades every alert against a
 baseline so its edge is measured, not claimed. See `README.md` for usage.
@@ -31,17 +31,17 @@ bun run replay --chain 8453              # re-score stored events offline with t
 
 ```
 argus.config.ts          chains (http/ws), watchlist, discovery, signal overrides, alerts
-migrations/              plain .sql applied in order (0014 = v2 schema; v1 DBs are backed up first)
+migrations/              plain .sql applied in order (0014 = v2 schema, v1 DBs are backed up first; 0015 = V4 pools)
 src/
   index.ts               CLI: run | doctor | replay; config hot-reload
   config.ts              hand-rolled validation; ${VAR} interpolation; signal overrides deep-merged
-  chains.ts              verified per-chain registry: quotes, factories, native/USD reference pool
+  chains.ts              verified per-chain registry: quotes, factories (incl. V4 PoolManagers), price references (WETH/ZORA/VIRTUAL vs USDC)
   model.ts               ChainEvent union (transfer, swap, reserves, liquidity, pool_created, funding)
   ingest/rpc.ts          RpcPool: per-host limits, token bucket, failover/cooldown, coalescing, settle()
   ingest/sync.ts         ChainSync: block-cursor loop (headers → filtered getLogs → signers → emit),
                          reorg walk-back, launch capture, resume/rewind, pruned-range skip
   ingest/heads.ts        newHeads over native WebSocket (wake-up signal only)
-  ingest/decode.ts       pure log decoder (V2/V3/ERC-20), oriented by registered pools
+  ingest/decode.ts       pure log decoder (V2/V3/V4/ERC-20), oriented by registered pools; V4 pools keyed by bytes32 id
   ingest/reads.ts        batched eth_call: token metadata, pool discovery, pool balances
   ingest/funders.ts      first-funder resolver (Etherscan for ETH, Blockscout PRO for Base)
   state.ts               ChainState: rewindable market state + TokenMetrics snapshots
@@ -55,6 +55,18 @@ src/
 web/src/                 React app: pages/, components/, lib/ (api, live SSE store, router, format)
 tests/                   decoder fixtures (real mainnet logs), fake-chain sync, state rewind, signals, API
 ```
+
+## Uniswap V4 notes
+
+- The PoolManager is a singleton: every pool's logs come from one address and carry a `bytes32` pool id
+  (the `pools.address` value for `dex = 'v4'`). `poolKey()` maps a log to its pool id; `addresses()` in
+  sync excludes V4 ids from `eth_getLogs` address filters.
+- A V4 pool is created by `Initialize`. Currency `0x0` is native ETH (a quote). `PoolCreated` carries
+  `sqrtPriceX96` and `hooks`.
+- `Swap` deltas are from the *swapper's* perspective (verified on live Base logs), the opposite sign of V3,
+  so the decoder negates them. `ModifyLiquidity` has no amounts: `rangeAmounts()` derives them from
+  `liquidity`, the tick range and the current price.
+- Fixtures: `tests/fixtures/v4-logs.json` (real Base logs). Not yet soak-tested over a long live run.
 
 ## Invariants — do not break
 
@@ -88,11 +100,11 @@ tests/                   decoder fixtures (real mainnet logs), fake-chain sync, 
 ## Status
 
 - [x] v2 ingestion: block-cursor sync, launch capture, reorgs, resume/rewind, provider failover
-- [x] V2 + V3 decoding, ETH + Base, signer attribution, native/USD from on-chain reference pools
+- [x] V2 + V3 + V4 decoding, ETH + Base, signer attribution, USD from on-chain reference pools (ETH, ZORA, VIRTUAL)
 - [x] Market state, 5 opportunity + 6 risk signals, verdicts with explicit gates
 - [x] Funder clustering (ETH via Etherscan; Base needs `BLOCKSCOUT_API_KEY`)
 - [x] Paper-traded track record vs baseline; wallet track records; smart-money signal
 - [x] Telegram + webhooks; React dashboard (opportunities, token, track record, activity, wallets, system)
-- [ ] Uniswap V4 (PoolManager singleton) — most Base launches (Clanker/Zora) now use V4
+- [x] Route-level code splitting for the dashboard (token and track-record views)
+- [ ] V4/V3-aware pool discovery for hand-added `watchlist` tokens (`ingest/reads.ts` finds V2/V3 only)
 - [ ] Base Flashblocks fast path (`pendingLogs` on `wss://mainnet-preconf.base.org`) for sub-block alerts
-- [ ] Route-level code splitting for the dashboard bundle
