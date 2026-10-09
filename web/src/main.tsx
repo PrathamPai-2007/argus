@@ -1,4 +1,4 @@
-import { Component, StrictMode, type ReactNode } from "react";
+import { Component, lazy, StrictMode, Suspense, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { Shell } from "@/components/Shell.tsx";
 import { ErrorNote, TipProvider } from "@/components/ui.tsx";
@@ -7,9 +7,11 @@ import { usePath } from "@/lib/router.tsx";
 import { ActivityPage } from "@/pages/Activity.tsx";
 import { Opportunities } from "@/pages/Opportunities.tsx";
 import { System } from "@/pages/System.tsx";
-import { Token } from "@/pages/Token.tsx";
-import { TrackRecord } from "@/pages/TrackRecord.tsx";
 import { Wallets } from "@/pages/Wallets.tsx";
+
+// The two heaviest views (xyflow + candles, recharts) load on demand.
+const Token = lazy(() => import("@/pages/Token.tsx").then((m) => ({ default: m.Token })));
+const TrackRecord = lazy(() => import("@/pages/TrackRecord.tsx").then((m) => ({ default: m.TrackRecord })));
 
 class Boundary extends Component<{ children: ReactNode; resetKey: string }, { error: Error | null }> {
   state: { error: Error | null } = { error: null };
@@ -36,7 +38,9 @@ function Routes() {
   else page = <Opportunities />;
   return (
     <Shell>
-      <Boundary resetKey={path}>{page}</Boundary>
+      <Boundary resetKey={path}>
+        <Suspense fallback={null}>{page}</Suspense>
+      </Boundary>
     </Shell>
   );
 }
